@@ -54,6 +54,8 @@ func levelColor(_ pct: Double) -> NSColor {
 
 enum Keychain {
     static let service = "Claude Code-credentials"
+    /// Our own item, separate from Claude Code's, holding the optional Admin API key.
+    static let adminService = "UsageMonitor-admin-key"
 
     static func read() throws -> [String: Any] {
         let out = try run(["find-generic-password", "-s", service, "-a", NSUserName(), "-w"])
@@ -69,6 +71,22 @@ enum Keychain {
         _ = try run(["add-generic-password", "-U", "-s", service, "-a", NSUserName(), "-w", json])
     }
 
+    /// The Admin API key is stored only here, in the macOS Keychain — never in
+    /// UserDefaults, a file, or a log.
+    static func readAdminKey() -> String? {
+        guard let k = try? run(["find-generic-password", "-s", adminService, "-a", NSUserName(), "-w"]),
+              !k.isEmpty else { return nil }
+        return k
+    }
+
+    static func storeAdminKey(_ key: String) throws {
+        _ = try run(["add-generic-password", "-U", "-s", adminService, "-a", NSUserName(), "-w", key])
+    }
+
+    static func deleteAdminKey() {
+        _ = try? run(["delete-generic-password", "-s", adminService, "-a", NSUserName()])
+    }
+
     @discardableResult
     private static func run(_ args: [String]) throws -> String {
         let p = Process()
@@ -81,6 +99,154 @@ enum Keychain {
         guard p.terminationStatus == 0 else { throw UsageError.noCredential }
         return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+}
+
+// MARK: - Key scanner (find existing Anthropic keys already on this Mac)
+
+/// A candidate key found on disk/in the environment, with where it came from.
+struct FoundKey: Hashable {
+    let key: String
+    let source: String
+    var isAdmin: Bool { key.hasPrefix("sk-ant-admin") }
+    /// Masked for display — we never show a full key in the UI.
+    var masked: String {
+        let tail = key.count > 4 ? String(key.suffix(4)) : "****"
+        let head = key.hasPrefix("sk-ant-admin") ? "sk-ant-admin…" : "sk-ant-…"
+        return "\(head)\(tail)"
+    }
+}
+
+/// Best-effort read-only scan of common locations for `sk-ant-…` keys. Reads
+/// files the user already owns; never writes, never transmits.
+enum KeyScanner {
+    static func scan() -> [FoundKey] {
+        var found: [FoundKey] = []
+        var seen = Set<String>()
+        let home = NSHomeDirectory()
+
+        // 1. Shell profiles that commonly export ANTHROPIC_API_KEY / _ADMIN_KEY.
+        let profiles = [".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".profile"]
+        for name in profiles {
+            let path = "\(home)/\(name)"
+            guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            for key in keys(in: text) where seen.insert(key).inserted {
+                found.append(FoundKey(key: key, source: "~/\(name)"))
+            }
+        }
+
+        // 2. The `ant` CLI credential store.
+        let antDir = "\(home)/.config/anthropic"
+        if let items = try? FileManager.default.contentsOfDirectory(atPath: antDir) {
+            for item in items {
+                guard let text = try? String(contentsOfFile: "\(antDir)/\(item)", encoding: .utf8) else { continue }
+                for key in keys(in: text) where seen.insert(key).inserted {
+                    found.append(FoundKey(key: key, source: "~/.config/anthropic/\(item)"))
+                }
+            }
+        }
+
+        // 3. The login shell's environment (captures keys exported but not in the files above).
+        if let text = loginShellEnv() {
+            for line in text.split(separator: "\n") where line.contains("ANTHROPIC") {
+                for key in keys(in: String(line)) where seen.insert(key).inserted {
+                    found.append(FoundKey(key: key, source: "shell environment"))
+                }
+            }
+        }
+
+        // Admin keys first — those are the ones cost reporting needs.
+        return found.sorted { $0.isAdmin && !$1.isAdmin }
+    }
+
+    private static func keys(in text: String) -> [String] {
+        let pattern = "sk-ant-[A-Za-z0-9_-]{20,}"
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = text as NSString
+        return re.matches(in: text, range: NSRange(location: 0, length: ns.length))
+            .map { ns.substring(with: $0.range) }
+    }
+
+    private static func loginShellEnv() -> String? {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: shell)
+        p.arguments = ["-lic", "env"]
+        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+        do { try p.run(); p.waitUntilExit() } catch { return nil }
+        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+    }
+}
+
+// MARK: - Cost client (Anthropic Admin API — org billing)
+
+/// Fetches month-to-date API spend via the Admin API cost report.
+/// Uses the Admin key only to read `cost_report`; the key never leaves this Mac
+/// except in the HTTPS request to Anthropic's own server.
+final class CostClient {
+    let base = "https://api.anthropic.com/v1/organizations/cost_report"
+
+    /// Month-to-date spend in USD. Throws `.http` on auth/other failure so the
+    /// caller can tell an invalid key from a network blip.
+    func fetchMonthToDate(adminKey: String) throws -> Double {
+        var cents = 0.0
+        var page: String?
+        let start = Self.startOfMonthUTC()
+        repeat {
+            var comps = URLComponents(string: base)!
+            comps.queryItems = [
+                URLQueryItem(name: "starting_at", value: start),
+                URLQueryItem(name: "bucket_width", value: "1d"),
+                URLQueryItem(name: "limit", value: "31"),
+            ]
+            if let page { comps.queryItems?.append(URLQueryItem(name: "page", value: page)) }
+
+            var req = URLRequest(url: comps.url!)
+            req.setValue(adminKey, forHTTPHeaderField: "x-api-key")
+            req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            let (data, code) = try syncData(req)
+            guard code == 200 else { throw UsageError.http(code) }
+
+            let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            for bucket in obj["data"] as? [[String: Any]] ?? [] {
+                for item in bucket["results"] as? [[String: Any]] ?? [] {
+                    // amount is a decimal string in the lowest currency unit (cents).
+                    if let s = item["amount"] as? String, let v = Double(s) { cents += v }
+                }
+            }
+            page = (obj["has_more"] as? Bool == true) ? obj["next_page"] as? String : nil
+        } while page != nil
+        return cents / 100.0
+    }
+
+    /// True if the key authenticates against the cost endpoint (used to validate).
+    func validate(adminKey: String) -> Bool {
+        (try? fetchMonthToDate(adminKey: adminKey)) != nil
+    }
+
+    private static func startOfMonthUTC() -> String {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let comps = cal.dateComponents([.year, .month], from: Date())
+        let start = cal.date(from: comps) ?? Date()
+        let f = ISO8601DateFormatter()
+        f.timeZone = TimeZone(identifier: "UTC")
+        return f.string(from: start)
+    }
+
+    private func syncData(_ req: URLRequest) throws -> (Data, Int) {
+        let sem = DispatchSemaphore(value: 0)
+        var result: (Data, Int)?
+        var failure: Error?
+        URLSession.shared.dataTask(with: req) { d, resp, e in
+            if let e { failure = e } else {
+                result = (d ?? Data(), (resp as? HTTPURLResponse)?.statusCode ?? 0)
+            }
+            sem.signal()
+        }.resume()
+        sem.wait()
+        if let failure { throw failure }
+        return result!
     }
 }
 
@@ -212,13 +378,19 @@ func signedInToClaude() -> Bool {
     return !t.isEmpty
 }
 
-/// First-run window that walks a new user through the two prerequisites.
+func apiKeyConfigured() -> Bool { Keychain.readAdminKey() != nil }
+
+/// First-run window: sets up the Claude Code subscription (for the gauges) and,
+/// optionally, an Admin API key (for dollar spend).
 final class OnboardingController: NSObject, NSWindowDelegate {
     var onReady: (() -> Void)?
+    var onKeyChanged: (() -> Void)?
     private var window: NSWindow?
     private var body: NSTextField?
+    private var apiStatus: NSTextField?
     private var status: NSTextField?
     private var primary: NSButton?
+    private let cost = CostClient()
 
     func present() {
         if window == nil { build() }
@@ -229,7 +401,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     }
 
     private func build() {
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 340),
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 470),
                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
         win.title = "Usage Monitor Setup"
         win.delegate = self
@@ -238,32 +410,50 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         let heading = NSTextField(labelWithString: "Welcome to Usage Monitor 🔋")
         heading.font = .systemFont(ofSize: 18, weight: .bold)
 
+        // Section 1 — Claude Code subscription (powers the % gauges).
+        let sub = sectionTitle("Claude usage gauges")
         let body = NSTextField(wrappingLabelWithString: "")
         body.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         self.body = body
+        let copyBtn = button("Copy install command", #selector(copyInstall))
+        let recheck = button("Re-check", #selector(refresh))
+        let subRow = NSStackView(views: [copyBtn, NSView(), recheck])
+        subRow.orientation = .horizontal; subRow.spacing = 8
+
+        // Section 2 — optional Admin API key (powers dollar spend).
+        let apiTitle = sectionTitle("API dollar spend  (optional)")
+        let apiBody = NSTextField(wrappingLabelWithString:
+            "To also show what you've spent on the pay-as-you-go API, add an "
+            + "Admin API key (starts with sk-ant-admin) from console.anthropic.com. "
+            + "It's stored only in your macOS Keychain and used solely to read your "
+            + "cost report — never shared. Skip this if you only use a Pro/Max plan.")
+        apiBody.font = .systemFont(ofSize: 11)
+        apiBody.textColor = .secondaryLabelColor
+        let apiStatus = NSTextField(labelWithString: "")
+        apiStatus.font = .systemFont(ofSize: 12, weight: .medium)
+        self.apiStatus = apiStatus
+        let scanBtn = button("Scan this Mac…", #selector(scanForKeys))
+        let enterBtn = button("Enter key…", #selector(enterKey))
+        let removeBtn = button("Remove", #selector(removeKey))
+        let apiRow = NSStackView(views: [scanBtn, enterBtn, removeBtn, NSView()])
+        apiRow.orientation = .horizontal; apiRow.spacing = 8
 
         let status = NSTextField(labelWithString: "")
         status.font = .systemFont(ofSize: 11)
         status.textColor = .secondaryLabelColor
         self.status = status
-
-        let copyBtn = NSButton(title: "Copy install command", target: self, action: #selector(copyInstall))
-        copyBtn.bezelStyle = .rounded
-        let recheck = NSButton(title: "Re-check", target: self, action: #selector(refresh))
-        recheck.bezelStyle = .rounded
-        let primary = NSButton(title: "Get Started", target: self, action: #selector(finish))
-        primary.bezelStyle = .rounded
+        let primary = button("Get Started", #selector(finish))
         primary.keyEquivalent = "\r"
         self.primary = primary
+        let footer = NSStackView(views: [status, NSView(), primary])
+        footer.orientation = .horizontal; footer.spacing = 8
 
-        let btnRow = NSStackView(views: [copyBtn, NSView(), recheck, primary])
-        btnRow.orientation = .horizontal
-        btnRow.spacing = 8
-
-        let stack = NSStackView(views: [heading, body, NSView(), status, btnRow])
+        let stack = NSStackView(views: [heading, sub, body, subRow,
+                                        separator(), apiTitle, apiBody, apiStatus, apiRow,
+                                        separator(), footer])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 12
+        stack.spacing = 10
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 24, bottom: 20, right: 24)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
@@ -275,10 +465,28 @@ final class OnboardingController: NSObject, NSWindowDelegate {
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             body.widthAnchor.constraint(equalToConstant: 432),
-            btnRow.widthAnchor.constraint(equalToConstant: 432),
+            apiBody.widthAnchor.constraint(equalToConstant: 432),
+            footer.widthAnchor.constraint(equalToConstant: 432),
         ])
         win.contentView = content
         self.window = win
+    }
+
+    private func sectionTitle(_ s: String) -> NSTextField {
+        let t = NSTextField(labelWithString: s)
+        t.font = .systemFont(ofSize: 13, weight: .semibold)
+        return t
+    }
+    private func button(_ title: String, _ action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .rounded
+        return b
+    }
+    private func separator() -> NSBox {
+        let b = NSBox(); b.boxType = .separator
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.widthAnchor.constraint(equalToConstant: 432).isActive = true
+        return b
     }
 
     @objc func refresh() {
@@ -286,8 +494,6 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         let signedIn = signedInToClaude()
         func mark(_ ok: Bool) -> String { ok ? "✅" : "⬜️" }
         body?.stringValue = """
-        The app reads your Claude usage from Claude Code — no separate login.
-
         \(mark(hasCLI))  1. Install Claude Code
               curl -fsSL https://claude.ai/install.sh | bash
 
@@ -295,16 +501,106 @@ final class OnboardingController: NSObject, NSWindowDelegate {
               Run  claude  in a terminal and complete sign-in.
               (Requires a Claude Pro or Max subscription.)
         """
+        if apiKeyConfigured() {
+            apiStatus?.stringValue = "✅  API key configured — dollar spend is on."
+            apiStatus?.textColor = .labelColor
+        } else {
+            apiStatus?.stringValue = "⬜️  No API key — dollar spend is off."
+            apiStatus?.textColor = .secondaryLabelColor
+        }
         let ready = hasCLI && signedIn
         primary?.isEnabled = ready
-        status?.stringValue = ready ? "All set — you're good to go."
-                                    : "Do the unchecked steps, then Re-check."
+        status?.stringValue = ready ? "Ready. The API key is optional."
+                                    : "Do the unchecked steps above, then Re-check."
     }
 
     @objc func copyInstall() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString("curl -fsSL https://claude.ai/install.sh | bash", forType: .string)
         status?.stringValue = "Install command copied — paste it into a terminal."
+    }
+
+    // MARK: API key — scan / manual / remove
+
+    @objc func scanForKeys() {
+        apiStatus?.stringValue = "Scanning…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let found = KeyScanner.scan()
+            DispatchQueue.main.async { self?.presentScanResults(found) }
+        }
+    }
+
+    private func presentScanResults(_ found: [FoundKey]) {
+        guard let window else { return }
+        guard !found.isEmpty else {
+            let a = NSAlert()
+            a.messageText = "No keys found on this Mac"
+            a.informativeText = "Couldn't find an Anthropic key in your shell profiles or "
+                + "the ant CLI config. Use “Enter key…” to type one in."
+            a.beginSheetModal(for: window) { _ in }
+            refresh(); return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Use a key found on this Mac?"
+        alert.informativeText = "Only the masked key is shown. Cost reporting needs an "
+            + "Admin key (sk-ant-admin); other keys can't read the cost report."
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 320, height: 26))
+        for f in found { popup.addItem(withTitle: "\(f.masked)   —   \(f.source)") }
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Use This Key")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] resp in
+            guard resp == .alertFirstButtonReturn else { self?.refresh(); return }
+            self?.validateAndStore(found[popup.indexOfSelectedItem].key)
+        }
+    }
+
+    @objc func enterKey() {
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Enter your Admin API key"
+        alert.informativeText = "Starts with sk-ant-admin. Input is hidden and stored "
+            + "only in your macOS Keychain."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "sk-ant-admin-…"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] resp in
+            guard resp == .alertFirstButtonReturn else { return }
+            let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { return }
+            self?.validateAndStore(key)
+        }
+    }
+
+    /// Verify the key against the cost endpoint before storing it.
+    private func validateAndStore(_ key: String) {
+        apiStatus?.stringValue = "Verifying key…"
+        apiStatus?.textColor = .secondaryLabelColor
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let ok = self?.cost.validate(adminKey: key) ?? false
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if ok {
+                    try? Keychain.storeAdminKey(key)
+                    self.onKeyChanged?()
+                } else if let window = self.window {
+                    let a = NSAlert()
+                    a.messageText = "That key didn't work"
+                    a.informativeText = "It was rejected by the cost report endpoint. Make "
+                        + "sure it's an Admin key (sk-ant-admin) with billing access."
+                    a.beginSheetModal(for: window) { _ in }
+                }
+                self.refresh()
+            }
+        }
+    }
+
+    @objc func removeKey() {
+        Keychain.deleteAdminKey()
+        onKeyChanged?()
+        refresh()
     }
 
     @objc func finish() {
@@ -318,15 +614,19 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let client = UsageClient()
+    let costClient = CostClient()
     let onboarding = OnboardingController()
     var timer: Timer?
     var gauges: [Gauge] = []
     var lastError: String?
     var lastUpdated: Date?
+    var monthSpend: Double?      // month-to-date USD, nil if no key or not yet fetched
+    var costError: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         onboarding.onReady = { [weak self] in self?.poll() }
+        onboarding.onKeyChanged = { [weak self] in self?.pollCost() }
         render()
         poll()
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
@@ -338,6 +638,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func openSetup() { onboarding.present() }
 
     @objc func poll() {
+        pollCost()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             do {
@@ -348,6 +649,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 DispatchQueue.main.async { self.lastError = msg; self.render() }
+            }
+        }
+    }
+
+    func pollCost() {
+        guard let key = Keychain.readAdminKey() else {
+            monthSpend = nil; costError = nil; return
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            do {
+                let usd = try self.costClient.fetchMonthToDate(adminKey: key)
+                DispatchQueue.main.async { self.monthSpend = usd; self.costError = nil; self.render() }
+            } catch {
+                let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                DispatchQueue.main.async { self.costError = msg; self.render() }
             }
         }
     }
@@ -438,6 +755,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 menu.addItem(item)
             }
             if let err = lastError { menu.addItem(disabled("⚠︎  \(err) (showing last good data)")) }
+        }
+        if apiKeyConfigured() {
+            menu.addItem(.separator())
+            menu.addItem(disabled("API spend (this month)"))
+            if let usd = monthSpend {
+                menu.addItem(disabled(String(format: "$%.2f used", usd)))
+            } else if let err = costError {
+                menu.addItem(disabled("⚠︎  \(err)"))
+            } else {
+                menu.addItem(disabled("Loading…"))
+            }
         }
         if let updated = lastUpdated {
             menu.addItem(.separator())

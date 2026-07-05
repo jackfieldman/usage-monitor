@@ -32,8 +32,14 @@ open UsageMonitor.app
 ```
 
 On first launch (or any time it's not signed in) a **setup window** walks you
-through the two prerequisites — installing Claude Code and signing in. You can
-reopen it any time from the menu-bar **Set Up…** item.
+through installing Claude Code and signing in. The same window has an optional
+**API dollar spend** section — add an Admin API key and the menu also shows
+your month-to-date pay-as-you-go API cost. You can either let the app **scan
+your Mac** for a key it already finds (shell profiles, the `ant` CLI config),
+or **type one in confidentially** (hidden field). The key is verified against
+the cost endpoint before it's saved, stored only in your macOS Keychain, and
+used solely to read your cost report. Reopen setup any time from the menu-bar
+**Set Up…** item.
 
 Then use **Open at Login** in the menu to have it start automatically. Move
 `UsageMonitor.app` to `/Applications` first if you want it to live there.
@@ -54,12 +60,23 @@ Maintainers: see [SIGNING.md](SIGNING.md) for the signed-release pipeline
 
 ## How it works
 
-The app reads the OAuth token Claude Code keeps in your macOS Keychain
-(`Claude Code-credentials`) and calls the same endpoint the Claude Code
-`/usage` panel uses (`GET https://api.anthropic.com/api/oauth/usage`). It maps
-the response's `limits` array to the gauges, polls every 5 minutes, and
-refreshes the token when it's near expiry (writing the new token back to the
-same Keychain item, so Claude Code stays in sync).
+**Gauges (subscription usage).** The app reads the OAuth token Claude Code
+keeps in your macOS Keychain (`Claude Code-credentials`) and calls the same
+endpoint the Claude Code `/usage` panel uses
+(`GET https://api.anthropic.com/api/oauth/usage`). It maps the response's
+`limits` array to the gauges, polls every 5 minutes, and refreshes the token
+when it's near expiry (writing the new token back to the same Keychain item, so
+Claude Code stays in sync).
+
+**Dollar spend (optional, API only).** If you add an Admin API key, the app
+calls the Console Admin API
+(`GET https://api.anthropic.com/v1/organizations/cost_report`) once per poll,
+sums the current month's buckets, and shows the total in the menu. This is
+separate from subscription usage — it reflects metered pay-as-you-go API
+billing, so it only shows anything if you have an API organization. The Admin
+key is stored in its own Keychain item (`UsageMonitor-admin-key`), entered via
+a hidden field or picked from a masked list of keys already on your Mac, and
+sent only to Anthropic over HTTPS.
 
 ### Privacy
 
