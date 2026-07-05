@@ -1,0 +1,4 @@
+# build product
+UsageMonitor.app/
+*.dSYM/
+.DS_Store
