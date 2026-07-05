@@ -11,6 +11,28 @@ import ServiceManagement
 
 struct Gauge { let label: String; let percent: Double; let sub: String }
 
+enum IconShape: String, CaseIterable {
+    case battery, bars, rings
+    var title: String {
+        switch self {
+        case .battery: return "Battery"
+        case .bars: return "Bar Chart"
+        case .rings: return "Rings"
+        }
+    }
+}
+
+enum IconStyle: String, CaseIterable {
+    case colour, greyscale, battery
+    var title: String {
+        switch self {
+        case .colour: return "Colour"
+        case .greyscale: return "Greyscale"
+        case .battery: return "System Battery"
+        }
+    }
+}
+
 enum UsageError: LocalizedError {
     case noCredential, refreshFailed, http(Int)
     var errorDescription: String? {
@@ -334,13 +356,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         if gauges.isEmpty {
             button.image = warningImage()
-            button.imagePosition = .imageOnly
+            button.toolTip = lastError
         } else {
-            button.effectiveAppearance.performAsCurrentDrawingAppearance {
-                button.image = self.gaugeImage(self.gauges)
+            switch iconShape {
+            case .battery: button.image = consolidated ? consolidatedImage(gauges) : gaugeImage(gauges)
+            case .bars: button.image = barsImage(gauges)
+            case .rings: button.image = ringsImage(gauges)
             }
+            button.toolTip = gauges.map { "\($0.label): \(Int($0.percent))%" }
+                .joined(separator: "\n")
         }
+        button.imagePosition = .imageOnly
         statusItem.menu = makeMenu()
+    }
+
+    var consolidated: Bool {
+        get { UserDefaults.standard.bool(forKey: "consolidatedView") }
+        set { UserDefaults.standard.set(newValue, forKey: "consolidatedView") }
+    }
+
+    @objc func toggleConsolidated() {
+        consolidated.toggle()
+        render()
+    }
+
+    var iconShape: IconShape {
+        get { IconShape(rawValue: UserDefaults.standard.string(forKey: "iconShape") ?? "") ?? .battery }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "iconShape") }
+    }
+
+    @objc func pickShape(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let shape = IconShape(rawValue: raw) {
+            iconShape = shape
+        }
+        render()
+    }
+
+    var iconStyle: IconStyle {
+        get { IconStyle(rawValue: UserDefaults.standard.string(forKey: "iconStyle") ?? "") ?? .colour }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "iconStyle") }
+    }
+
+    @objc func pickStyle(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let style = IconStyle(rawValue: raw) {
+            iconStyle = style
+        }
+        render()
+    }
+
+    /// Charge-bar colour for the current icon style. Greyscale encodes the
+    /// level as lightness; System Battery is monochrome until the red zone,
+    /// like the macOS battery icon.
+    func fillColor(_ pct: Double) -> NSColor {
+        switch iconStyle {
+        case .colour: return levelColor(pct)
+        case .greyscale:
+            if pct >= 80 { return .labelColor }
+            if pct >= 50 { return NSColor.labelColor.withAlphaComponent(0.62) }
+            return NSColor.labelColor.withAlphaComponent(0.38)
+        case .battery:
+            return pct >= 80 ? levelColor(pct) : .labelColor
+        }
     }
 
     // MARK: menu
@@ -369,11 +445,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(.separator())
         menu.addItem(item("Refresh now", #selector(poll), "r"))
+        let shapeItem = NSMenuItem(title: "Icon Shape", action: nil, keyEquivalent: "")
+        let shapeMenu = NSMenu()
+        for shape in IconShape.allCases {
+            let i = NSMenuItem(title: shape.title, action: #selector(pickShape(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = shape.rawValue
+            i.state = shape == iconShape ? .on : .off
+            shapeMenu.addItem(i)
+        }
+        shapeItem.submenu = shapeMenu
+        menu.addItem(shapeItem)
+        if iconShape == .battery {   // bars/rings are single-glyph already
+            let combined = item("Consolidated Icon", #selector(toggleConsolidated), "")
+            combined.state = consolidated ? .on : .off
+            menu.addItem(combined)
+        }
+        let styleItem = NSMenuItem(title: "Icon Style", action: nil, keyEquivalent: "")
+        let styleMenu = NSMenu()
+        for style in IconStyle.allCases {
+            let i = NSMenuItem(title: style.title, action: #selector(pickStyle(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = style.rawValue
+            i.state = style == iconStyle ? .on : .off
+            styleMenu.addItem(i)
+        }
+        styleItem.submenu = styleMenu
+        menu.addItem(styleItem)
         let login = item("Open at Login", #selector(toggleLogin), "")
         login.state = loginEnabled ? .on : .off
         menu.addItem(login)
         menu.addItem(item("Set Up…", #selector(openSetup), ""))
-        menu.addItem(item("Quit", #selector(NSApplication.terminate(_:)), "q"))
+        // Target must be NSApp: with the delegate as target the action fails
+        // validation (delegate has no terminate(_:)) and Quit renders disabled.
+        let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApp
+        menu.addItem(quit)
         return menu
     }
 
@@ -435,49 +542,157 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return img
     }
 
+    /// Battery shell like the system battery icon: 1pt hairline outline,
+    /// pixel-aligned, with a small cap nub past the right edge.
+    private func drawShell(_ body: NSRect) {
+        let tint = NSColor.labelColor.withAlphaComponent(0.5)
+        let r = body.height * 0.28
+        let outline = NSBezierPath(roundedRect: body.insetBy(dx: 0.5, dy: 0.5),
+                                   xRadius: r, yRadius: r)
+        outline.lineWidth = 1
+        tint.setStroke()
+        outline.stroke()
+        let capH = body.height * 0.36
+        let cap = NSRect(x: body.maxX + 1, y: body.midY - capH / 2, width: 1.5, height: capH)
+        tint.setFill()
+        NSBezierPath(roundedRect: cap, xRadius: 0.75, yRadius: 0.75).fill()
+    }
+
+    /// Colour charge bar inside a shell; `track` is the full-width area at 100%.
+    private func drawFill(_ track: NSRect, percent: Double) {
+        let w = track.width * max(0, min(100, percent)) / 100
+        guard w > 0.5 else { return }
+        let r = min(2, track.height / 2, w / 2)
+        fillColor(percent).setFill()
+        NSBezierPath(roundedRect: NSRect(x: track.minX, y: track.minY, width: w, height: track.height),
+                     xRadius: r, yRadius: r).fill()
+    }
+
+    /// One battery per gauge, with its percentage alongside.
     func gaugeImage(_ gauges: [Gauge]) -> NSImage {
-        let h: CGFloat = 22, bodyW: CGFloat = 20, bodyH: CGFloat = 9, capW: CGFloat = 2
-        let gap: CGFloat = 3, gaugeGap: CGFloat = 8, pad: CGFloat = 3
-        let font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        let h: CGFloat = 22, bodyW: CGFloat = 26, bodyH: CGFloat = 12
+        let capExt: CGFloat = 2.5   // gap + cap nub beyond the shell
+        let gap: CGFloat = 4, gaugeGap: CGFloat = 10, pad: CGFloat = 2
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         let numAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
 
         let items: [(g: Gauge, s: NSAttributedString, w: CGFloat)] = gauges.map { g in
             let s = NSAttributedString(string: "\(Int(g.percent))", attributes: numAttrs)
-            return (g, s, bodyW + capW + gap + ceil(s.size().width))
+            return (g, s, bodyW + capExt + gap + ceil(s.size().width))
         }
         let total = items.isEmpty ? 8
             : pad * 2 + items.reduce(0) { $0 + $1.w } + gaugeGap * CGFloat(items.count - 1)
 
-        let img = NSImage(size: NSSize(width: total, height: h))
-        img.lockFocus()
-        var x = pad
-        let by = (h - bodyH) / 2
-        for it in items {
-            let body = NSRect(x: x, y: by, width: bodyW, height: bodyH)
-            let track = NSBezierPath(roundedRect: body, xRadius: 2, yRadius: 2)
-            NSColor.tertiaryLabelColor.setFill(); track.fill()
-
-            let p = max(0, min(100, it.g.percent)) / 100
-            let fw = (bodyW - 2) * p
-            if fw > 0.5 {
-                let fr = NSRect(x: x + 1, y: by + 1, width: fw, height: bodyH - 2)
-                levelColor(it.g.percent).setFill()
-                NSBezierPath(roundedRect: fr, xRadius: 1.5, yRadius: 1.5).fill()
+        return NSImage(size: NSSize(width: total, height: h), flipped: false) { _ in
+            var x = pad
+            let by = ((h - bodyH) / 2).rounded()
+            for it in items {
+                let body = NSRect(x: x, y: by, width: bodyW, height: bodyH)
+                self.drawShell(body)
+                self.drawFill(body.insetBy(dx: 2, dy: 2), percent: it.g.percent)
+                let sy = ((h - it.s.size().height) / 2).rounded()
+                it.s.draw(at: NSPoint(x: x + bodyW + capExt + gap, y: sy))
+                x += it.w + gaugeGap
             }
-            NSColor.quaternaryLabelColor.setStroke()
-            track.lineWidth = 0.75; track.stroke()
-
-            let cap = NSRect(x: x + bodyW, y: (h - 5) / 2, width: capW, height: 5)
-            NSColor.tertiaryLabelColor.setFill()
-            NSBezierPath(roundedRect: cap, xRadius: 1, yRadius: 1).fill()
-
-            let sy = (h - it.s.size().height) / 2
-            it.s.draw(at: NSPoint(x: x + bodyW + capW + gap, y: sy))
-            x += it.w + gaugeGap
+            return true
         }
-        img.unlockFocus()
-        img.isTemplate = false
-        return img
+    }
+
+    private func peakLabel(_ gauges: [Gauge]) -> NSAttributedString {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let peak = gauges.map(\.percent).max() ?? 0
+        return NSAttributedString(string: "\(Int(peak))",
+                                  attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+    }
+
+    /// One rounded column per gauge over a faint full-height track,
+    /// with the highest percentage alongside.
+    func barsImage(_ gauges: [Gauge]) -> NSImage {
+        let h: CGFloat = 22, chartH: CGFloat = 15, barW: CGFloat = 4.5, barGap: CGFloat = 2
+        let gap: CGFloat = 4, pad: CGFloat = 2
+        let s = peakLabel(gauges)
+        let chartW = barW * CGFloat(gauges.count) + barGap * CGFloat(max(0, gauges.count - 1))
+        let total = pad * 2 + chartW + gap + ceil(s.size().width)
+
+        return NSImage(size: NSSize(width: total, height: h), flipped: false) { _ in
+            let baseY = ((h - chartH) / 2).rounded()
+            for (i, g) in gauges.enumerated() {
+                let x = pad + CGFloat(i) * (barW + barGap)
+                NSColor.labelColor.withAlphaComponent(0.18).setFill()
+                NSBezierPath(roundedRect: NSRect(x: x, y: baseY, width: barW, height: chartH),
+                             xRadius: barW / 2, yRadius: barW / 2).fill()
+                let bh = max(barW, chartH * max(0, min(100, g.percent)) / 100)
+                self.fillColor(g.percent).setFill()
+                NSBezierPath(roundedRect: NSRect(x: x, y: baseY, width: barW, height: bh),
+                             xRadius: barW / 2, yRadius: barW / 2).fill()
+            }
+            let sy = ((h - s.size().height) / 2).rounded()
+            s.draw(at: NSPoint(x: pad + chartW + gap, y: sy))
+            return true
+        }
+    }
+
+    /// Concentric activity-style rings, outermost = first gauge, sweeping
+    /// clockwise from 12 o'clock, with the highest percentage alongside.
+    func ringsImage(_ gauges: [Gauge]) -> NSImage {
+        let h: CGFloat = 22, d: CGFloat = 18, stroke: CGFloat = 2.2, ringGap: CGFloat = 0.6
+        let gap: CGFloat = 4, pad: CGFloat = 2
+        let s = peakLabel(gauges)
+        let total = pad * 2 + d + gap + ceil(s.size().width)
+
+        return NSImage(size: NSSize(width: total, height: h), flipped: false) { _ in
+            let c = NSPoint(x: pad + d / 2, y: h / 2)
+            for (i, g) in gauges.enumerated() {
+                let r = d / 2 - stroke / 2 - CGFloat(i) * (stroke + ringGap)
+                guard r > stroke / 2 else { break }
+                let track = NSBezierPath()
+                track.appendArc(withCenter: c, radius: r, startAngle: 0, endAngle: 360)
+                track.lineWidth = stroke
+                NSColor.labelColor.withAlphaComponent(0.18).setStroke()
+                track.stroke()
+                let p = max(0, min(100, g.percent)) / 100
+                guard p > 0.01 else { continue }
+                let arc = NSBezierPath()
+                arc.lineWidth = stroke
+                arc.lineCapStyle = .round
+                arc.appendArc(withCenter: c, radius: r,
+                              startAngle: 90, endAngle: 90 - p * 360, clockwise: true)
+                self.fillColor(g.percent).setStroke()
+                arc.stroke()
+            }
+            let sy = ((h - s.size().height) / 2).rounded()
+            s.draw(at: NSPoint(x: pad + d + gap, y: sy))
+            return true
+        }
+    }
+
+    /// All gauges as stacked colour bars inside a single battery shell,
+    /// with the highest percentage alongside.
+    func consolidatedImage(_ gauges: [Gauge]) -> NSImage {
+        let h: CGFloat = 22, bodyW: CGFloat = 28, bodyH: CGFloat = 16
+        let capExt: CGFloat = 2.5, gap: CGFloat = 4, pad: CGFloat = 2
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let peak = gauges.map(\.percent).max() ?? 0
+        let s = NSAttributedString(string: "\(Int(peak))",
+                                   attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+        let total = pad * 2 + bodyW + capExt + gap + ceil(s.size().width)
+
+        return NSImage(size: NSSize(width: total, height: h), flipped: false) { _ in
+            let body = NSRect(x: pad, y: ((h - bodyH) / 2).rounded(), width: bodyW, height: bodyH)
+            self.drawShell(body)
+            let inner = body.insetBy(dx: 2, dy: 2)
+            let barGap: CGFloat = 1
+            let rows = CGFloat(gauges.count)
+            let barH = (inner.height - barGap * (rows - 1)) / rows
+            for (i, g) in gauges.enumerated() {
+                let y = inner.maxY - barH - CGFloat(i) * (barH + barGap)
+                self.drawFill(NSRect(x: inner.minX, y: y, width: inner.width, height: barH),
+                              percent: g.percent)
+            }
+            let sy = ((h - s.size().height) / 2).rounded()
+            s.draw(at: NSPoint(x: body.maxX + capExt + gap, y: sy))
+            return true
+        }
     }
 }
 

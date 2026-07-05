@@ -8,6 +8,10 @@ so you can see how close you are to your limits without opening the app.
 
 Green under 50%, amber 50–79%, red at 80%+. Click the item for a labelled
 breakdown with reset times, a **Refresh now** button, and **Open at Login**.
+The menu also offers an **Icon Shape** (battery, bar chart, or rings), an
+**Icon Style** (colour, greyscale, or system-battery monochrome), and — for
+the battery shape — a **Consolidated Icon** mode that stacks all three gauges
+in a single glyph with the highest percentage beside it.
 
 ## Requirements
 
