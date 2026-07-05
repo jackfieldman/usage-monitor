@@ -390,7 +390,9 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     private var apiStatus: NSTextField?
     private var status: NSTextField?
     private var primary: NSButton?
+    private var apiButtons: [NSButton] = []
     private let cost = CostClient()
+    private var busy = false
 
     func present() {
         if window == nil { build() }
@@ -432,10 +434,12 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         let apiStatus = NSTextField(labelWithString: "")
         apiStatus.font = .systemFont(ofSize: 12, weight: .medium)
         self.apiStatus = apiStatus
-        let scanBtn = button("Scan this Mac…", #selector(scanForKeys))
-        let enterBtn = button("Enter key…", #selector(enterKey))
+        let getBtn = button("Get a key…", #selector(openConsole))
+        let scanBtn = button("Scan Mac…", #selector(scanForKeys))
+        let enterBtn = button("Enter manually…", #selector(enterKey))
         let removeBtn = button("Remove", #selector(removeKey))
-        let apiRow = NSStackView(views: [scanBtn, enterBtn, removeBtn, NSView()])
+        apiButtons = [getBtn, scanBtn, enterBtn, removeBtn]
+        let apiRow = NSStackView(views: [getBtn, scanBtn, enterBtn, removeBtn, NSView()])
         apiRow.orientation = .horizontal; apiRow.spacing = 8
 
         let status = NSTextField(labelWithString: "")
@@ -522,12 +526,25 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
     // MARK: API key — scan / manual / remove
 
+    @objc func openConsole() {
+        if let url = URL(string: "https://console.anthropic.com/settings/keys") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     @objc func scanForKeys() {
+        guard !busy else { return }
+        setBusy(true)
         apiStatus?.stringValue = "Scanning…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let found = KeyScanner.scan()
-            DispatchQueue.main.async { self?.presentScanResults(found) }
+            DispatchQueue.main.async { self?.setBusy(false); self?.presentScanResults(found) }
         }
+    }
+
+    private func setBusy(_ on: Bool) {
+        busy = on
+        apiButtons.forEach { $0.isEnabled = !on }
     }
 
     private func presentScanResults(_ found: [FoundKey]) {
@@ -556,7 +573,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     }
 
     @objc func enterKey() {
-        guard let window else { return }
+        guard !busy, let window else { return }
         let alert = NSAlert()
         alert.messageText = "Enter your Admin API key"
         alert.informativeText = "Starts with sk-ant-admin. Input is hidden and stored "
@@ -576,12 +593,14 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
     /// Verify the key against the cost endpoint before storing it.
     private func validateAndStore(_ key: String) {
+        setBusy(true)
         apiStatus?.stringValue = "Verifying key…"
         apiStatus?.textColor = .secondaryLabelColor
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let ok = self?.cost.validate(adminKey: key) ?? false
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.setBusy(false)
                 if ok {
                     try? Keychain.storeAdminKey(key)
                     self.onKeyChanged?()

@@ -4,14 +4,26 @@ A tiny macOS **menu-bar app** that shows your Claude usage limits as
 battery-style gauges — session, all-models weekly, and per-model weekly —
 so you can see how close you are to your limits without opening the app.
 
-<!-- screenshot placeholder: three mini batteries in the menu bar -->
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/icons-dark.png">
+    <img alt="The menu-bar gauges, and the icon shape and style options" src="docs/icons-light.png" width="720">
+  </picture>
+</p>
 
 Green under 50%, amber 50–79%, red at 80%+. Click the item for a labelled
 breakdown with reset times, a **Refresh now** button, and **Open at Login**.
-The menu also offers an **Icon Shape** (battery, bar chart, or rings), an
-**Icon Style** (colour, greyscale, or system-battery monochrome), and — for
-the battery shape — a **Consolidated Icon** mode that stacks all three gauges
-in a single glyph with the highest percentage beside it.
+
+The icon is configurable from that menu:
+
+- **Icon Shape** — **Battery** (default), **Bar chart**, or **Rings**.
+- **Icon Style** — **Colour** (traffic-light), **Greyscale** (level as
+  lightness), or **System Battery** (monochrome until the red zone).
+- **Consolidated Icon** — for the battery shape, stacks all three gauges in one
+  glyph with the highest percentage beside it, to save menu-bar space.
+
+Each gauge's number is the percent used; the shapes and styles above all show
+the same three example gauges (21% / 58% / 93%).
 
 ## Requirements
 
@@ -82,7 +94,9 @@ sent only to Anthropic over HTTPS.
 
 Your token and usage data never leave your Mac except in the request to
 Anthropic's own server — the same server Claude Code already talks to. There
-is no third-party server, telemetry, or analytics.
+is no third-party server, telemetry, or analytics. If you add an Admin API key,
+it lives only in your macOS Keychain, is never written to disk or logged, and
+is sent only to Anthropic over HTTPS to read your cost report.
 
 ### ⚠️ Unofficial
 
