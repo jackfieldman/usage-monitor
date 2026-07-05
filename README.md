@@ -27,20 +27,26 @@ cd usage-monitor
 open UsageMonitor.app
 ```
 
+On first launch (or any time it's not signed in) a **setup window** walks you
+through the two prerequisites — installing Claude Code and signing in. You can
+reopen it any time from the menu-bar **Set Up…** item.
+
 Then use **Open at Login** in the menu to have it start automatically. Move
 `UsageMonitor.app` to `/Applications` first if you want it to live there.
 
 ### From a downloaded build
 
-Because the app isn't signed by an identified Apple developer, macOS
-Gatekeeper quarantines it on first open. Clear the quarantine flag once:
+A signed & notarized build (from the Releases page) opens with a normal
+double-click. If you built or received an **unsigned/ad-hoc** copy, macOS
+Gatekeeper quarantines it on first open — clear the flag once:
 
 ```sh
 xattr -dr com.apple.quarantine /path/to/UsageMonitor.app
 open /path/to/UsageMonitor.app
 ```
 
-(If the download *is* a signed & notarized build, just double-click it.)
+Maintainers: see [SIGNING.md](SIGNING.md) for the signed-release pipeline
+(`./release.sh`).
 
 ## How it works
 

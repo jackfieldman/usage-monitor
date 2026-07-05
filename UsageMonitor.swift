@@ -170,11 +170,133 @@ final class UsageClient {
     }
 }
 
+// MARK: - Onboarding
+
+func claudeInstalled() -> Bool {
+    let paths = ["\(NSHomeDirectory())/.local/bin/claude",
+                 "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+    if paths.contains(where: { FileManager.default.isExecutableFile(atPath: $0) }) { return true }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    p.arguments = ["which", "claude"]
+    p.standardOutput = Pipe(); p.standardError = Pipe()
+    do { try p.run(); p.waitUntilExit(); return p.terminationStatus == 0 } catch { return false }
+}
+
+func signedInToClaude() -> Bool {
+    guard let cred = try? Keychain.read(),
+          let oauth = cred["claudeAiOauth"] as? [String: Any],
+          let t = oauth["accessToken"] as? String else { return false }
+    return !t.isEmpty
+}
+
+/// First-run window that walks a new user through the two prerequisites.
+final class OnboardingController: NSObject, NSWindowDelegate {
+    var onReady: (() -> Void)?
+    private var window: NSWindow?
+    private var body: NSTextField?
+    private var status: NSTextField?
+    private var primary: NSButton?
+
+    func present() {
+        if window == nil { build() }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.center()
+        window?.makeKeyAndOrderFront(nil)
+        refresh()
+    }
+
+    private func build() {
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 340),
+                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        win.title = "Usage Monitor Setup"
+        win.delegate = self
+        win.isReleasedWhenClosed = false
+
+        let heading = NSTextField(labelWithString: "Welcome to Usage Monitor 🔋")
+        heading.font = .systemFont(ofSize: 18, weight: .bold)
+
+        let body = NSTextField(wrappingLabelWithString: "")
+        body.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        self.body = body
+
+        let status = NSTextField(labelWithString: "")
+        status.font = .systemFont(ofSize: 11)
+        status.textColor = .secondaryLabelColor
+        self.status = status
+
+        let copyBtn = NSButton(title: "Copy install command", target: self, action: #selector(copyInstall))
+        copyBtn.bezelStyle = .rounded
+        let recheck = NSButton(title: "Re-check", target: self, action: #selector(refresh))
+        recheck.bezelStyle = .rounded
+        let primary = NSButton(title: "Get Started", target: self, action: #selector(finish))
+        primary.bezelStyle = .rounded
+        primary.keyEquivalent = "\r"
+        self.primary = primary
+
+        let btnRow = NSStackView(views: [copyBtn, NSView(), recheck, primary])
+        btnRow.orientation = .horizontal
+        btnRow.spacing = 8
+
+        let stack = NSStackView(views: [heading, body, NSView(), status, btnRow])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 24, bottom: 20, right: 24)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let content = NSView()
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: content.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            body.widthAnchor.constraint(equalToConstant: 432),
+            btnRow.widthAnchor.constraint(equalToConstant: 432),
+        ])
+        win.contentView = content
+        self.window = win
+    }
+
+    @objc func refresh() {
+        let hasCLI = claudeInstalled()
+        let signedIn = signedInToClaude()
+        func mark(_ ok: Bool) -> String { ok ? "✅" : "⬜️" }
+        body?.stringValue = """
+        The app reads your Claude usage from Claude Code — no separate login.
+
+        \(mark(hasCLI))  1. Install Claude Code
+              curl -fsSL https://claude.ai/install.sh | bash
+
+        \(mark(signedIn))  2. Sign in to Claude Code
+              Run  claude  in a terminal and complete sign-in.
+              (Requires a Claude Pro or Max subscription.)
+        """
+        let ready = hasCLI && signedIn
+        primary?.isEnabled = ready
+        status?.stringValue = ready ? "All set — you're good to go."
+                                    : "Do the unchecked steps, then Re-check."
+    }
+
+    @objc func copyInstall() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("curl -fsSL https://claude.ai/install.sh | bash", forType: .string)
+        status?.stringValue = "Install command copied — paste it into a terminal."
+    }
+
+    @objc func finish() {
+        window?.close()
+        onReady?()
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let client = UsageClient()
+    let onboarding = OnboardingController()
     var timer: Timer?
     var gauges: [Gauge] = []
     var lastError: String?
@@ -182,12 +304,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        onboarding.onReady = { [weak self] in self?.poll() }
         render()
         poll()
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.poll()
         }
+        if !signedInToClaude() { onboarding.present() }   // first-run guidance
     }
+
+    @objc func openSetup() { onboarding.present() }
 
     @objc func poll() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -246,6 +372,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let login = item("Open at Login", #selector(toggleLogin), "")
         login.state = loginEnabled ? .on : .off
         menu.addItem(login)
+        menu.addItem(item("Set Up…", #selector(openSetup), ""))
         menu.addItem(item("Quit", #selector(NSApplication.terminate(_:)), "q"))
         return menu
     }
