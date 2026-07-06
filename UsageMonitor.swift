@@ -44,10 +44,36 @@ enum UsageError: LocalizedError {
     }
 }
 
+/// Usage severity. The 50/80 thresholds live here only (DESIGN.md "the contract"),
+/// so the colour and its greyscale/battery shade can never drift apart.
+enum Level {
+    case low, mid, high
+    init(_ pct: Double) { self = pct >= 80 ? .high : (pct >= 50 ? .mid : .low) }
+}
+
 func levelColor(_ pct: Double) -> NSColor {
-    if pct >= 80 { return NSColor(srgbRed: 1.00, green: 0.27, blue: 0.23, alpha: 1) }
-    if pct >= 50 { return NSColor(srgbRed: 1.00, green: 0.62, blue: 0.04, alpha: 1) }
-    return NSColor(srgbRed: 0.19, green: 0.82, blue: 0.35, alpha: 1)
+    switch Level(pct) {
+    case .high: return NSColor(srgbRed: 1.00, green: 0.27, blue: 0.23, alpha: 1)
+    case .mid:  return NSColor(srgbRed: 1.00, green: 0.62, blue: 0.04, alpha: 1)
+    case .low:  return NSColor(srgbRed: 0.19, green: 0.82, blue: 0.35, alpha: 1)
+    }
+}
+
+/// Synchronous HTTP: performs `req` and blocks until it completes. MUST be called
+/// off the main thread. Returns (body, statusCode); throws on transport failure.
+func httpSync(_ req: URLRequest) throws -> (Data, Int) {
+    let sem = DispatchSemaphore(value: 0)
+    var result: (Data, Int)?
+    var failure: Error?
+    URLSession.shared.dataTask(with: req) { d, resp, e in
+        if let e { failure = e } else {
+            result = (d ?? Data(), (resp as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+        sem.signal()
+    }.resume()
+    sem.wait()
+    if let failure { throw failure }
+    return result!
 }
 
 // MARK: - Keychain (via /usr/bin/security — same item Claude Code uses)
@@ -172,8 +198,16 @@ enum KeyScanner {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: shell)
         p.arguments = ["-lic", "env"]
-        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
-        do { try p.run(); p.waitUntilExit() } catch { return nil }
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        p.standardInput = FileHandle.nullDevice   // never block waiting on stdin
+        let done = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in done.signal() }
+        do { try p.run() } catch { return nil }
+        // A slow or hung profile (prompt, network in .zshrc, nvm/pyenv init) must
+        // not wedge the scan forever — give up after a few seconds.
+        if done.wait(timeout: .now() + 3) == .timedOut { p.terminate(); return nil }
         return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
     }
 }
@@ -204,7 +238,7 @@ final class CostClient {
             var req = URLRequest(url: comps.url!)
             req.setValue(adminKey, forHTTPHeaderField: "x-api-key")
             req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-            let (data, code) = try syncData(req)
+            let (data, code) = try httpSync(req)
             guard code == 200 else { throw UsageError.http(code) }
 
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
@@ -219,11 +253,6 @@ final class CostClient {
         return cents / 100.0
     }
 
-    /// True if the key authenticates against the cost endpoint (used to validate).
-    func validate(adminKey: String) -> Bool {
-        (try? fetchMonthToDate(adminKey: adminKey)) != nil
-    }
-
     private static func startOfMonthUTC() -> String {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC")!
@@ -232,21 +261,6 @@ final class CostClient {
         let f = ISO8601DateFormatter()
         f.timeZone = TimeZone(identifier: "UTC")
         return f.string(from: start)
-    }
-
-    private func syncData(_ req: URLRequest) throws -> (Data, Int) {
-        let sem = DispatchSemaphore(value: 0)
-        var result: (Data, Int)?
-        var failure: Error?
-        URLSession.shared.dataTask(with: req) { d, resp, e in
-            if let e { failure = e } else {
-                result = (d ?? Data(), (resp as? HTTPURLResponse)?.statusCode ?? 0)
-            }
-            sem.signal()
-        }.resume()
-        sem.wait()
-        if let failure { throw failure }
-        return result!
     }
 }
 
@@ -292,7 +306,7 @@ final class UsageClient {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
-        let (data, code) = try syncData(req)
+        let (data, code) = try httpSync(req)
         guard code == 200,
               let tok = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let at = tok["access_token"] as? String else { throw UsageError.refreshFailed }
@@ -310,22 +324,7 @@ final class UsageClient {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        return try syncData(req)
-    }
-
-    private func syncData(_ req: URLRequest) throws -> (Data, Int) {
-        let sem = DispatchSemaphore(value: 0)
-        var result: (Data, Int)?
-        var failure: Error?
-        URLSession.shared.dataTask(with: req) { d, resp, e in
-            if let e { failure = e } else {
-                result = (d ?? Data(), (resp as? HTTPURLResponse)?.statusCode ?? 0)
-            }
-            sem.signal()
-        }.resume()
-        sem.wait()
-        if let failure { throw failure }
-        return result!
+        return try httpSync(req)
     }
 
     // limits[] -> Gauge
@@ -591,27 +590,42 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         }
     }
 
-    /// Verify the key against the cost endpoint before storing it.
+    /// Verify the key before storing it. A clear auth rejection (401/403) means
+    /// the key is wrong. A network or transient failure must NOT reject a good
+    /// key — we store it and let the next refresh confirm it.
     private func validateAndStore(_ key: String) {
+        enum Outcome { case ok, invalid, unverified }
         setBusy(true)
         apiStatus?.stringValue = "Verifying key…"
         apiStatus?.textColor = .secondaryLabelColor
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let ok = self?.cost.validate(adminKey: key) ?? false
+            guard let self else { return }
+            let outcome: Outcome
+            do { _ = try self.cost.fetchMonthToDate(adminKey: key); outcome = .ok }
+            catch let UsageError.http(code) where code == 401 || code == 403 { outcome = .invalid }
+            catch { outcome = .unverified }
             DispatchQueue.main.async {
-                guard let self else { return }
                 self.setBusy(false)
-                if ok {
+                if outcome != .invalid {
                     try? Keychain.storeAdminKey(key)
                     self.onKeyChanged?()
-                } else if let window = self.window {
-                    let a = NSAlert()
-                    a.messageText = "That key didn't work"
-                    a.informativeText = "It was rejected by the cost report endpoint. Make "
-                        + "sure it's an Admin key (sk-ant-admin) with billing access."
-                    a.beginSheetModal(for: window) { _ in }
                 }
                 self.refresh()
+                switch outcome {
+                case .unverified:
+                    self.apiStatus?.stringValue = "Saved — couldn't reach Anthropic to verify; will check on next refresh."
+                    self.apiStatus?.textColor = .secondaryLabelColor
+                case .invalid:
+                    if let window = self.window {
+                        let a = NSAlert()
+                        a.messageText = "That key didn't work"
+                        a.informativeText = "It was rejected as unauthorized. Make sure it's an "
+                            + "Admin key (sk-ant-admin) with billing access."
+                        a.beginSheetModal(for: window) { _ in }
+                    }
+                case .ok:
+                    break
+                }
             }
         }
     }
@@ -641,11 +655,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastUpdated: Date?
     var monthSpend: Double?      // month-to-date USD, nil if no key or not yet fetched
     var costError: String?
+    var hasAdminKey = false      // cached so render()/makeMenu don't spawn `security` each time
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        hasAdminKey = apiKeyConfigured()
         onboarding.onReady = { [weak self] in self?.poll() }
-        onboarding.onKeyChanged = { [weak self] in self?.pollCost() }
+        onboarding.onKeyChanged = { [weak self] in
+            guard let self else { return }
+            self.hasAdminKey = apiKeyConfigured()
+            self.pollCost()
+        }
         render()
         poll()
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
@@ -673,11 +693,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func pollCost() {
-        guard let key = Keychain.readAdminKey() else {
-            monthSpend = nil; costError = nil; return
-        }
+        guard hasAdminKey else { monthSpend = nil; costError = nil; return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
+            guard let self, let key = Keychain.readAdminKey() else { return }
             do {
                 let usd = try self.costClient.fetchMonthToDate(adminKey: key)
                 DispatchQueue.main.async { self.monthSpend = usd; self.costError = nil; self.render() }
@@ -747,11 +765,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch iconStyle {
         case .colour: return levelColor(pct)
         case .greyscale:
-            if pct >= 80 { return .labelColor }
-            if pct >= 50 { return NSColor.labelColor.withAlphaComponent(0.62) }
-            return NSColor.labelColor.withAlphaComponent(0.38)
+            switch Level(pct) {
+            case .high: return .labelColor
+            case .mid:  return NSColor.labelColor.withAlphaComponent(0.62)
+            case .low:  return NSColor.labelColor.withAlphaComponent(0.38)
+            }
         case .battery:
-            return pct >= 80 ? levelColor(pct) : .labelColor
+            return Level(pct) == .high ? levelColor(pct) : .labelColor
         }
     }
 
@@ -775,14 +795,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if let err = lastError { menu.addItem(disabled("⚠︎  \(err) (showing last good data)")) }
         }
-        if apiKeyConfigured() {
+        if hasAdminKey {
             menu.addItem(.separator())
             menu.addItem(disabled("API spend (this month)"))
-            if let usd = monthSpend {
-                menu.addItem(disabled(String(format: "$%.2f used", usd)))
-            } else if let err = costError {
-                menu.addItem(disabled("⚠︎  \(err)"))
-            } else {
+            if let usd = monthSpend { menu.addItem(disabled(String(format: "$%.2f used", usd))) }
+            if let err = costError {
+                menu.addItem(disabled(monthSpend == nil ? "⚠︎  \(err)"
+                                                        : "⚠︎  \(err) (showing last good data)"))
+            } else if monthSpend == nil {
                 menu.addItem(disabled("Loading…"))
             }
         }
@@ -968,10 +988,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSColor.labelColor.withAlphaComponent(0.18).setFill()
                 NSBezierPath(roundedRect: NSRect(x: x, y: baseY, width: barW, height: chartH),
                              xRadius: barW / 2, yRadius: barW / 2).fill()
-                let bh = max(barW, chartH * max(0, min(100, g.percent)) / 100)
-                self.fillColor(g.percent).setFill()
-                NSBezierPath(roundedRect: NSRect(x: x, y: baseY, width: barW, height: bh),
-                             xRadius: barW / 2, yRadius: barW / 2).fill()
+                let p = max(0, min(100, g.percent)) / 100
+                if p > 0 {   // 0% shows only the track, matching the battery styles
+                    let bh = max(barW, chartH * p)   // min height keeps small values visible
+                    self.fillColor(g.percent).setFill()
+                    NSBezierPath(roundedRect: NSRect(x: x, y: baseY, width: barW, height: bh),
+                                 xRadius: barW / 2, yRadius: barW / 2).fill()
+                }
             }
             let sy = ((h - s.size().height) / 2).rounded()
             s.draw(at: NSPoint(x: pad + chartW + gap, y: sy))
