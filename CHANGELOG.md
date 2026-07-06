@@ -3,6 +3,11 @@
 All notable changes to Usage Monitor are recorded here. Versions follow the
 `CFBundleShortVersionString` in `build.sh`.
 
+## 1.4.1
+
+- Enabling notifications now posts a one-time confirmation ("Notifications are
+  on…") so you can see they work — once per enable.
+
 ## 1.4
 
 - **Defaults changed** to **Bar chart** shape + **Greyscale** style — the most

@@ -709,6 +709,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         render()
         poll()
+        if notifyEnabled && !notifyConfirmed { requestAuthThenConfirm() }
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.poll()
         }
@@ -771,15 +772,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         get { UserDefaults.standard.bool(forKey: "notifyEnabled") }
         set { UserDefaults.standard.set(newValue, forKey: "notifyEnabled") }
     }
+    /// Whether we've shown the one-time "notifications are on" confirmation.
+    var notifyConfirmed: Bool {
+        get { UserDefaults.standard.bool(forKey: "notifyConfirmed") }
+        set { UserDefaults.standard.set(newValue, forKey: "notifyConfirmed") }
+    }
 
     @objc func toggleNotify() {
         notifyEnabled.toggle()
         if notifyEnabled {
-            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            requestAuthThenConfirm()
         } else {
             // Turning off clears our stacked banners so they can all be dismissed at once.
             UNUserNotificationCenter.current().removeAllDeliveredNotifications()
             notifiedHigh.removeAll(); saveNotified()
+            notifyConfirmed = false   // re-confirm the next time it's turned on
+        }
+    }
+
+    /// Requests permission (no re-prompt once decided) and, if granted, posts a
+    /// single confirmation so you can see notifications work — once per enable.
+    func requestAuthThenConfirm() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
+            guard granted else { return }
+            DispatchQueue.main.async {
+                guard let self, !self.notifyConfirmed else { return }
+                self.notifyConfirmed = true
+                let c = UNMutableNotificationContent()
+                c.title = "Usage Monitor"
+                c.body = "Notifications are on — I'll alert you when a limit passes 80%."
+                UNUserNotificationCenter.current().add(
+                    UNNotificationRequest(identifier: "usage-confirm", content: c, trigger: nil))
+            }
         }
     }
 
