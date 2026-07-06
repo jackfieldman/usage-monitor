@@ -25,6 +25,11 @@ The icon is configurable from that menu:
 Each gauge's number is the percent used; the shapes and styles above all show
 the same three example gauges (21% / 58% / 93%).
 
+Turn on **Notify near a limit (80%)** in the menu to get a macOS notification
+the moment any limit first crosses into the red zone — so you hear about it
+without watching the menu bar. It alerts once per crossing and re-arms after the
+limit resets below 80%.
+
 ## Requirements
 
 - macOS 13 (Ventura) or later

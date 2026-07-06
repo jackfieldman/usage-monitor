@@ -6,6 +6,8 @@
 // Build:  ./build.sh      Run:  open UsageMonitor.app
 import AppKit
 import ServiceManagement
+import Security
+import UserNotifications
 
 // MARK: - Model
 
@@ -34,12 +36,13 @@ enum IconStyle: String, CaseIterable {
 }
 
 enum UsageError: LocalizedError {
-    case noCredential, refreshFailed, http(Int)
+    case noCredential, refreshFailed, http(Int), keychain(OSStatus)
     var errorDescription: String? {
         switch self {
         case .noCredential: return "Not signed in to Claude Code"
         case .refreshFailed: return "Couldn't refresh the login token"
         case .http(let c): return "Usage API returned HTTP \(c)"
+        case .keychain(let s): return "Keychain error \(s)"
         }
     }
 }
@@ -76,7 +79,7 @@ func httpSync(_ req: URLRequest) throws -> (Data, Int) {
     return result!
 }
 
-// MARK: - Keychain (via /usr/bin/security — same item Claude Code uses)
+// MARK: - Keychain (Claude Code item via /usr/bin/security; our Admin key via SecItem)
 
 enum Keychain {
     static let service = "Claude Code-credentials"
@@ -98,19 +101,42 @@ enum Keychain {
     }
 
     /// The Admin API key is stored only here, in the macOS Keychain — never in
-    /// UserDefaults, a file, or a log.
+    /// UserDefaults, a file, or a log. Unlike the Claude Code item (read via the
+    /// `security` CLI), this uses the in-process Security APIs so the long-lived
+    /// key is never passed as a command-line argument visible to `ps`.
+    private static func adminQuery() -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: adminService,
+         kSecAttrAccount as String: NSUserName()]
+    }
+
     static func readAdminKey() -> String? {
-        guard let k = try? run(["find-generic-password", "-s", adminService, "-a", NSUserName(), "-w"]),
-              !k.isEmpty else { return nil }
-        return k
+        var q = adminQuery()
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: AnyObject?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+              let data = out as? Data, let s = String(data: data, encoding: .utf8), !s.isEmpty
+        else { return nil }
+        return s
     }
 
     static func storeAdminKey(_ key: String) throws {
-        _ = try run(["add-generic-password", "-U", "-s", adminService, "-a", NSUserName(), "-w", key])
+        let value = [kSecValueData as String: Data(key.utf8)] as CFDictionary
+        let status = SecItemUpdate(adminQuery() as CFDictionary, value)
+        if status == errSecItemNotFound {
+            var add = adminQuery()
+            add[kSecValueData as String] = Data(key.utf8)
+            add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
+            let addStatus = SecItemAdd(add as CFDictionary, nil)
+            guard addStatus == errSecSuccess else { throw UsageError.keychain(addStatus) }
+        } else if status != errSecSuccess {
+            throw UsageError.keychain(status)
+        }
     }
 
     static func deleteAdminKey() {
-        _ = try? run(["delete-generic-password", "-s", adminService, "-a", NSUserName()])
+        SecItemDelete(adminQuery() as CFDictionary)
     }
 
     @discardableResult
@@ -644,8 +670,9 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let statusMenu = NSMenu()    // built once; rebuilt on open via NSMenuDelegate
     let client = UsageClient()
     let costClient = CostClient()
     let onboarding = OnboardingController()
@@ -655,11 +682,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastUpdated: Date?
     var monthSpend: Double?      // month-to-date USD, nil if no key or not yet fetched
     var costError: String?
-    var hasAdminKey = false      // cached so render()/makeMenu don't spawn `security` each time
+    var hasAdminKey = false      // cached so render()/the menu don't spawn `security` each time
+    var notifiedHigh = Set<String>()   // gauges already alerted while in the red zone
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         hasAdminKey = apiKeyConfigured()
+        statusMenu.delegate = self
+        statusItem.menu = statusMenu
         onboarding.onReady = { [weak self] in self?.poll() }
         onboarding.onKeyChanged = { [weak self] in
             guard let self else { return }
@@ -683,6 +713,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let g = try self.client.fetchUsage()
                 DispatchQueue.main.async {
+                    self.checkNotifications(g)
                     self.gauges = g; self.lastError = nil; self.lastUpdated = Date(); self.render()
                 }
             } catch {
@@ -721,7 +752,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .joined(separator: "\n")
         }
         button.imagePosition = .imageOnly
-        statusItem.menu = makeMenu()
+    }
+
+    // MARK: notifications — alert when a limit crosses into the red zone
+
+    var notifyEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "notifyEnabled") }
+        set { UserDefaults.standard.set(newValue, forKey: "notifyEnabled") }
+    }
+
+    @objc func toggleNotify() {
+        notifyEnabled.toggle()
+        if notifyEnabled {
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
+    }
+
+    /// Returns the gauges that just crossed from below 80% to 80%+ (so each
+    /// crossing alerts once), updating `notified` in place. Pure + testable.
+    static func newlyHigh(_ gauges: [Gauge], notified: inout Set<String>) -> [Gauge] {
+        var crossed: [Gauge] = []
+        for g in gauges {
+            if g.percent >= 80 {
+                if notified.insert(g.label).inserted { crossed.append(g) }
+            } else {
+                notified.remove(g.label)   // dropped back; allow a fresh alert later
+            }
+        }
+        return crossed
+    }
+
+    func checkNotifications(_ gauges: [Gauge]) {
+        guard notifyEnabled else { notifiedHigh.removeAll(); return }
+        for g in Self.newlyHigh(gauges, notified: &notifiedHigh) {
+            let c = UNMutableNotificationContent()
+            c.title = "Claude usage — \(g.label)"
+            c.body = "You're at \(Int(g.percent))% of your \(g.label.lowercased()) limit."
+            let id = "usage-\(g.label)"
+            UNUserNotificationCenter.current().add(
+                UNNotificationRequest(identifier: id, content: c, trigger: nil))
+        }
     }
 
     var consolidated: Bool {
@@ -777,8 +847,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: menu
 
-    func makeMenu() -> NSMenu {
-        let menu = NSMenu()
+    /// Rebuilt each time the menu opens — the checkmarks and dynamic text stay
+    /// current without render() reconstructing the menu on every poll.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
         if gauges.isEmpty, let err = lastError {
             menu.addItem(disabled("⚠︎  \(err)"))
             if err.contains("signed in") {
@@ -839,6 +911,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         styleItem.submenu = styleMenu
         menu.addItem(styleItem)
+        let notify = item("Notify near a limit (80%)", #selector(toggleNotify), "")
+        notify.state = notifyEnabled ? .on : .off
+        menu.addItem(notify)
         let login = item("Open at Login", #selector(toggleLogin), "")
         login.state = loginEnabled ? .on : .off
         menu.addItem(login)
@@ -848,7 +923,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         menu.addItem(quit)
-        return menu
     }
 
     func disabled(_ title: String) -> NSMenuItem {
@@ -950,7 +1024,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let total = items.isEmpty ? 8
             : pad * 2 + items.reduce(0) { $0 + $1.w } + gaugeGap * CGFloat(items.count - 1)
 
-        return NSImage(size: NSSize(width: total, height: h), flipped: false) { _ in
+        return NSImage(size: NSSize(width: total, height: h), flipped: false) { [weak self] _ in
+            guard let self else { return false }
             var x = pad
             let by = ((h - bodyH) / 2).rounded()
             for it in items {
@@ -981,7 +1056,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let chartW = barW * CGFloat(gauges.count) + barGap * CGFloat(max(0, gauges.count - 1))
         let total = pad * 2 + chartW + gap + ceil(s.size().width)
 
-        return NSImage(size: NSSize(width: total, height: h), flipped: false) { _ in
+        return NSImage(size: NSSize(width: total, height: h), flipped: false) { [weak self] _ in
+            guard let self else { return false }
             let baseY = ((h - chartH) / 2).rounded()
             for (i, g) in gauges.enumerated() {
                 let x = pad + CGFloat(i) * (barW + barGap)
@@ -1010,7 +1086,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let s = peakLabel(gauges)
         let total = pad * 2 + d + gap + ceil(s.size().width)
 
-        return NSImage(size: NSSize(width: total, height: h), flipped: false) { _ in
+        return NSImage(size: NSSize(width: total, height: h), flipped: false) { [weak self] _ in
+            guard let self else { return false }
             let c = NSPoint(x: pad + d / 2, y: h / 2)
             for (i, g) in gauges.enumerated() {
                 let r = d / 2 - stroke / 2 - CGFloat(i) * (stroke + ringGap)
@@ -1047,7 +1124,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                    attributes: [.font: font, .foregroundColor: NSColor.labelColor])
         let total = pad * 2 + bodyW + capExt + gap + ceil(s.size().width)
 
-        return NSImage(size: NSSize(width: total, height: h), flipped: false) { _ in
+        return NSImage(size: NSSize(width: total, height: h), flipped: false) { [weak self] _ in
+            guard let self else { return false }
             let body = NSRect(x: pad, y: ((h - bodyH) / 2).rounded(), width: bodyW, height: bodyH)
             self.drawShell(body)
             let inner = body.insetBy(dx: 2, dy: 2)
