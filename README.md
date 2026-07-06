@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/icon.png" width="128" alt="Usage Monitor icon"></p>
+
 # Usage Monitor
 
 A tiny macOS **menu-bar app** that shows your Claude usage limits as

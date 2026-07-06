@@ -3,6 +3,13 @@
 All notable changes to Usage Monitor are recorded here. Versions follow the
 `CFBundleShortVersionString` in `build.sh`.
 
+## 1.3
+
+- **App icon.** A proper icon — a battery gauge with a green→amber→red charge on
+  a slate squircle — now ships in the bundle, so it appears in Finder, the
+  setup window, and macOS notifications. Regenerate it with
+  `swift docs/make-icon.swift <size> <out.png>`.
+
 ## 1.2
 
 - **Limit notifications.** New **Notify near a limit (80%)** menu toggle posts a

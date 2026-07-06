@@ -434,8 +434,18 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         win.delegate = self
         win.isReleasedWhenClosed = false
 
-        let heading = NSTextField(labelWithString: "Welcome to Usage Monitor 🔋")
-        heading.font = .systemFont(ofSize: 18, weight: .bold)
+        let iconView = NSImageView()
+        iconView.image = NSApp.applicationIconImage
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        iconView.heightAnchor.constraint(equalToConstant: 44).isActive = true
+        let title = NSTextField(labelWithString: "Welcome to Usage Monitor")
+        title.font = .systemFont(ofSize: 18, weight: .bold)
+        let heading = NSStackView(views: [iconView, title])
+        heading.orientation = .horizontal
+        heading.spacing = 12
+        heading.alignment = .centerY
 
         // Section 1 — Claude Code subscription (powers the % gauges).
         let sub = sectionTitle("Claude usage gauges")

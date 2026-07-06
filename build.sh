@@ -11,9 +11,13 @@ cd "$(dirname "$0")"
 
 APP="UsageMonitor.app"
 MACOS="$APP/Contents/MacOS"
-mkdir -p "$MACOS"
+RES="$APP/Contents/Resources"
+mkdir -p "$MACOS" "$RES"
 
 swiftc -O UsageMonitor.swift -o "$MACOS/UsageMonitor" -framework AppKit
+
+# App icon — used by Finder, the Dock, and macOS notifications.
+cp AppIcon.icns "$RES/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -24,8 +28,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key>     <string>Usage Monitor</string>
     <key>CFBundleIdentifier</key>      <string>com.usagemonitor.app</string>
     <key>CFBundleExecutable</key>      <string>UsageMonitor</string>
-    <key>CFBundleVersion</key>         <string>1.2</string>
-    <key>CFBundleShortVersionString</key> <string>1.2</string>
+    <key>CFBundleIconFile</key>        <string>AppIcon</string>
+    <key>CFBundleVersion</key>         <string>1.3</string>
+    <key>CFBundleShortVersionString</key> <string>1.3</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>NSPrincipalClass</key>        <string>NSApplication</string>
     <key>LSUIElement</key>             <true/>
