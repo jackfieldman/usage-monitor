@@ -698,6 +698,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         hasAdminKey = apiKeyConfigured()
+        notifiedHigh = Set(UserDefaults.standard.stringArray(forKey: "notifiedHigh") ?? [])
         statusMenu.delegate = self
         statusItem.menu = statusMenu
         onboarding.onReady = { [weak self] in self?.poll() }
@@ -775,6 +776,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         notifyEnabled.toggle()
         if notifyEnabled {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        } else {
+            // Turning off clears our stacked banners so they can all be dismissed at once.
+            UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+            notifiedHigh.removeAll(); saveNotified()
         }
     }
 
@@ -792,9 +797,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return crossed
     }
 
+    private func saveNotified() {
+        UserDefaults.standard.set(Array(notifiedHigh), forKey: "notifiedHigh")
+    }
+
     func checkNotifications(_ gauges: [Gauge]) {
-        guard notifyEnabled else { notifiedHigh.removeAll(); return }
-        for g in Self.newlyHigh(gauges, notified: &notifiedHigh) {
+        guard notifyEnabled else {
+            if !notifiedHigh.isEmpty { notifiedHigh.removeAll(); saveNotified() }
+            return
+        }
+        let crossed = Self.newlyHigh(gauges, notified: &notifiedHigh)
+        saveNotified()   // persist so a relaunch doesn't re-alert a still-maxed limit
+        for g in crossed {
             let c = UNMutableNotificationContent()
             c.title = "Claude usage — \(g.label)"
             c.body = "You're at \(Int(g.percent))% of your \(g.label.lowercased()) limit."
@@ -815,8 +829,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     var iconShape: IconShape {
-        get { IconShape(rawValue: UserDefaults.standard.string(forKey: "iconShape") ?? "") ?? .battery }
+        get { IconShape(rawValue: UserDefaults.standard.string(forKey: "iconShape") ?? "") ?? .bars }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "iconShape") }
+    }
+
+    /// Which limit's percent the single-glyph shapes (bars/rings/consolidated)
+    /// show beside the icon. Empty = the highest of all limits.
+    var numberLabel: String {
+        get { UserDefaults.standard.string(forKey: "numberLabel") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "numberLabel") }
+    }
+
+    @objc func pickNumber(_ sender: NSMenuItem) {
+        numberLabel = (sender.representedObject as? String) ?? ""
+        render()
+    }
+
+    func displayPercent(_ gauges: [Gauge]) -> Double {
+        if !numberLabel.isEmpty, let g = gauges.first(where: { $0.label == numberLabel }) {
+            return g.percent
+        }
+        return gauges.map(\.percent).max() ?? 0
     }
 
     @objc func pickShape(_ sender: NSMenuItem) {
@@ -827,7 +860,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     var iconStyle: IconStyle {
-        get { IconStyle(rawValue: UserDefaults.standard.string(forKey: "iconStyle") ?? "") ?? .colour }
+        get { IconStyle(rawValue: UserDefaults.standard.string(forKey: "iconStyle") ?? "") ?? .greyscale }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "iconStyle") }
     }
 
@@ -921,6 +954,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         styleItem.submenu = styleMenu
         menu.addItem(styleItem)
+        // Which limit's percent the single-glyph shapes show as the number.
+        let numberItem = NSMenuItem(title: "Number Shows", action: nil, keyEquivalent: "")
+        let numberMenu = NSMenu()
+        let highest = NSMenuItem(title: "Highest", action: #selector(pickNumber(_:)), keyEquivalent: "")
+        highest.target = self
+        highest.representedObject = ""
+        highest.state = numberLabel.isEmpty ? .on : .off
+        numberMenu.addItem(highest)
+        if !gauges.isEmpty { numberMenu.addItem(.separator()) }
+        for g in gauges {
+            let i = NSMenuItem(title: g.label, action: #selector(pickNumber(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = g.label
+            i.state = g.label == numberLabel ? .on : .off
+            numberMenu.addItem(i)
+        }
+        numberItem.submenu = numberMenu
+        menu.addItem(numberItem)
         let notify = item("Notify near a limit (80%)", #selector(toggleNotify), "")
         notify.state = notifyEnabled ? .on : .off
         menu.addItem(notify)
@@ -1052,8 +1103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func peakLabel(_ gauges: [Gauge]) -> NSAttributedString {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        let peak = gauges.map(\.percent).max() ?? 0
-        return NSAttributedString(string: "\(Int(peak))",
+        return NSAttributedString(string: "\(Int(displayPercent(gauges)))",
                                   attributes: [.font: font, .foregroundColor: NSColor.labelColor])
     }
 
@@ -1128,10 +1178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func consolidatedImage(_ gauges: [Gauge]) -> NSImage {
         let h: CGFloat = 22, bodyW: CGFloat = 28, bodyH: CGFloat = 16
         let capExt: CGFloat = 2.5, gap: CGFloat = 4, pad: CGFloat = 2
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        let peak = gauges.map(\.percent).max() ?? 0
-        let s = NSAttributedString(string: "\(Int(peak))",
-                                   attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+        let s = peakLabel(gauges)
         let total = pad * 2 + bodyW + capExt + gap + ceil(s.size().width)
 
         return NSImage(size: NSSize(width: total, height: h), flipped: false) { [weak self] _ in

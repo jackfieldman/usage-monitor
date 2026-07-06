@@ -18,11 +18,13 @@ breakdown with reset times, a **Refresh now** button, and **Open at Login**.
 
 The icon is configurable from that menu:
 
-- **Icon Shape** — **Battery** (default), **Bar chart**, or **Rings**.
-- **Icon Style** — **Colour** (traffic-light), **Greyscale** (level as
-  lightness), or **System Battery** (monochrome until the red zone).
+- **Icon Shape** — **Bar chart** (default), **Battery**, or **Rings**.
+- **Icon Style** — **Greyscale** (default; level as lightness), **Colour**
+  (traffic-light), or **System Battery** (monochrome until the red zone).
 - **Consolidated Icon** — for the battery shape, stacks all three gauges in one
-  glyph with the highest percentage beside it, to save menu-bar space.
+  glyph, to save menu-bar space.
+- **Number Shows** — choose which limit's percentage sits beside the icon: the
+  highest by default, or a specific one (Session, All models, or a model).
 
 Each gauge's number is the percent used; the shapes and styles above all show
 the same three example gauges (21% / 58% / 93%).

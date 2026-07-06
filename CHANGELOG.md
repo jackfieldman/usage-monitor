@@ -3,6 +3,17 @@
 All notable changes to Usage Monitor are recorded here. Versions follow the
 `CFBundleShortVersionString` in `build.sh`.
 
+## 1.4
+
+- **Defaults changed** to **Bar chart** shape + **Greyscale** style — the most
+  menu-bar-native look. (Your existing choice is preserved if you'd set one.)
+- **Number Shows** menu — pick which limit's percentage appears beside the icon
+  (highest by default, or a specific one like Session or a model).
+- **Notifications no longer repeat** across relaunches: the "already alerted"
+  state is persisted, so a limit stuck at 100% won't re-alert every launch.
+  Turning notifications off now also clears any stacked banners.
+- App icon re-registered so it resolves for notifications and Finder.
+
 ## 1.3
 
 - **App icon.** A proper icon — a battery gauge with a green→amber→red charge on
