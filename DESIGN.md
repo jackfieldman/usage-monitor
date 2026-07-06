@@ -43,6 +43,13 @@ information. All drawing is AppKit (`UsageMonitor.swift`), resolution-
 independent via `NSImage` drawing handlers, with 1pt strokes pixel-aligned on
 half-pixel boundaries. Dimensions here are Apple points (`px` in tokens ≡ pt).
 
+**Scope.** This design system governs the **menu-bar glyph and its menu** —
+the product's visual identity. The first-run setup window and system
+notifications are deliberately built from stock AppKit/macOS controls (default
+system fonts, standard buttons and alerts) so they match the OS rather than the
+glyph; they are intentionally outside these tokens and shouldn't grow a bespoke
+visual language.
+
 ## Colors
 
 Three level colours encode usage severity, mirroring Apple's traffic-light
