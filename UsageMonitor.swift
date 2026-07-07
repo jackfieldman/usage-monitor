@@ -47,8 +47,8 @@ enum UsageError: LocalizedError {
     }
 }
 
-/// Usage severity. The 50/80 thresholds live here only (DESIGN.md "the contract"),
-/// so the colour and its greyscale/battery shade can never drift apart.
+/// Usage severity. The 50/80 thresholds live here only, so the colour and
+/// its greyscale/battery shade can never drift apart.
 enum Level {
     case low, mid, high
     init(_ pct: Double) { self = pct >= 80 ? .high : (pct >= 50 ? .mid : .low) }

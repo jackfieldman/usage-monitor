@@ -1,8 +1,9 @@
 #!/bin/bash
 # Build a signed + notarized, distributable UsageMonitor.app.
 #
-# Prereqs (one-time — see SIGNING.md):
-#   1. A "Developer ID Application" certificate installed in your login keychain.
+# Prereqs (one-time):
+#   1. A "Developer ID Application" certificate installed in your login keychain
+#      (requires a paid Apple Developer Program membership).
 #   2. A stored notarytool credential profile:
 #        xcrun notarytool store-credentials usage-monitor \
 #          --apple-id you@example.com --team-id TEAMID --password <app-specific-pw>
@@ -20,7 +21,7 @@ IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/nul
     | grep -m1 'Developer ID Application' | sed -E 's/.*"([^"]+)".*/\1/' || true)}"
 if [ -z "$IDENTITY" ]; then
     echo "✗ No 'Developer ID Application' certificate found."
-    echo "  Follow SIGNING.md to create one, then re-run."
+    echo "  Create one in Keychain Access, then re-run."
     exit 1
 fi
 

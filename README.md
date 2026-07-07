@@ -76,9 +76,6 @@ xattr -dr com.apple.quarantine /path/to/UsageMonitor.app
 open /path/to/UsageMonitor.app
 ```
 
-Maintainers: see [SIGNING.md](SIGNING.md) for the signed-release pipeline
-(`./release.sh`).
-
 ## How it works
 
 **Gauges (subscription usage).** The app reads the OAuth token Claude Code
