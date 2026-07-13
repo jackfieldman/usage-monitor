@@ -1,7 +1,9 @@
 // UsageMonitor — a self-contained macOS menu-bar app that shows Claude usage
 // limits as tiny battery gauges. No external dependencies: it reads the OAuth
 // token Claude Code stores in the Keychain, calls the same usage endpoint the
-// /usage panel uses, refreshes the token when needed, and draws the result.
+// /usage panel uses, and draws the result. Strictly a read-only consumer of
+// the credential — it never refreshes or rewrites the token (Claude Code owns
+// it; see UsageClient.fetchUsage for why refreshing here is unsafe).
 //
 // Build:  ./build.sh      Run:  open UsageMonitor.app
 import AppKit
@@ -36,11 +38,11 @@ enum IconStyle: String, CaseIterable {
 }
 
 enum UsageError: LocalizedError {
-    case noCredential, refreshFailed, http(Int), keychain(OSStatus)
+    case noCredential, tokenExpired, http(Int), keychain(OSStatus)
     var errorDescription: String? {
         switch self {
         case .noCredential: return "Not signed in to Claude Code"
-        case .refreshFailed: return "Couldn't refresh the login token"
+        case .tokenExpired: return "Login token expired — Claude Code renews it on next use"
         case .http(let c): return "Usage API returned HTTP \(c)"
         case .keychain(let s): return "Keychain error \(s)"
         }
@@ -92,12 +94,6 @@ enum Keychain {
               let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { throw UsageError.noCredential }
         return obj
-    }
-
-    static func write(_ obj: [String: Any]) throws {
-        let data = try JSONSerialization.data(withJSONObject: obj)
-        let json = String(data: data, encoding: .utf8)!
-        _ = try run(["add-generic-password", "-U", "-s", service, "-a", NSUserName(), "-w", json])
     }
 
     /// The Admin API key is stored only here, in the macOS Keychain — never in
@@ -294,55 +290,27 @@ final class CostClient {
 
 final class UsageClient {
     let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
-    let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
-    let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    let refreshSkewMS = 300_000.0   // refresh when within 5 min of expiry
 
     /// Blocking; call off the main thread.
+    ///
+    /// Read-only by design: the access token is used exactly as Claude Code
+    /// left it, and an expired token is reported — never refreshed. Refreshing
+    /// rotates the shared refresh token, and if Claude Code refreshes with its
+    /// (now stale) copy the server's reuse detection can revoke the whole
+    /// grant, logging Claude Code out. Claude Code renews the token whenever
+    /// it's used; the next poll then picks the fresh one up automatically.
     func fetchUsage() throws -> [Gauge] {
-        var token = try validToken()
-        var (data, code) = try get(token)
-        if code == 401 || code == 403 {
-            var cred = try Keychain.read()
-            token = try refresh(&cred)
-            (data, code) = try get(token)
+        let cred = try Keychain.read()
+        let oauth = cred["claudeAiOauth"] as? [String: Any] ?? [:]
+        guard let token = oauth["accessToken"] as? String, !token.isEmpty else {
+            throw UsageError.noCredential
         }
+        let (data, code) = try get(token)
+        if code == 401 || code == 403 { throw UsageError.tokenExpired }
         guard code == 200 else { throw UsageError.http(code) }
         let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
         let limits = obj["limits"] as? [[String: Any]] ?? []
         return limits.map(gauge(from:))
-    }
-
-    private func validToken() throws -> String {
-        var cred = try Keychain.read()
-        let oauth = cred["claudeAiOauth"] as? [String: Any] ?? [:]
-        let expiresAt = (oauth["expiresAt"] as? NSNumber)?.doubleValue ?? 0
-        if expiresAt - Date().timeIntervalSince1970 * 1000 < refreshSkewMS {
-            return try refresh(&cred)
-        }
-        return oauth["accessToken"] as? String ?? ""
-    }
-
-    private func refresh(_ cred: inout [String: Any]) throws -> String {
-        guard var oauth = cred["claudeAiOauth"] as? [String: Any],
-              let rt = oauth["refreshToken"] as? String else { throw UsageError.noCredential }
-        let body = try JSONSerialization.data(withJSONObject: [
-            "grant_type": "refresh_token", "refresh_token": rt, "client_id": clientID])
-        var req = URLRequest(url: tokenURL)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = body
-        let (data, code) = try httpSync(req)
-        guard code == 200,
-              let tok = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let at = tok["access_token"] as? String else { throw UsageError.refreshFailed }
-        oauth["accessToken"] = at
-        if let newRT = tok["refresh_token"] as? String { oauth["refreshToken"] = newRT }
-        let expIn = (tok["expires_in"] as? NSNumber)?.doubleValue ?? 3600
-        oauth["expiresAt"] = Date().timeIntervalSince1970 * 1000 + expIn * 1000
-        cred["claudeAiOauth"] = oauth
-        try Keychain.write(cred)
-        return at
     }
 
     private func get(_ token: String) throws -> (Data, Int) {

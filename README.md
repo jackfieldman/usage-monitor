@@ -82,9 +82,12 @@ open /path/to/UsageMonitor.app
 keeps in your macOS Keychain (`Claude Code-credentials`) and calls the same
 endpoint the Claude Code `/usage` panel uses
 (`GET https://api.anthropic.com/api/oauth/usage`). It maps the response's
-`limits` array to the gauges, polls every 5 minutes, and refreshes the token
-when it's near expiry (writing the new token back to the same Keychain item, so
-Claude Code stays in sync).
+`limits` array to the gauges and polls every 5 minutes. The credential is
+strictly **read-only**: the app never refreshes or rewrites the token, because
+rotating a refresh token Claude Code also holds can trip the OAuth server's
+reuse detection and log Claude Code out. If the token has expired the menu says
+so (keeping the last good data); it renews the next time you use Claude Code
+and the gauges pick it up on the following poll.
 
 **Dollar spend (optional, API only).** If you add an Admin API key, the app
 calls the Console Admin API
@@ -121,7 +124,7 @@ rm -rf /path/to/UsageMonitor.app
 
 The app never installs background services or launch agents; removing the
 `.app` is a complete uninstall. It does not delete or alter your Keychain
-login (it only reads it and refreshes the token, exactly as Claude Code does).
+login — it only ever reads it.
 
 ## Colours
 

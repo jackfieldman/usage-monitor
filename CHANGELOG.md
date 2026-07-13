@@ -3,6 +3,16 @@
 All notable changes to Usage Monitor are recorded here. Versions follow the
 `CFBundleShortVersionString` in `build.sh`.
 
+## 1.5
+
+- **The app no longer refreshes the login token — fixes Claude Code getting
+  logged out.** Refreshing rotated the refresh token the app shares with
+  Claude Code; when both refreshed, the OAuth server's reuse detection could
+  revoke the whole grant, signing Claude Code out. The credential is now
+  strictly read-only: an expired token shows "Login token expired — Claude
+  Code renews it on next use" (keeping the last good data), and the gauges
+  recover automatically on the poll after you next use Claude Code.
+
 ## 1.4.1
 
 - Enabling notifications now posts a one-time confirmation ("Notifications are
