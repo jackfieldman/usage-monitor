@@ -3,3 +3,4 @@ UsageMonitor.app/
 *.dSYM/
 .DS_Store
 dist/
+.gstack/

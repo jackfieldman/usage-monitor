@@ -18,9 +18,12 @@ breakdown with reset times, a **Refresh now** button, and **Open at Login**.
 
 The icon is configurable from that menu:
 
-- **Icon Shape** — **Bar chart** (default), **Battery**, or **Rings**.
+- **Icon Shape** — **Bar chart (vertical)** (default), **Bar chart
+  (horizontal)**, **Battery**, or **Rings**.
 - **Icon Style** — **Greyscale** (default; level as lightness), **Colour**
   (traffic-light), or **System Battery** (monochrome until the red zone).
+- **Density** — **Compact** (default) or **Comfortable**, which draws the
+  charts a bit wider for readability.
 - **Consolidated Icon** — for the battery shape, stacks all three gauges in one
   glyph, to save menu-bar space.
 - **Number Shows** — choose which limit's percentage sits beside the icon: the
@@ -41,8 +44,11 @@ limit resets below 80%.
 - **Community** — questions, ideas, and show-and-tell live in
   [GitHub Discussions](https://github.com/jackfieldman/usage-monitor/discussions)
   (**Join the Community…** in the app menu).
-- The app itself checks GitHub once a day and shows **Update Available…** in
-  the menu when there's a new release.
+- The app itself checks GitHub once a day; when there's a new release it
+  notifies you and the menu offers **Update to x.y Now** (one click: download,
+  signature-verify, swap in place, relaunch). Turn on **Install Updates
+  Automatically** to skip the ask. Updates are only installed if the download's
+  code signature matches the app's own Developer ID team.
 
 ## Requirements
 

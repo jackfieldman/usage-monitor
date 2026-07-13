@@ -3,6 +3,21 @@
 All notable changes to Usage Monitor are recorded here. Versions follow the
 `CFBundleShortVersionString` in `build.sh`.
 
+## 1.7
+
+- **Horizontal bar chart.** New **Bar Chart (Horizontal)** icon shape — one
+  left-to-right bar per gauge, stacked; the sideways twin of the vertical bars.
+- **Density.** New **Compact / Comfortable** menu setting: Comfortable widens
+  the charts (bars, batteries) a touch for readability; Compact keeps the
+  classic tight footprint.
+- **One-click and automatic updates.** When the daily check finds a new
+  release, the app now posts a notification (once per version) and the menu
+  offers **Update to x.y Now** — it downloads the release zip, verifies the
+  code signature is from the same Developer ID team, swaps itself in place,
+  and relaunches. Turn on **Install Updates Automatically** to skip the ask.
+  Any verification or download failure leaves the current install untouched
+  and opens the release page instead.
+
 ## 1.6
 
 - **"%" beside the menu-bar number** — the glyph now reads e.g. "52%" instead

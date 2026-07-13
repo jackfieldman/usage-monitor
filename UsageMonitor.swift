@@ -16,12 +16,25 @@ import UserNotifications
 struct Gauge { let label: String; let percent: Double; let sub: String }
 
 enum IconShape: String, CaseIterable {
-    case battery, bars, rings
+    case battery, bars, hbars, rings
     var title: String {
         switch self {
         case .battery: return "Battery"
-        case .bars: return "Bar Chart"
+        case .bars: return "Bar Chart (Vertical)"
+        case .hbars: return "Bar Chart (Horizontal)"
         case .rings: return "Rings"
+        }
+    }
+}
+
+/// How wide the glyphs draw. Comfortable widens the charts a touch for
+/// readability; Compact is the classic tight menu-bar footprint.
+enum Density: String, CaseIterable {
+    case compact, comfortable
+    var title: String {
+        switch self {
+        case .compact: return "Compact"
+        case .comfortable: return "Comfortable"
         }
     }
 }
@@ -62,6 +75,22 @@ func levelColor(_ pct: Double) -> NSColor {
     case .mid:  return NSColor(srgbRed: 1.00, green: 0.62, blue: 0.04, alpha: 1)
     case .low:  return NSColor(srgbRed: 0.19, green: 0.82, blue: 0.35, alpha: 1)
     }
+}
+
+/// Runs a command-line tool synchronously, capturing stdout+stderr.
+/// MUST be called off the main thread for anything slow.
+@discardableResult
+func runTool(_ path: String, _ args: [String]) -> (status: Int32, text: String) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = out
+    do { try p.run() } catch { return (-1, "") }
+    p.waitUntilExit()
+    let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return (p.terminationStatus, text)
 }
 
 /// Synchronous HTTP: performs `req` and blocks until it completes. MUST be called
@@ -294,18 +323,70 @@ final class CostClient {
 final class UpdateChecker {
     let latestURL = URL(string: "https://api.github.com/repos/jackfieldman/usage-monitor/releases/latest")!
 
-    /// Blocking; call off the main thread. Returns (version, release page)
-    /// when a newer release exists, else nil.
-    func check() -> (version: String, page: URL)? {
+    /// Blocking; call off the main thread. Returns (version, release page,
+    /// zip asset) when a newer release exists, else nil. `zip` is nil when the
+    /// release has no UsageMonitor.zip asset — then we can only open the page.
+    func check() -> (version: String, page: URL, zip: URL?)? {
         var req = URLRequest(url: latestURL)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         guard let (data, code) = try? httpSync(req), code == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let tag = obj["tag_name"] as? String,
               let page = URL(string: obj["html_url"] as? String ?? "") else { return nil }
+        var zip: URL?
+        for asset in obj["assets"] as? [[String: Any]] ?? []
+        where asset["name"] as? String == "UsageMonitor.zip" {
+            zip = URL(string: asset["browser_download_url"] as? String ?? "")
+        }
         let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
         let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
-        return Self.isNewer(latest, than: current) ? (latest, page) : nil
+        return Self.isNewer(latest, than: current) ? (latest, page, zip) : nil
+    }
+
+    /// Downloads `zip`, verifies the app inside is signed by the SAME
+    /// Developer ID team as the running app, and swaps it into the running
+    /// bundle's path. Returns false (leaving the current install untouched)
+    /// on any download, signature, or filesystem failure. Blocking.
+    func downloadAndInstall(_ zip: URL) -> Bool {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory.appendingPathComponent("UsageMonitorUpdate-\(getpid())")
+        defer { try? fm.removeItem(at: tmp) }
+        do {
+            try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+            let (data, code) = try httpSync(URLRequest(url: zip))
+            guard code == 200, !data.isEmpty else { return false }
+            let zipPath = tmp.appendingPathComponent("UsageMonitor.zip")
+            try data.write(to: zipPath)
+            guard runTool("/usr/bin/ditto", ["-xk", zipPath.path, tmp.path]).status == 0 else { return false }
+            let newApp = tmp.appendingPathComponent("UsageMonitor.app")
+            guard fm.fileExists(atPath: newApp.path), signedBySameTeam(newApp) else { return false }
+            let current = URL(fileURLWithPath: Bundle.main.bundlePath)
+            // Move the running bundle aside, the new one into place; restore
+            // the old one if the second move fails.
+            let aside = tmp.appendingPathComponent("UsageMonitor-old.app")
+            try fm.moveItem(at: current, to: aside)
+            do { try fm.moveItem(at: newApp, to: current) }
+            catch { try? fm.moveItem(at: aside, to: current); return false }
+            return true
+        } catch { return false }
+    }
+
+    /// True only if `app` passes strict codesign verification AND carries the
+    /// same TeamIdentifier as the running app. Ad-hoc builds ("not set")
+    /// never match, so development copies won't self-update.
+    private func signedBySameTeam(_ app: URL) -> Bool {
+        guard runTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path]).status == 0,
+              let new = teamID(app.path), new != "not set",
+              new == teamID(Bundle.main.bundlePath) else { return false }
+        return true
+    }
+
+    private func teamID(_ path: String) -> String? {
+        let (status, text) = runTool("/usr/bin/codesign", ["-dvv", path])
+        guard status == 0 else { return nil }
+        return text.split(separator: "\n")
+            .first { $0.hasPrefix("TeamIdentifier=") }
+            .map { String($0.dropFirst("TeamIdentifier=".count)) }
     }
 
     /// Numeric dotted-version compare: "1.10" > "1.9", "1.5" == "1.5.0".
@@ -695,7 +776,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var gauges: [Gauge] = []
     var lastError: String?
     var lastUpdated: Date?
-    var updateAvailable: (version: String, page: URL)?
+    var updateAvailable: (version: String, page: URL, zip: URL?)?
+    var updating = false
     var monthSpend: Double?      // month-to-date USD, nil if no key or not yet fetched
     var costError: String?
     var hasAdminKey = false      // cached so render()/the menu don't spawn `security` each time
@@ -749,8 +831,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastUpdateCheck")
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self, let found = self.updates.check() else { return }
-            DispatchQueue.main.async { self.updateAvailable = found }
+            DispatchQueue.main.async {
+                self.updateAvailable = found
+                if self.autoUpdateEnabled { self.installUpdate() }
+                else { self.notifyUpdateOnce(found.version) }
+            }
         }
+    }
+
+    var autoUpdateEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "autoUpdate") }
+        set { UserDefaults.standard.set(newValue, forKey: "autoUpdate") }
+    }
+
+    @objc func toggleAutoUpdate() {
+        autoUpdateEnabled.toggle()
+        if autoUpdateEnabled, updateAvailable != nil { installUpdate() }
+    }
+
+    /// One notification per version, so a quietly ignored update doesn't nag.
+    func notifyUpdateOnce(_ version: String) {
+        guard UserDefaults.standard.string(forKey: "notifiedUpdate") != version else { return }
+        UserDefaults.standard.set(version, forKey: "notifiedUpdate")
+        let c = UNMutableNotificationContent()
+        c.title = "Usage Monitor \(version) is available"
+        c.body = "Choose “Update to \(version) Now” from the menu to install it."
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "update-\(version)", content: c, trigger: nil))
+    }
+
+    /// Installs in place and relaunches. Any failure falls back to opening
+    /// the release page so the user can update by hand.
+    @objc func installUpdate() {
+        guard let up = updateAvailable, !updating else { return }
+        guard let zip = up.zip else { openUpdatePage(); return }
+        updating = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let ok = self.updates.downloadAndInstall(zip)
+            DispatchQueue.main.async {
+                self.updating = false
+                if ok { self.relaunch() } else { self.openUpdatePage() }
+            }
+        }
+    }
+
+    /// Relaunch the (just-replaced) bundle: the `open` runs after we exit.
+    private func relaunch() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "sleep 0.5; /usr/bin/open \"\(Bundle.main.bundlePath)\""]
+        try? p.run()
+        NSApp.terminate(nil)
     }
 
     @objc func openUpdatePage() {
@@ -783,6 +915,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             switch iconShape {
             case .battery: button.image = consolidated ? consolidatedImage(gauges) : gaugeImage(gauges)
             case .bars: button.image = barsImage(gauges)
+            case .hbars: button.image = hbarsImage(gauges)
             case .rings: button.image = ringsImage(gauges)
             }
             button.toolTip = gauges.map { "\($0.label): \(Int($0.percent))%" }
@@ -908,6 +1041,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
+    var density: Density {
+        get { Density(rawValue: UserDefaults.standard.string(forKey: "density") ?? "") ?? .compact }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "density") }
+    }
+
+    @objc func pickDensity(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let d = Density(rawValue: raw) {
+            density = d
+        }
+        render()
+    }
+
     var iconStyle: IconStyle {
         get { IconStyle(rawValue: UserDefaults.standard.string(forKey: "iconStyle") ?? "") ?? .greyscale }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "iconStyle") }
@@ -976,7 +1121,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let up = updateAvailable {
             menu.addItem(.separator())
-            menu.addItem(item("Update Available — \(up.version)…", #selector(openUpdatePage), ""))
+            if updating {
+                menu.addItem(disabled("Updating to \(up.version)…"))
+            } else {
+                menu.addItem(item("Update to \(up.version) Now", #selector(installUpdate), ""))
+                menu.addItem(item("What's New…", #selector(openUpdatePage), ""))
+            }
         }
         menu.addItem(.separator())
         menu.addItem(item("Refresh now", #selector(poll), "r"))
@@ -1007,6 +1157,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         styleItem.submenu = styleMenu
         menu.addItem(styleItem)
+        let densityItem = NSMenuItem(title: "Density", action: nil, keyEquivalent: "")
+        let densityMenu = NSMenu()
+        for d in Density.allCases {
+            let i = NSMenuItem(title: d.title, action: #selector(pickDensity(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = d.rawValue
+            i.state = d == density ? .on : .off
+            densityMenu.addItem(i)
+        }
+        densityItem.submenu = densityMenu
+        menu.addItem(densityItem)
         // Which limit's percent the single-glyph shapes show as the number.
         let numberItem = NSMenuItem(title: "Number Shows", action: nil, keyEquivalent: "")
         let numberMenu = NSMenu()
@@ -1028,6 +1189,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let notify = item("Notify near a limit (80%)", #selector(toggleNotify), "")
         notify.state = notifyEnabled ? .on : .off
         menu.addItem(notify)
+        let auto = item("Install Updates Automatically", #selector(toggleAutoUpdate), "")
+        auto.state = autoUpdateEnabled ? .on : .off
+        menu.addItem(auto)
         let login = item("Open at Login", #selector(toggleLogin), "")
         login.state = loginEnabled ? .on : .off
         menu.addItem(login)
@@ -1128,7 +1292,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// One battery per gauge, with its percentage alongside.
     func gaugeImage(_ gauges: [Gauge]) -> NSImage {
-        let h: CGFloat = 22, bodyW: CGFloat = 26, bodyH: CGFloat = 12
+        let h: CGFloat = 22, bodyH: CGFloat = 12
+        let bodyW: CGFloat = density == .comfortable ? 32 : 26
         let capExt: CGFloat = 2.5   // gap + cap nub beyond the shell
         let gap: CGFloat = 4, gaugeGap: CGFloat = 10, pad: CGFloat = 2
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
@@ -1166,7 +1331,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// One rounded column per gauge over a faint full-height track,
     /// with the highest percentage alongside.
     func barsImage(_ gauges: [Gauge]) -> NSImage {
-        let h: CGFloat = 22, chartH: CGFloat = 15, barW: CGFloat = 4.5, barGap: CGFloat = 2
+        let h: CGFloat = 22, chartH: CGFloat = 15
+        let barW: CGFloat = density == .comfortable ? 6.5 : 4.5
+        let barGap: CGFloat = density == .comfortable ? 3 : 2
         let gap: CGFloat = 4, pad: CGFloat = 2
         let s = peakLabel(gauges)
         let chartW = barW * CGFloat(gauges.count) + barGap * CGFloat(max(0, gauges.count - 1))
@@ -1190,6 +1357,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             let sy = ((h - s.size().height) / 2).rounded()
             s.draw(at: NSPoint(x: pad + chartW + gap, y: sy))
+            return true
+        }
+    }
+
+    /// One horizontal bar per gauge over a faint full-width track, rows
+    /// stacked top-to-bottom in gauge order, with the highest percentage
+    /// alongside. The sideways twin of barsImage.
+    func hbarsImage(_ gauges: [Gauge]) -> NSImage {
+        let h: CGFloat = 22, chartH: CGFloat = 16, rowGap: CGFloat = 1.5
+        let trackW: CGFloat = density == .comfortable ? 26 : 18
+        let gap: CGFloat = 4, pad: CGFloat = 2
+        let s = peakLabel(gauges)
+        let total = pad * 2 + trackW + gap + ceil(s.size().width)
+
+        return NSImage(size: NSSize(width: total, height: h), flipped: false) { [weak self] _ in
+            guard let self else { return false }
+            let rows = CGFloat(max(1, gauges.count))
+            let rowH = (chartH - rowGap * (rows - 1)) / rows
+            let baseY = ((h - chartH) / 2).rounded()
+            for (i, g) in gauges.enumerated() {
+                let y = baseY + chartH - rowH - CGFloat(i) * (rowH + rowGap)
+                NSColor.labelColor.withAlphaComponent(0.18).setFill()
+                NSBezierPath(roundedRect: NSRect(x: pad, y: y, width: trackW, height: rowH),
+                             xRadius: rowH / 2, yRadius: rowH / 2).fill()
+                let p = max(0, min(100, g.percent)) / 100
+                if p > 0 {   // 0% shows only the track, matching the other shapes
+                    let bw = max(rowH, trackW * p)   // min width keeps small values visible
+                    self.fillColor(g.percent).setFill()
+                    NSBezierPath(roundedRect: NSRect(x: pad, y: y, width: bw, height: rowH),
+                                 xRadius: rowH / 2, yRadius: rowH / 2).fill()
+                }
+            }
+            let sy = ((h - s.size().height) / 2).rounded()
+            s.draw(at: NSPoint(x: pad + trackW + gap, y: sy))
             return true
         }
     }
@@ -1232,7 +1433,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// All gauges as stacked colour bars inside a single battery shell,
     /// with the highest percentage alongside.
     func consolidatedImage(_ gauges: [Gauge]) -> NSImage {
-        let h: CGFloat = 22, bodyW: CGFloat = 28, bodyH: CGFloat = 16
+        let h: CGFloat = 22, bodyH: CGFloat = 16
+        let bodyW: CGFloat = density == .comfortable ? 34 : 28
         let capExt: CGFloat = 2.5, gap: CGFloat = 4, pad: CGFloat = 2
         let s = peakLabel(gauges)
         let total = pad * 2 + bodyW + capExt + gap + ceil(s.size().width)
