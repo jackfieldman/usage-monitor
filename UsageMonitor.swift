@@ -286,6 +286,40 @@ final class CostClient {
     }
 }
 
+// MARK: - Update check (GitHub releases)
+
+/// Once a day, asks GitHub for the latest release and remembers if it's newer
+/// than the running app. Only the standard HTTP request is sent — no
+/// identifiers, no telemetry.
+final class UpdateChecker {
+    let latestURL = URL(string: "https://api.github.com/repos/jackfieldman/usage-monitor/releases/latest")!
+
+    /// Blocking; call off the main thread. Returns (version, release page)
+    /// when a newer release exists, else nil.
+    func check() -> (version: String, page: URL)? {
+        var req = URLRequest(url: latestURL)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        guard let (data, code) = try? httpSync(req), code == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tag = obj["tag_name"] as? String,
+              let page = URL(string: obj["html_url"] as? String ?? "") else { return nil }
+        let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+        return Self.isNewer(latest, than: current) ? (latest, page) : nil
+    }
+
+    /// Numeric dotted-version compare: "1.10" > "1.9", "1.5" == "1.5.0".
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        let av = a.split(separator: ".").map { Int($0) ?? 0 }
+        let bv = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(av.count, bv.count) {
+            let x = i < av.count ? av[i] : 0, y = i < bv.count ? bv[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+}
+
 // MARK: - Usage client
 
 final class UsageClient {
@@ -654,10 +688,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let client = UsageClient()
     let costClient = CostClient()
     let onboarding = OnboardingController()
+    let updates = UpdateChecker()
+    let newsletterURL = URL(string: "https://buttondown.com/jaco")!
+    let communityURL = URL(string: "https://github.com/jackfieldman/usage-monitor/discussions")!
     var timer: Timer?
     var gauges: [Gauge] = []
     var lastError: String?
     var lastUpdated: Date?
+    var updateAvailable: (version: String, page: URL)?
     var monthSpend: Double?      // month-to-date USD, nil if no key or not yet fetched
     var costError: String?
     var hasAdminKey = false      // cached so render()/the menu don't spawn `security` each time
@@ -688,6 +726,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func poll() {
         pollCost()
+        checkForUpdate()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             do {
@@ -702,6 +741,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
     }
+
+    /// At most one GitHub hit per day, whatever the poll cadence.
+    func checkForUpdate() {
+        let last = UserDefaults.standard.double(forKey: "lastUpdateCheck")
+        guard Date().timeIntervalSince1970 - last > 86_400 else { return }
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastUpdateCheck")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self, let found = self.updates.check() else { return }
+            DispatchQueue.main.async { self.updateAvailable = found }
+        }
+    }
+
+    @objc func openUpdatePage() {
+        if let page = updateAvailable?.page { NSWorkspace.shared.open(page) }
+    }
+
+    @objc func openNewsletter() { NSWorkspace.shared.open(newsletterURL) }
+    @objc func openCommunity() { NSWorkspace.shared.open(communityURL) }
 
     func pollCost() {
         guard hasAdminKey else { monthSpend = nil; costError = nil; return }
@@ -917,6 +974,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
             menu.addItem(disabled("Updated \(relative(updated))"))
         }
+        if let up = updateAvailable {
+            menu.addItem(.separator())
+            menu.addItem(item("Update Available — \(up.version)…", #selector(openUpdatePage), ""))
+        }
         menu.addItem(.separator())
         menu.addItem(item("Refresh now", #selector(poll), "r"))
         let shapeItem = NSMenuItem(title: "Icon Shape", action: nil, keyEquivalent: "")
@@ -971,6 +1032,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         login.state = loginEnabled ? .on : .off
         menu.addItem(login)
         menu.addItem(item("Set Up…", #selector(openSetup), ""))
+        menu.addItem(.separator())
+        menu.addItem(item("Subscribe to Updates…", #selector(openNewsletter), ""))
+        menu.addItem(item("Join the Community…", #selector(openCommunity), ""))
         // Target must be NSApp: with the delegate as target the action fails
         // validation (delegate has no terminate(_:)) and Quit renders disabled.
         let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -1071,7 +1135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let numAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
 
         let items: [(g: Gauge, s: NSAttributedString, w: CGFloat)] = gauges.map { g in
-            let s = NSAttributedString(string: "\(Int(g.percent))", attributes: numAttrs)
+            let s = NSAttributedString(string: "\(Int(g.percent))%", attributes: numAttrs)
             return (g, s, bodyW + capExt + gap + ceil(s.size().width))
         }
         let total = items.isEmpty ? 8
@@ -1095,7 +1159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func peakLabel(_ gauges: [Gauge]) -> NSAttributedString {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        return NSAttributedString(string: "\(Int(displayPercent(gauges)))",
+        return NSAttributedString(string: "\(Int(displayPercent(gauges)))%",
                                   attributes: [.font: font, .foregroundColor: NSColor.labelColor])
     }
 

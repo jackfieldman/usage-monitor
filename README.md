@@ -34,6 +34,16 @@ the moment any limit first crosses into the red zone — so you hear about it
 without watching the menu bar. It alerts once per crossing and re-arms after the
 limit resets below 80%.
 
+## Stay in the loop
+
+- **Newsletter** — [subscribe for release announcements](https://buttondown.com/jaco)
+  (also in the app menu: **Subscribe to Updates…**).
+- **Community** — questions, ideas, and show-and-tell live in
+  [GitHub Discussions](https://github.com/jackfieldman/usage-monitor/discussions)
+  (**Join the Community…** in the app menu).
+- The app itself checks GitHub once a day and shows **Update Available…** in
+  the menu when there's a new release.
+
 ## Requirements
 
 - macOS 13 (Ventura) or later
@@ -106,6 +116,11 @@ Anthropic's own server — the same server Claude Code already talks to. There
 is no third-party server, telemetry, or analytics. If you add an Admin API key,
 it lives only in your macOS Keychain, is never written to disk or logged, and
 is sent only to Anthropic over HTTPS to read your cost report.
+
+Once a day the app also asks GitHub for the latest release
+(`api.github.com/repos/jackfieldman/usage-monitor/releases/latest`) so it can
+offer you updates. That's an anonymous HTTP request — nothing about you or
+your usage is sent.
 
 ### ⚠️ Unofficial
 

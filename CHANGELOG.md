@@ -3,6 +3,18 @@
 All notable changes to Usage Monitor are recorded here. Versions follow the
 `CFBundleShortVersionString` in `build.sh`.
 
+## 1.6
+
+- **"%" beside the menu-bar number** — the glyph now reads e.g. "52%" instead
+  of a bare "52", in every shape (bars, rings, battery, consolidated).
+- **Update notices.** Once a day the app asks GitHub for the latest release
+  (an anonymous HTTP request — no identifiers, no telemetry) and, when a newer
+  version exists, shows an **Update Available — x.y…** menu item that opens the
+  download page.
+- **Subscribe to Updates…** menu item — join the release-announcement
+  newsletter.
+- **Join the Community…** menu item — opens the project's GitHub Discussions.
+
 ## 1.5
 
 - **The app no longer refreshes the login token — fixes Claude Code getting
