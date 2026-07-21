@@ -2,9 +2,12 @@
 
 # Usage Monitor
 
-A tiny macOS **menu-bar app** that shows your Claude usage limits as
-battery-style gauges — session, all-models weekly, and per-model weekly —
-so you can see how close you are to your limits without opening the app.
+A tiny macOS **menu-bar app** that shows **multi-provider** AI usage limits
+as battery-style gauges — Claude session / weekly / per-model, Grok credits
+and product usage, with room for more. Rename providers (“Claude Work”,
+“Grok Personal”), badge them with letters (C / G), choose what lands in the
+menu bar, and **click any activity row** to jump to that session’s Terminal
+tab, Orbit window, or desktop app.
 
 <p align="center">
   <picture>
@@ -37,6 +40,19 @@ the moment any limit first crosses into the red zone — so you hear about it
 without watching the menu bar. It alerts once per crossing and re-arms after the
 limit resets below 80%.
 
+The menu also has **clickable activity** (per provider that has it enabled):
+
+- **Dark line** — letter badge + what the session is working on (Claude’s
+  last prompt summary, Grok’s session title).
+- **Light line** — project · branch · Live/time · tokens (Claude) or model.
+- **Click** — focuses the live host process: Terminal tab by TTY, iTerm,
+  Warp, Ghostty, Orbit, or Claude desktop when that’s the parent; otherwise
+  opens the project folder.
+
+Under **Providers** you can rename slots, set letter badges, toggle menu-bar
+and activity visibility, and add another provider slot. **Menu Bar Layout**
+chooses how clusters pack: per-provider letter+%, all gauges, or highest only.
+
 ## Stay in the loop
 
 - **Newsletter** — [subscribe for release announcements](https://buttondown.com/jaco)
@@ -53,8 +69,10 @@ limit resets below 80%.
 ## Requirements
 
 - macOS 13 (Ventura) or later
-- **Claude Code** installed and signed in (a Pro or Max subscription). The app
-  reuses the login Claude Code already stores — there's nothing extra to log in to.
+- **Claude Code** and/or **Grok CLI** installed and signed in (Codex / Cursor
+  optional). Either is enough; both work together. Defaults seed from whatever
+  you’re signed into on that Mac. The app reuses the logins those tools already
+  store — there's nothing extra to log in to.
 - To build from source: Xcode Command Line Tools (`xcode-select --install`).
 
 ## Install
@@ -68,15 +86,15 @@ cd usage-monitor
 open UsageMonitor.app
 ```
 
-On first launch (or any time it's not signed in) a **setup window** walks you
-through installing Claude Code and signing in. The same window has an optional
-**API dollar spend** section — add an Admin API key and the menu also shows
-your month-to-date pay-as-you-go API cost. You can either let the app **scan
-your Mac** for a key it already finds (shell profiles, the `ant` CLI config),
-or **type one in confidentially** (hidden field). The key is verified against
-the cost endpoint before it's saved, stored only in your macOS Keychain, and
-used solely to read your cost report. Reopen setup any time from the menu-bar
-**Set Up…** item.
+On first launch (or any time neither provider is signed in) a **setup window**
+walks you through installing Claude Code and/or Grok and signing in. The same
+window has an optional **Claude API dollar spend** section — add an Admin API
+key and the menu also shows your month-to-date Anthropic pay-as-you-go cost.
+You can either let the app **scan your Mac** for a key it already finds (shell
+profiles, the `ant` CLI config), or **type one in confidentially** (hidden
+field). The key is verified against the cost endpoint before it's saved,
+stored only in your macOS Keychain, and used solely to read your cost report.
+Reopen setup any time from the menu-bar **Set Up…** item.
 
 Then use **Open at Login** in the menu to have it start automatically. Move
 `UsageMonitor.app` to `/Applications` first if you want it to live there.
@@ -94,9 +112,9 @@ open /path/to/UsageMonitor.app
 
 ## How it works
 
-**Gauges (subscription usage).** The app reads the OAuth token Claude Code
-keeps in your macOS Keychain (`Claude Code-credentials`) and calls the same
-endpoint the Claude Code `/usage` panel uses
+**Claude gauges (subscription usage).** The app reads the OAuth token Claude
+Code keeps in your macOS Keychain (`Claude Code-credentials`) and calls the
+same endpoint the Claude Code `/usage` panel uses
 (`GET https://api.anthropic.com/api/oauth/usage`). It maps the response's
 `limits` array to the gauges and polls every 5 minutes. The credential is
 strictly **read-only**: the app never refreshes or rewrites the token, because
@@ -105,8 +123,34 @@ reuse detection and log Claude Code out. If the token has expired the menu says
 so (keeping the last good data); it renews the next time you use Claude Code
 and the gauges pick it up on the following poll.
 
-**Dollar spend (optional, API only).** If you add an Admin API key, the app
-calls the Console Admin API
+**Grok gauges (credit / product usage).** The app reads the session token Grok
+CLI keeps in `~/.grok/auth.json` and calls the same billing endpoint Grok's
+`/usage` command uses
+(`GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`). It maps
+overall `creditUsagePercent` and any product rows with a usage percent
+(Build, API, Chat, Imagine) into gauges, and shows the billing-period reset
+time. Also **read-only**: Grok owns token refresh; an expired session shows
+in the menu and recovers the next time you use Grok. Polls on the same
+5-minute cadence as Claude.
+
+**Claude Code activity.** Every Claude Code CLI session writes its own
+transcript to `~/.claude/projects/<project>/<session>.jsonl`, including the
+project path, git branch, and Anthropic's own token-usage numbers for every
+turn. The app rescans these files every 10 seconds — a session with an
+unanswered turn (no `turn_duration` marker yet) shows as **Live**; otherwise
+it shows how long ago it was last active. It never reads message content,
+only this per-turn metadata, and every file is read incrementally (only the
+bytes appended since the last scan), so it stays cheap even for long-running
+sessions.
+
+**Grok activity.** Grok CLI maintains `~/.grok/active_sessions.json` and
+per-session `summary.json` files under `~/.grok/sessions/`. The app reads
+only that registry metadata (cwd, pid, last active, branch, model) every
+10 seconds — a session whose process is still alive shows as **Live**. No
+chat content is read and no network call is made for activity.
+
+**Dollar spend (optional, Anthropic API only).** If you add an Admin API key,
+the app calls the Console Admin API
 (`GET https://api.anthropic.com/v1/organizations/cost_report`) once per poll,
 sums the current month's buckets, and shows the total in the menu. This is
 separate from subscription usage — it reflects metered pay-as-you-go API
@@ -117,11 +161,13 @@ sent only to Anthropic over HTTPS.
 
 ### Privacy
 
-Your token and usage data never leave your Mac except in the request to
-Anthropic's own server — the same server Claude Code already talks to. There
-is no third-party server, telemetry, or analytics. If you add an Admin API key,
-it lives only in your macOS Keychain, is never written to disk or logged, and
-is sent only to Anthropic over HTTPS to read your cost report.
+Your tokens and usage data never leave your Mac except in requests to
+Anthropic's and xAI's own servers — the same servers Claude Code and Grok
+already talk to. There is no third-party server, telemetry, or analytics.
+Activity sections make no network requests at all — they only read local
+files those CLIs already wrote. If you add an Admin API key, it lives only
+in your macOS Keychain, is never written to disk or logged, and is sent only
+to Anthropic over HTTPS to read your cost report.
 
 Once a day the app also asks GitHub for the latest release
 (`api.github.com/repos/jackfieldman/usage-monitor/releases/latest`) so it can
@@ -130,10 +176,11 @@ your usage is sent.
 
 ### ⚠️ Unofficial
 
-This is not affiliated with or endorsed by Anthropic. It relies on an
-**undocumented** internal endpoint that Anthropic can change or remove at any
-time, which would stop the gauges from updating until the app is updated. It
-also isn't an investment/billing tool — it only mirrors what `/usage` shows.
+This is not affiliated with or endorsed by Anthropic or xAI. It relies on
+**undocumented** internal endpoints either company can change or remove at
+any time, which would stop the gauges from updating until the app is updated.
+It also isn't an investment/billing tool — it only mirrors what each CLI's
+`/usage` view shows.
 
 ## Uninstall
 

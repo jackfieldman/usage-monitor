@@ -1,9 +1,8 @@
-// UsageMonitor — a self-contained macOS menu-bar app that shows Claude usage
-// limits as tiny battery gauges. No external dependencies: it reads the OAuth
-// token Claude Code stores in the Keychain, calls the same usage endpoint the
-// /usage panel uses, and draws the result. Strictly a read-only consumer of
-// the credential — it never refreshes or rewrites the token (Claude Code owns
-// it; see UsageClient.fetchUsage for why refreshing here is unsafe).
+// UsageMonitor — a self-contained macOS menu-bar app that shows multi-provider
+// AI usage limits as tiny battery gauges. No external dependencies.
+//
+// Providers are configurable slots (Claude, Grok, …) with personal names and
+// letter badges. Credentials are always read-only — each CLI owns refresh.
 //
 // Build:  ./build.sh      Run:  open UsageMonitor.app
 import AppKit
@@ -14,6 +13,393 @@ import UserNotifications
 // MARK: - Model
 
 struct Gauge { let label: String; let percent: Double; let sub: String }
+
+/// Built-in adapter kinds. New kinds plug in here; the UI is N-slot generic.
+enum ProviderKind: String, CaseIterable, Codable {
+    case claude, grok, codex, cursor
+    var defaultName: String {
+        switch self {
+        case .claude: return "Claude"
+        case .grok: return "Grok"
+        case .codex: return "Codex"
+        case .cursor: return "Cursor"
+        }
+    }
+    var defaultLetter: String {
+        switch self {
+        case .claude: return "C"
+        case .grok: return "G"
+        case .codex: return "X"
+        case .cursor: return "U"
+        }
+    }
+    var processNames: [String] {
+        switch self {
+        case .claude: return ["claude"]
+        case .grok: return ["grok"]
+        case .codex: return ["codex"]
+        case .cursor: return ["Cursor"]
+        }
+    }
+    /// True when this kind can fetch subscription gauges (vs activity/open only).
+    var supportsUsage: Bool {
+        switch self {
+        case .claude, .grok, .codex: return true
+        case .cursor: return false   // no stable public usage endpoint yet
+        }
+    }
+}
+
+/// One user-facing provider slot — rename, badge letter, bar/menu toggles.
+struct ProviderConfig: Codable, Equatable {
+    var id: String
+    var kind: ProviderKind
+    var displayName: String
+    var letter: String
+    var enabled: Bool
+    var showInMenuBar: Bool
+    var showActivity: Bool
+
+    static func make(_ kind: ProviderKind, name: String? = nil, letter: String? = nil) -> ProviderConfig {
+        ProviderConfig(
+            id: kind.rawValue,
+            kind: kind,
+            displayName: name ?? kind.defaultName,
+            letter: (letter ?? kind.defaultLetter).uppercased(),
+            enabled: true,
+            showInMenuBar: true,
+            showActivity: true)
+    }
+}
+
+/// Live gauge snapshot for one provider slot.
+struct ProviderGauges {
+    let config: ProviderConfig
+    let gauges: [Gauge]
+}
+
+/// Menu-bar drawing unit: letter badge + one or more gauges for a provider.
+struct IconCluster {
+    let letter: String
+    let name: String
+    let gauges: [Gauge]
+}
+
+/// How the menu-bar packs multiple providers.
+enum MenuBarLayout: String, CaseIterable {
+    case perProvider   // letter + highest% per shown provider (default)
+    case allGauges     // every gauge (Claude session/weekly/…) + Grok primary
+    case highestOnly   // single global highest across shown providers
+    var title: String {
+        switch self {
+        case .perProvider: return "Per Provider (letter + %)"
+        case .allGauges: return "All Gauges"
+        case .highestOnly: return "Highest Only"
+        }
+    }
+}
+
+/// Unified activity row (any provider). Click opens the host terminal/app.
+struct ActivitySession {
+    let id: String
+    let providerId: String
+    let providerLetter: String
+    let providerName: String
+    let project: String
+    let cwd: String?
+    let branch: String?
+    /// Dark header line — "currently working on" / session title.
+    let title: String?
+    let tokensIn: Int?
+    let tokensOut: Int?
+    let model: String?
+    let lastActivity: Date
+    let live: Bool
+    let pid: Int?
+    let tty: String?
+}
+
+/// NSMenuItem.representedObject must be a class — Swift structs often fail
+/// `as? ActivitySession` on click, so the action no-ops. This box fixes that.
+final class ActivitySessionBox: NSObject {
+    let session: ActivitySession
+    init(_ session: ActivitySession) { self.session = session }
+}
+
+// MARK: - What's New (in-app release notes + blue “NEW” chip)
+
+enum WhatsNew {
+    static var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    }
+
+    /// Newest first. Keep in sync with CHANGELOG.md for the current series.
+    static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.3", "Smarter defaults", [
+            "Seeds providers from what you actually use (signed-in CLIs)",
+            "Grok-first ordering on JV’s Macs; Claude-first for everyone else",
+        ]),
+        ("2.2", "What's New polish", [
+            "Blue NEW chip on What’s New until you’ve opened it",
+            "In-app release notes window (this panel)",
+        ]),
+        ("2.1", "Codex, Cursor & Add Provider", [
+            "Codex gauges from ChatGPT usage (weekly % + reset)",
+            "Cursor slot — open the desktop app; live when running",
+            "Add Provider offers real adapters (no dead-end dialog)",
+            "Remove a provider from its submenu",
+        ]),
+        ("2.0", "Multi-provider & clickable activity", [
+            "Rename providers and letter badges (C: / G: / …)",
+            "Menu bar layout: per-provider, all gauges, or highest",
+            "Click an activity row to open its Terminal tab / app",
+            "Two-line activity: dark “working on” + light path line",
+            "Bar % Shows — pick which limit each letter displays",
+        ]),
+        ("1.9", "Grok usage", [
+            "Grok credit & product limits in the menu bar",
+            "Grok activity from local sessions",
+            "Works with Claude only, Grok only, or both",
+        ]),
+    ]
+
+    private static let seenKey = "whatsNewSeenVersion"
+
+    static var seenVersion: String {
+        get { UserDefaults.standard.string(forKey: seenKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: seenKey) }
+    }
+
+    /// Show the blue chip until the user opens What’s New for this version.
+    static var hasUnseen: Bool { seenVersion != appVersion }
+
+    static func markSeen() { seenVersion = appVersion }
+
+    /// Soft blue used for the NEW chip outline + fill.
+    static var chipBlue: NSColor {
+        NSColor(srgbRed: 0.20, green: 0.48, blue: 0.98, alpha: 1)
+    }
+    static var chipBlueSoft: NSColor {
+        NSColor(srgbRed: 0.20, green: 0.48, blue: 0.98, alpha: 0.14)
+    }
+
+    /// Tiny pill badge: white “NEW” on blue, with a slightly darker blue ring.
+    static func newChipImage(height: CGFloat = 16) -> NSImage {
+        let text = "NEW"
+        let font = NSFont.systemFont(ofSize: max(9, height * 0.58), weight: .bold)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.white,
+            .kern: 0.4,
+        ]
+        let s = NSAttributedString(string: text, attributes: attrs)
+        let textSize = s.size()
+        let padX: CGFloat = 6
+        let w = ceil(textSize.width) + padX * 2
+        let h = height
+        let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { _ in
+            let rect = NSRect(x: 0.5, y: 0.5, width: w - 1, height: h - 1)
+            let path = NSBezierPath(roundedRect: rect, xRadius: (h - 1) / 2, yRadius: (h - 1) / 2)
+            WhatsNew.chipBlue.setFill()
+            path.fill()
+            // Brighter ring so the chip reads as “outlined blue” on any menu chrome.
+            NSColor(srgbRed: 0.45, green: 0.68, blue: 1.0, alpha: 0.95).setStroke()
+            path.lineWidth = 1
+            path.stroke()
+            let ty = ((h - textSize.height) / 2).rounded() - 0.5
+            s.draw(at: NSPoint(x: padX, y: ty))
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }
+}
+
+/// Lightweight panel listing recent releases. Marks the current version seen on open.
+final class WhatsNewController: NSObject, NSWindowDelegate {
+    private var window: NSWindow?
+
+    func present() {
+        WhatsNew.markSeen()
+        if window == nil { build() }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.center()
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func build() {
+        let width: CGFloat = 420
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: width, height: 480),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false)
+        win.title = "What's New"
+        win.delegate = self
+        win.isReleasedWhenClosed = false
+
+        let scroll = NSScrollView(frame: .zero)
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = false
+
+        let doc = NSView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 16, right: 22)
+
+        // Header: app icon + title + blue NEW chip
+        let icon = NSImageView()
+        icon.image = NSApp.applicationIconImage
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 36).isActive = true
+
+        let title = NSTextField(labelWithString: "Usage Monitor \(WhatsNew.appVersion)")
+        title.font = .systemFont(ofSize: 16, weight: .semibold)
+
+        let chip = NSImageView(image: WhatsNew.newChipImage(height: 18))
+        chip.imageScaling = .scaleNone
+
+        let titleRow = NSStackView(views: [title, chip])
+        titleRow.orientation = .horizontal
+        titleRow.spacing = 8
+        titleRow.alignment = .centerY
+
+        let subtitle = NSTextField(labelWithString: "Recent highlights — click activity rows to jump to terminals.")
+        subtitle.font = .systemFont(ofSize: 11)
+        subtitle.textColor = .secondaryLabelColor
+        subtitle.maximumNumberOfLines = 2
+        subtitle.preferredMaxLayoutWidth = width - 44
+
+        let headingCol = NSStackView(views: [titleRow, subtitle])
+        headingCol.orientation = .vertical
+        headingCol.alignment = .leading
+        headingCol.spacing = 4
+
+        let heading = NSStackView(views: [icon, headingCol])
+        heading.orientation = .horizontal
+        heading.spacing = 12
+        heading.alignment = .centerY
+        stack.addArrangedSubview(heading)
+
+        let rule = NSBox()
+        rule.boxType = .separator
+        rule.translatesAutoresizingMaskIntoConstraints = false
+        rule.widthAnchor.constraint(equalToConstant: width - 44).isActive = true
+        stack.addArrangedSubview(rule)
+
+        for (idx, rel) in WhatsNew.releases.enumerated() {
+            let isCurrent = rel.version == WhatsNew.appVersion || idx == 0
+            stack.addArrangedSubview(releaseBlock(rel.version, rel.title, rel.bullets, highlight: isCurrent && idx == 0))
+        }
+
+        let gotIt = NSButton(title: "Got it", target: self, action: #selector(close))
+        gotIt.bezelStyle = .rounded
+        gotIt.keyEquivalent = "\r"
+        let footer = NSStackView(views: [NSView(), gotIt])
+        footer.orientation = .horizontal
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        footer.widthAnchor.constraint(equalToConstant: width - 44).isActive = true
+        stack.addArrangedSubview(footer)
+
+        doc.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: doc.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
+            stack.widthAnchor.constraint(equalToConstant: width),
+        ])
+        scroll.documentView = doc
+
+        // Force layout so scroll document gets a real height.
+        doc.layoutSubtreeIfNeeded()
+        let contentH = stack.fittingSize.height
+        doc.frame = NSRect(x: 0, y: 0, width: width, height: max(contentH, 100))
+
+        let content = NSView()
+        content.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: content.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            scroll.widthAnchor.constraint(equalToConstant: width),
+            scroll.heightAnchor.constraint(equalToConstant: min(520, max(320, contentH + 8))),
+        ])
+        win.contentView = content
+        win.setContentSize(NSSize(width: width, height: min(520, max(320, contentH + 8))))
+        self.window = win
+    }
+
+    private func releaseBlock(_ version: String, _ title: String, _ bullets: [String], highlight: Bool) -> NSView {
+        let card = NSView()
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 10
+        if highlight {
+            card.layer?.backgroundColor = WhatsNew.chipBlueSoft.cgColor
+            card.layer?.borderWidth = 1
+            card.layer?.borderColor = WhatsNew.chipBlue.withAlphaComponent(0.45).cgColor
+        } else {
+            card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.35).cgColor
+        }
+
+        let ver = NSTextField(labelWithString: "v\(version)")
+        ver.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
+        ver.textColor = highlight ? WhatsNew.chipBlue : .secondaryLabelColor
+
+        var headerViews: [NSView] = [ver]
+        if highlight {
+            let chip = NSImageView(image: WhatsNew.newChipImage(height: 15))
+            headerViews.append(chip)
+        }
+        let name = NSTextField(labelWithString: title)
+        name.font = .systemFont(ofSize: 13, weight: .semibold)
+        headerViews.append(name)
+
+        let header = NSStackView(views: headerViews)
+        header.orientation = .horizontal
+        header.spacing = 8
+        header.alignment = .centerY
+
+        var rows: [NSView] = [header]
+        for b in bullets {
+            let line = NSTextField(wrappingLabelWithString: "·  \(b)")
+            line.font = .systemFont(ofSize: 12)
+            line.textColor = .labelColor
+            line.preferredMaxLayoutWidth = 360
+            rows.append(line)
+        }
+        let inner = NSStackView(views: rows)
+        inner.orientation = .vertical
+        inner.alignment = .leading
+        inner.spacing = 5
+        inner.translatesAutoresizingMaskIntoConstraints = false
+        inner.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+
+        card.addSubview(inner)
+        NSLayoutConstraint.activate([
+            inner.topAnchor.constraint(equalTo: card.topAnchor),
+            inner.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            inner.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            inner.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            card.widthAnchor.constraint(equalToConstant: 376),
+        ])
+        return card
+    }
+
+    @objc func close() {
+        window?.close()
+    }
+}
 
 enum IconShape: String, CaseIterable {
     case battery, bars, hbars, rings
@@ -52,10 +438,16 @@ enum IconStyle: String, CaseIterable {
 
 enum UsageError: LocalizedError {
     case noCredential, tokenExpired, http(Int), keychain(OSStatus)
+    case noGrokCredential, grokTokenExpired
+    case noCodexCredential, codexTokenExpired
     var errorDescription: String? {
         switch self {
         case .noCredential: return "Not signed in to Claude Code"
         case .tokenExpired: return "Login token expired — Claude Code renews it on next use"
+        case .noGrokCredential: return "Not signed in to Grok"
+        case .grokTokenExpired: return "Grok login expired — Grok renews it on next use"
+        case .noCodexCredential: return "Not signed in to Codex"
+        case .codexTokenExpired: return "Codex login expired — run codex login"
         case .http(let c): return "Usage API returned HTTP \(c)"
         case .keychain(let s): return "Keychain error \(s)"
         }
@@ -315,6 +707,531 @@ final class CostClient {
     }
 }
 
+// MARK: - Provider store (UserDefaults — names, letters, bar placement)
+
+enum ProviderStore {
+    private static let key = "providerConfigs.v1"
+    private static let layoutKey = "menuBarLayout"
+    private static let orderMigrateKey = "providerOrderMigrated.v2"
+
+    static var layout: MenuBarLayout {
+        get { MenuBarLayout(rawValue: UserDefaults.standard.string(forKey: layoutKey) ?? "") ?? .perProvider }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: layoutKey) }
+    }
+
+    static func load() -> [ProviderConfig] {
+        if let data = UserDefaults.standard.data(forKey: key),
+           let decoded = try? JSONDecoder().decode([ProviderConfig].self, from: data),
+           !decoded.isEmpty {
+            return applyPreferredOrderOnce(decoded)
+        }
+        let seed = smartDefaults()
+        save(seed)
+        return seed
+    }
+
+    static func save(_ configs: [ProviderConfig]) {
+        if let data = try? JSONEncoder().encode(configs) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
+    /// Seed from what's actually signed in / installed on this Mac.
+    /// Order: Grok-first on JV's machines; otherwise Claude-first among present providers.
+    static func smartDefaults() -> [ProviderConfig] {
+        let present = presentKinds()
+        let order = preferredKindOrder()
+        let kinds = order.filter { present.contains($0) }
+        if kinds.isEmpty {
+            // Nothing signed in yet — seed preferred pair so setup still makes sense.
+            return preferredKindOrder().prefix(2).map { ProviderConfig.make($0) }
+        }
+        return kinds.map { ProviderConfig.make($0) }
+    }
+
+    /// Back-compat alias.
+    static func defaults() -> [ProviderConfig] { smartDefaults() }
+
+    static func update(_ id: String, mutate: (inout ProviderConfig) -> Void) {
+        var all = load()
+        guard let i = all.firstIndex(where: { $0.id == id }) else { return }
+        mutate(&all[i])
+        save(all)
+    }
+
+    // MARK: preference / detection
+
+    /// True on JV's personal Macs (home user) or when Grok is signed in as him.
+    /// Everyone else gets neutral “whatever you have” ordering (Claude first if present).
+    static func prefersGrokFirst() -> Bool {
+        let user = NSUserName().lowercased()
+        if user == "jv" || user == "jaco" || user.hasPrefix("jaco") { return true }
+        if let email = grokAccountEmail()?.lowercased(),
+           email.contains("jaco.veldsman") || email.hasPrefix("jaco.") {
+            return true
+        }
+        return false
+    }
+
+    static func preferredKindOrder() -> [ProviderKind] {
+        if prefersGrokFirst() {
+            return [.grok, .claude, .codex, .cursor]
+        }
+        return [.claude, .grok, .codex, .cursor]
+    }
+
+    /// Which adapters look usable right now (signed in / installed).
+    static func presentKinds() -> Set<ProviderKind> {
+        var s = Set<ProviderKind>()
+        if signedInToClaude() { s.insert(.claude) }
+        if signedInToGrok() { s.insert(.grok) }
+        if signedInToCodex() { s.insert(.codex) }
+        if cursorInstalled() { s.insert(.cursor) }
+        return s
+    }
+
+    /// One-time reorder for existing installs so JV gets Grok first without wiping renames.
+    private static func applyPreferredOrderOnce(_ configs: [ProviderConfig]) -> [ProviderConfig] {
+        guard prefersGrokFirst(),
+              !UserDefaults.standard.bool(forKey: orderMigrateKey) else {
+            return configs
+        }
+        UserDefaults.standard.set(true, forKey: orderMigrateKey)
+        let order = preferredKindOrder()
+        let sorted = configs.sorted { a, b in
+            let ia = order.firstIndex(of: a.kind) ?? 100
+            let ib = order.firstIndex(of: b.kind) ?? 100
+            if ia != ib { return ia < ib }
+            return a.displayName < b.displayName
+        }
+        if sorted.map(\.id) != configs.map(\.id) {
+            save(sorted)
+            return sorted
+        }
+        return configs
+    }
+
+    /// Best-effort email from Grok auth (for personal-machine detection only).
+    private static func grokAccountEmail() -> String? {
+        let path = NSHomeDirectory() + "/.grok/auth.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        for (_, value) in obj {
+            guard let entry = value as? [String: Any],
+                  let email = entry["email"] as? String, !email.isEmpty else { continue }
+            return email
+        }
+        return nil
+    }
+}
+
+// MARK: - Process focus (open the terminal / app hosting a session)
+
+/// Resolves a live CLI PID to its host app (Terminal tab, iTerm, Warp, Orbit,
+/// Claude desktop) and brings that surface to the front.
+enum ProcessFocus {
+    /// Known host bundle ids we can activate.
+    private static let hostBundles: [(names: [String], bundle: String)] = [
+        (["Terminal"], "com.apple.Terminal"),
+        (["iTerm2", "iTerm"], "com.googlecode.iterm2"),
+        (["Warp"], "dev.warp.Warp-Stable"),
+        (["ghostty", "Ghostty"], "com.mitchellh.ghostty"),
+        (["Orbit", "orbit"], "com.ofx.orbit"),
+        (["Orbit Dev", "orbit"], "com.ofx.orbit.dev"),
+        (["Claude"], "com.anthropic.claudefordesktop"),
+    ]
+
+    /// Best-effort: focus the tab/window for `pid`, else activate a sensible app.
+    /// Safe from a background queue — UI hops to the main thread.
+    static func open(pid: Int?, tty: String?, cwd: String?, providerKind: ProviderKind) {
+        // Resolve process matching off the main thread (ps/lsof).
+        var usePid = pid
+        var useTTY = tty
+        if usePid == nil || !(usePid.map(processAlive) ?? false) {
+            if let cwd, let found = findProcess(names: providerKind.processNames, cwd: cwd) {
+                usePid = found.pid
+                useTTY = found.tty
+            }
+        }
+        let resolvedPid = usePid
+        let resolvedTTY = useTTY
+        let resolvedCwd = cwd
+        let kind = providerKind
+        DispatchQueue.main.async {
+            if let pid = resolvedPid, pid > 0, processAlive(pid) {
+                if focus(pid: pid, tty: resolvedTTY) { return }
+            }
+            if kind == .claude, activateBundle("com.anthropic.claudefordesktop") { return }
+            if kind == .cursor {
+                for bid in ["com.todesktop.230313mzl4w4u92", "com.cursor.Cursor", "com.anysphere.cursor"] {
+                    if activateBundle(bid) { return }
+                }
+                if FileManager.default.fileExists(atPath: "/Applications/Cursor.app") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Cursor.app"))
+                    return
+                }
+            }
+            // Grok / Codex often live in Terminal or Orbit.
+            if kind == .grok || kind == .codex {
+                if activateBundle("com.ofx.orbit") { return }
+                if activateBundle("com.ofx.orbit.dev") { return }
+            }
+            if let resolvedCwd, !resolvedCwd.isEmpty {
+                NSWorkspace.shared.open(URL(fileURLWithPath: resolvedCwd))
+                return
+            }
+            _ = activateBundle("com.apple.Terminal")
+        }
+    }
+
+    private static func activateApp(_ app: NSRunningApplication) {
+        if #available(macOS 14.0, *) {
+            app.activate()
+        } else {
+            app.activate(options: [.activateAllWindows])
+        }
+    }
+
+    @discardableResult
+    private static func focus(pid: Int, tty: String?) -> Bool {
+        let chain = processChain(from: pid)
+        // Prefer an explicit tty, else any non-?? tty in the parent chain (CLI often has it).
+        let resolvedTTY: String? = {
+            if let tty, !tty.isEmpty, tty != "??" { return tty }
+            return chain.map(\.tty).first { $0 != "??" && !$0.isEmpty }
+        }()
+        NSLog("UsageMonitor: focus pid=\(pid) tty=\(resolvedTTY ?? "nil") chain=\(chain.map { "\($0.comm):\($0.pid)" }.joined(separator: "→"))")
+
+        // Prefer a GUI host in the parent chain (Terminal / iTerm / Warp / Orbit / …).
+        for step in chain {
+            if let app = NSRunningApplication(processIdentifier: pid_t(step.pid)),
+               let bid = app.bundleIdentifier,
+               hostBundles.contains(where: { $0.bundle == bid }) {
+                activateApp(app)
+                if bid == "com.apple.Terminal", let resolvedTTY {
+                    selectTerminalTab(tty: resolvedTTY)
+                } else if bid == "com.googlecode.iterm2", let resolvedTTY {
+                    selectITermSession(tty: resolvedTTY)
+                }
+                return true
+            }
+            // Match by command name when bundle id is absent (CLI helpers / login shells).
+            let comm = (step.comm as NSString).lastPathComponent
+            for host in hostBundles where host.names.contains(where: { comm.localizedCaseInsensitiveContains($0) }) {
+                if activateBundle(host.bundle) {
+                    if host.bundle == "com.apple.Terminal", let resolvedTTY {
+                        selectTerminalTab(tty: resolvedTTY)
+                    } else if host.bundle == "com.googlecode.iterm2", let resolvedTTY {
+                        selectITermSession(tty: resolvedTTY)
+                    }
+                    return true
+                }
+            }
+        }
+
+        // No GUI host found in the chain — if we have a TTY, still try Terminal (most common).
+        if let resolvedTTY {
+            if activateBundle("com.apple.Terminal") {
+                selectTerminalTab(tty: resolvedTTY)
+                return true
+            }
+        }
+        // Activate the leaf process's app if any.
+        if let app = NSRunningApplication(processIdentifier: pid_t(pid)) {
+            activateApp(app)
+            return true
+        }
+        return false
+    }
+
+    private static func selectTerminalTab(tty: String) {
+        // Accept "ttys030", "/dev/ttys030", or "030".
+        var needle = tty.replacingOccurrences(of: "/dev/", with: "")
+        if !needle.hasPrefix("tty") { needle = "tty" + needle }
+        let script = """
+        tell application "Terminal"
+          activate
+          repeat with w in windows
+            set tabIndex to 0
+            repeat with t in tabs of w
+              set tabIndex to tabIndex + 1
+              try
+                set ttyName to (tty of t as text)
+                if ttyName contains "\(needle)" then
+                  set selected of t to true
+                  set index of w to 1
+                  set frontmost of w to true
+                  return "ok"
+                end if
+              end try
+            end repeat
+          end repeat
+          return "miss"
+        end tell
+        """
+        var err: NSDictionary?
+        if let apple = NSAppleScript(source: script) {
+            let result = apple.executeAndReturnError(&err)
+            if let err {
+                NSLog("UsageMonitor: Terminal tab select error: \(err)")
+            } else {
+                NSLog("UsageMonitor: Terminal tab select → \(result.stringValue ?? "?") for \(needle)")
+            }
+        }
+    }
+
+    private static func selectITermSession(tty: String) {
+        let needle = tty.replacingOccurrences(of: "/dev/", with: "")
+        let script = """
+        tell application "iTerm"
+          activate
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in sessions of t
+                try
+                  if (tty of s as text) contains "\(needle)" then
+                    select t
+                    return
+                  end if
+                end try
+              end repeat
+            end repeat
+          end repeat
+        end tell
+        """
+        var err: NSDictionary?
+        if let apple = NSAppleScript(source: script) {
+            apple.executeAndReturnError(&err)
+        }
+    }
+
+    @discardableResult
+    static func activateBundle(_ id: String) -> Bool {
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: id)
+        if let app = apps.first {
+            activateApp(app)
+            return true
+        }
+        // Launch if installed.
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+            return true
+        }
+        return false
+    }
+
+    static func processAlive(_ pid: Int) -> Bool {
+        guard pid > 0 else { return false }
+        return kill(pid_t(pid), 0) == 0
+    }
+
+    struct ProcInfo { let pid: Int; let ppid: Int; let tty: String; let comm: String }
+
+    static func processChain(from pid: Int) -> [ProcInfo] {
+        var out: [ProcInfo] = []
+        var cur = pid
+        for _ in 0..<10 {
+            guard let info = procInfo(cur) else { break }
+            out.append(info)
+            if info.ppid <= 1 { break }
+            cur = info.ppid
+        }
+        return out
+    }
+
+    static func procInfo(_ pid: Int) -> ProcInfo? {
+        let (status, text) = runTool("/bin/ps", ["-o", "pid=,ppid=,tty=,comm=", "-p", "\(pid)"])
+        guard status == 0 else { return nil }
+        let parts = text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard parts.count >= 4, let p = Int(parts[0]), let pp = Int(parts[1]) else { return nil }
+        return ProcInfo(pid: p, ppid: pp, tty: parts[2], comm: parts[3...].joined(separator: " "))
+    }
+
+    /// Find a live process whose command matches and cwd equals (or is under) path.
+    static func findProcess(names: [String], cwd: String) -> (pid: Int, tty: String)? {
+        let (status, text) = runTool("/bin/ps", ["-axo", "pid=,tty=,comm="])
+        guard status == 0 else { return nil }
+        let target = (cwd as NSString).standardizingPath
+        for line in text.split(separator: "\n") {
+            let parts = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard parts.count >= 3, let pid = Int(parts[0]) else { continue }
+            let comm = parts[2...].joined(separator: " ")
+            guard names.contains(where: { comm == $0 || comm.hasSuffix("/\($0)") }) else { continue }
+            guard let pcwd = cwdOf(pid: pid) else { continue }
+            let std = (pcwd as NSString).standardizingPath
+            if std == target || std.hasPrefix(target + "/") || target.hasPrefix(std + "/") {
+                return (pid, parts[1])
+            }
+        }
+        return nil
+    }
+
+    static func cwdOf(pid: Int) -> String? {
+        // macOS: lsof -a -p PID -d cwd -Fn
+        let (status, text) = runTool("/usr/sbin/lsof", ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"])
+        guard status == 0 else { return nil }
+        for line in text.split(separator: "\n") where line.hasPrefix("n") {
+            return String(line.dropFirst())
+        }
+        return nil
+    }
+
+    /// Index of live CLI processes: name → [(pid, tty, cwd)].
+    static func indexCLI(names: [String]) -> [(name: String, pid: Int, tty: String, cwd: String)] {
+        let (status, text) = runTool("/bin/ps", ["-axo", "pid=,tty=,comm="])
+        guard status == 0 else { return [] }
+        var out: [(String, Int, String, String)] = []
+        for line in text.split(separator: "\n") {
+            let parts = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard parts.count >= 3, let pid = Int(parts[0]) else { continue }
+            let comm = (parts[2] as NSString).lastPathComponent
+            guard names.contains(comm) else { continue }
+            let cwd = cwdOf(pid: pid) ?? ""
+            out.append((comm, pid, parts[1], cwd))
+        }
+        return out
+    }
+}
+
+// MARK: - Claude Code activity (local session transcripts)
+
+/// Surfaces which Claude Code CLI sessions (across terminals/projects) are
+/// active or recently active, and how many tokens each has sent/received.
+/// Reads only transcript metadata — no message content (except the short
+/// `lastPrompt` summary field Claude already stores for session lists).
+final class ClaudeActivityMonitor {
+    private struct Cache {
+        var offset: UInt64 = 0
+        var tokensIn = 0
+        var tokensOut = 0
+        var cwd = ""
+        var branch: String?
+        var lastActivity = Date.distantPast
+        var awaitingReply = false
+        var lastPrompt: String?
+        var entrypoint: String?
+    }
+
+    private var cache: [String: Cache] = [:]
+    private let recentWindow: TimeInterval = 30 * 60
+    private let liveWindow: TimeInterval = 5 * 60
+    private let root = URL(fileURLWithPath: NSHomeDirectory() + "/.claude/projects")
+
+    /// Blocking; call off the main thread. `config` supplies letter/name for rows.
+    func scan(config: ProviderConfig) -> [ActivitySession] {
+        let fm = FileManager.default
+        guard let projectDirs = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else {
+            return []
+        }
+        let cutoff = Date().addingTimeInterval(-recentWindow)
+        var seen = Set<String>()
+
+        for dir in projectDirs {
+            guard let files = try? fm.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+            for file in files where file.pathExtension == "jsonl" {
+                guard let mtime = try? file.resourceValues(forKeys: [.contentModificationDateKey])
+                    .contentModificationDate, mtime > cutoff else { continue }
+                seen.insert(file.path)
+                update(file)
+            }
+        }
+        cache = cache.filter { seen.contains($0.key) }
+
+        // Match live `claude` processes by cwd so rows can open the right TTY.
+        let liveProcs = ProcessFocus.indexCLI(names: ["claude"])
+
+        return cache.map { path, c -> ActivitySession in
+            let id = (path as NSString).lastPathComponent.replacingOccurrences(of: ".jsonl", with: "")
+            let match = liveProcs.first { proc in
+                guard !c.cwd.isEmpty, !proc.cwd.isEmpty else { return false }
+                let a = (c.cwd as NSString).standardizingPath
+                let b = (proc.cwd as NSString).standardizingPath
+                return a == b || a.hasPrefix(b + "/") || b.hasPrefix(a + "/")
+            }
+            let awaiting = c.awaitingReply && Date().timeIntervalSince(c.lastActivity) < liveWindow
+            let live = awaiting || match != nil
+            let title = c.lastPrompt.map(Self.shorten)
+            return ActivitySession(
+                id: id,
+                providerId: config.id,
+                providerLetter: config.letter,
+                providerName: config.displayName,
+                project: Self.projectLabel(c.cwd),
+                cwd: c.cwd.isEmpty ? nil : c.cwd,
+                branch: c.branch,
+                title: title,
+                tokensIn: c.tokensIn, tokensOut: c.tokensOut,
+                model: nil,
+                lastActivity: c.lastActivity,
+                live: live,
+                pid: match?.pid,
+                tty: match?.tty)
+        }.sorted { $0.lastActivity > $1.lastActivity }
+    }
+
+    private func update(_ file: URL) {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        var c = cache[file.path] ?? Cache()
+        if size < c.offset { c = Cache() }
+        guard size > c.offset else { cache[file.path] = c; return }
+        try? handle.seek(toOffset: c.offset)
+        let data = handle.readDataToEndOfFile()
+        c.offset = size
+        for line in data.split(separator: UInt8(ascii: "\n")) {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+            apply(obj, to: &c)
+        }
+        cache[file.path] = c
+    }
+
+    private func apply(_ obj: [String: Any], to c: inout Cache) {
+        if let cwd = obj["cwd"] as? String { c.cwd = cwd }
+        if let branch = obj["gitBranch"] as? String, !branch.isEmpty { c.branch = branch }
+        if let ts = obj["timestamp"] as? String, let d = isoTimestamp.date(from: ts) { c.lastActivity = d }
+        if let p = obj["lastPrompt"] as? String, !p.isEmpty { c.lastPrompt = p }
+        if let e = obj["entrypoint"] as? String { c.entrypoint = e }
+        let type = obj["type"] as? String
+        if type == "user" { c.awaitingReply = true }
+        if type == "system", (obj["subtype"] as? String) == "turn_duration" { c.awaitingReply = false }
+        if let message = obj["message"] as? [String: Any], let u = message["usage"] as? [String: Any] {
+            c.tokensIn += (u["input_tokens"] as? Int ?? 0)
+                + (u["cache_creation_input_tokens"] as? Int ?? 0)
+                + (u["cache_read_input_tokens"] as? Int ?? 0)
+            c.tokensOut += (u["output_tokens"] as? Int ?? 0)
+        }
+    }
+
+    private let isoTimestamp: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    private static func projectLabel(_ cwd: String) -> String {
+        let comps = cwd.split(separator: "/")
+        if let idx = comps.firstIndex(of: ".claude"), idx > 0 { return String(comps[idx - 1]) }
+        return (cwd as NSString).lastPathComponent
+    }
+
+    /// First line / ~72 chars of a lastPrompt for the dark header.
+    static func shorten(_ s: String) -> String {
+        let one = s.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if one.count <= 72 { return one }
+        return String(one.prefix(69)) + "…"
+    }
+}
+
+func abbreviateTokens(_ n: Int) -> String {
+    if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+    if n >= 1_000 { return String(format: "%.0fK", Double(n) / 1_000) }
+    return "\(n)"
+}
+
 // MARK: - Update check (GitHub releases)
 
 /// Once a day, asks GitHub for the latest release and remembers if it's newer
@@ -466,6 +1383,395 @@ final class UsageClient {
     }
 }
 
+// MARK: - Grok auth + billing (session token in ~/.grok/auth.json)
+
+/// Read-only access to the Grok CLI session stored at `~/.grok/auth.json`.
+/// Grok owns refresh; we never rewrite the file (same reason as Claude: a
+/// concurrent refresh race can invalidate the CLI's session).
+enum GrokAuth {
+    static let authPath = NSHomeDirectory() + "/.grok/auth.json"
+
+    /// Best available access token (`key` field) across OIDC/API entries.
+    static func readAccessToken() throws -> String {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              !obj.isEmpty
+        else { throw UsageError.noGrokCredential }
+
+        // Prefer the most recently created entry that still has a token.
+        var best: (token: String, created: String)?
+        for (_, value) in obj {
+            guard let entry = value as? [String: Any] else { continue }
+            let token = (entry["key"] as? String)
+                ?? (entry["access_token"] as? String)
+                ?? ""
+            guard !token.isEmpty else { continue }
+            let created = entry["create_time"] as? String ?? ""
+            if best == nil || created > (best?.created ?? "") {
+                best = (token, created)
+            }
+        }
+        guard let token = best?.token else { throw UsageError.noGrokCredential }
+        return token
+    }
+}
+
+/// Fetches Grok credit/usage gauges via the same billing endpoint the Grok
+/// CLI `/usage` command uses (`GET …/v1/billing?format=credits`).
+final class GrokUsageClient {
+    let billingURL = URL(string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits")!
+
+    /// Blocking; call off the main thread. Returns gauges: overall "Grok"
+    /// plus any product rows that report a usage percent (Build, API, …).
+    func fetchUsage() throws -> [Gauge] {
+        let token = try GrokAuth.readAccessToken()
+        var req = URLRequest(url: billingURL)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("cli", forHTTPHeaderField: "x-grok-client-mode")
+        let (data, code) = try httpSync(req)
+        if code == 401 || code == 403 { throw UsageError.grokTokenExpired }
+        guard code == 200 else { throw UsageError.http(code) }
+
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+        let config = obj["config"] as? [String: Any] ?? obj
+        let reset = resetSub(
+            (config["billingPeriodEnd"] as? String)
+                ?? ((config["currentPeriod"] as? [String: Any])?["end"] as? String))
+
+        var gauges: [Gauge] = []
+        if let pct = number(config["creditUsagePercent"]) {
+            gauges.append(Gauge(label: "Grok", percent: pct.rounded(), sub: reset))
+        }
+        for product in config["productUsage"] as? [[String: Any]] ?? [] {
+            guard let name = product["product"] as? String,
+                  let pct = number(product["usagePercent"]) else { continue }
+            gauges.append(Gauge(label: Self.productLabel(name),
+                                percent: pct.rounded(), sub: reset))
+        }
+        // If the API shape drifts and we got nothing, surface a clear error.
+        if gauges.isEmpty { throw UsageError.http(200) }
+        return gauges
+    }
+
+    private func number(_ any: Any?) -> Double? {
+        if let n = any as? NSNumber { return n.doubleValue }
+        if let s = any as? String { return Double(s) }
+        return nil
+    }
+
+    private static func productLabel(_ product: String) -> String {
+        switch product {
+        case "GrokBuild": return "Grok Build"
+        case "Api", "API": return "Grok API"
+        case "GrokChat": return "Grok Chat"
+        case "GrokImagine": return "Grok Imagine"
+        default:
+            return product.hasPrefix("Grok") ? product : "Grok \(product)"
+        }
+    }
+
+    private func resetSub(_ iso: String?) -> String {
+        guard let iso else { return "" }
+        let cleaned = iso.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: "+00:00", with: "Z")
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        var dt = f.date(from: cleaned)
+        if dt == nil {
+            // Fractional seconds / offset variants the ISO formatter sometimes misses.
+            let f2 = ISO8601DateFormatter()
+            f2.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            dt = f2.date(from: iso)
+        }
+        guard let dt else { return "" }
+        let delta = dt.timeIntervalSinceNow
+        if delta <= 0 { return "resetting…" }
+        let df = DateFormatter()
+        if delta < 3600 { return "resets in \(Int(delta / 60)) min" }
+        df.dateFormat = delta < 12 * 3600 ? "h:mm a" : "EEE h:mm a"
+        return "resets " + df.string(from: dt)
+    }
+}
+
+// MARK: - Codex auth + usage (ChatGPT session in ~/.codex/auth.json)
+
+/// Read-only access to Codex CLI auth at `~/.codex/auth.json`.
+enum CodexAuth {
+    static let authPath = NSHomeDirectory() + "/.codex/auth.json"
+
+    static func readTokens() throws -> (access: String, accountId: String?) {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw UsageError.noCodexCredential }
+        let tokens = obj["tokens"] as? [String: Any] ?? [:]
+        let access = tokens["access_token"] as? String ?? ""
+        guard !access.isEmpty else { throw UsageError.noCodexCredential }
+        let account = tokens["account_id"] as? String
+        return (access, account)
+    }
+}
+
+/// Fetches Codex rate-limit gauges via ChatGPT's WHAM usage endpoint
+/// (same data Codex / the ChatGPT Codex UI shows).
+final class CodexUsageClient {
+    let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
+
+    /// Blocking; call off the main thread.
+    func fetchUsage() throws -> [Gauge] {
+        let (access, accountId) = try CodexAuth.readTokens()
+        var req = URLRequest(url: usageURL)
+        req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("codex-cli", forHTTPHeaderField: "User-Agent")
+        if let accountId, !accountId.isEmpty {
+            req.setValue(accountId, forHTTPHeaderField: "ChatGPT-Account-Id")
+        }
+        let (data, code) = try httpSync(req)
+        if code == 401 || code == 403 { throw UsageError.codexTokenExpired }
+        guard code == 200 else { throw UsageError.http(code) }
+
+        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+        var gauges: [Gauge] = []
+
+        if let rl = obj["rate_limit"] as? [String: Any] {
+            if let primary = rl["primary_window"] as? [String: Any],
+               let pct = number(primary["used_percent"]) {
+                gauges.append(Gauge(label: "Codex", percent: pct.rounded(),
+                                    sub: resetSub(primary)))
+            }
+            if let secondary = rl["secondary_window"] as? [String: Any],
+               let pct = number(secondary["used_percent"]) {
+                gauges.append(Gauge(label: "Codex 2", percent: pct.rounded(),
+                                    sub: resetSub(secondary)))
+            }
+        }
+        // Credits balance as a soft gauge only when the account has a credit pool.
+        if let credits = obj["credits"] as? [String: Any],
+           credits["has_credits"] as? Bool == true,
+           let bal = number(credits["balance"]) {
+            // Balance is remaining credits (not a percent) — skip if we can't normalize.
+            _ = bal
+        }
+        if gauges.isEmpty { throw UsageError.http(200) }
+        return gauges
+    }
+
+    private func number(_ any: Any?) -> Double? {
+        if let n = any as? NSNumber { return n.doubleValue }
+        if let s = any as? String { return Double(s) }
+        if let i = any as? Int { return Double(i) }
+        return nil
+    }
+
+    private func resetSub(_ window: [String: Any]) -> String {
+        if let resetAt = window["reset_at"] as? Int ?? (window["reset_at"] as? NSNumber)?.intValue {
+            let dt = Date(timeIntervalSince1970: TimeInterval(resetAt))
+            let delta = dt.timeIntervalSinceNow
+            if delta <= 0 { return "resetting…" }
+            if delta < 3600 { return "resets in \(Int(delta / 60)) min" }
+            let df = DateFormatter()
+            df.dateFormat = delta < 12 * 3600 ? "h:mm a" : "EEE h:mm a"
+            return "resets " + df.string(from: dt)
+        }
+        if let secs = window["reset_after_seconds"] as? Int
+            ?? (window["reset_after_seconds"] as? NSNumber)?.intValue {
+            if secs <= 0 { return "resetting…" }
+            if secs < 3600 { return "resets in \(secs / 60) min" }
+            if secs < 86400 { return "resets in \(secs / 3600)h" }
+            return "resets in \(secs / 86400)d"
+        }
+        return ""
+    }
+}
+
+/// Codex activity from `~/.codex/session_index.jsonl` + live `codex` processes.
+final class CodexActivityMonitor {
+    private let indexPath = NSHomeDirectory() + "/.codex/session_index.jsonl"
+    private let recentWindow: TimeInterval = 30 * 60
+    private let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    func scan(config: ProviderConfig) -> [ActivitySession] {
+        guard let text = try? String(contentsOfFile: indexPath, encoding: .utf8) else { return [] }
+        let cutoff = Date().addingTimeInterval(-recentWindow)
+        let liveProcs = ProcessFocus.indexCLI(names: ["codex"])
+        var out: [ActivitySession] = []
+        for line in text.split(separator: "\n") {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let id = obj["id"] as? String else { continue }
+            let title = obj["thread_name"] as? String
+            let updated = parseDate(obj["updated_at"] as? String) ?? Date.distantPast
+            let cwd = obj["cwd"] as? String
+            let match = liveProcs.first { proc in
+                guard let cwd, !proc.cwd.isEmpty else { return false }
+                let a = (cwd as NSString).standardizingPath
+                let b = (proc.cwd as NSString).standardizingPath
+                return a == b || a.hasPrefix(b + "/") || b.hasPrefix(a + "/")
+            }
+            let live = match != nil
+            guard live || updated > cutoff else { continue }
+            let project: String
+            if let cwd, !cwd.isEmpty {
+                project = (cwd as NSString).lastPathComponent
+            } else {
+                project = title.map { ClaudeActivityMonitor.shorten($0) } ?? "codex"
+            }
+            out.append(ActivitySession(
+                id: id,
+                providerId: config.id,
+                providerLetter: config.letter,
+                providerName: config.displayName,
+                project: project,
+                cwd: cwd,
+                branch: nil,
+                title: title.map(ClaudeActivityMonitor.shorten),
+                tokensIn: nil, tokensOut: nil,
+                model: nil,
+                lastActivity: updated,
+                live: live,
+                pid: match?.pid,
+                tty: match?.tty))
+        }
+        return out.sorted { $0.lastActivity > $1.lastActivity }
+    }
+
+    private func parseDate(_ s: String?) -> Date? {
+        guard let s else { return nil }
+        return iso.date(from: s) ?? isoPlain.date(from: s)
+    }
+}
+
+/// Cursor activity — lightweight: if Cursor.app is running, one “app open” row.
+/// (No stable public usage endpoint; click opens the desktop app.)
+final class CursorActivityMonitor {
+    func scan(config: ProviderConfig) -> [ActivitySession] {
+        let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.todesktop.230313mzl4w4u92")
+            + NSWorkspace.shared.runningApplications.filter {
+                ($0.localizedName ?? "").localizedCaseInsensitiveContains("Cursor")
+                    && ($0.bundleURL?.path.contains("Cursor.app") ?? false)
+            }
+        guard let app = apps.first, app.processIdentifier > 0 else { return [] }
+        return [ActivitySession(
+            id: "cursor-app",
+            providerId: config.id,
+            providerLetter: config.letter,
+            providerName: config.displayName,
+            project: "Cursor",
+            cwd: nil,
+            branch: nil,
+            title: "Desktop app open",
+            tokensIn: nil, tokensOut: nil,
+            model: nil,
+            lastActivity: Date(),
+            live: true,
+            pid: Int(app.processIdentifier),
+            tty: nil)]
+    }
+}
+
+// MARK: - Grok activity (local session registry — no chat content)
+
+/// Surfaces which Grok CLI sessions are live or recent. Reads only the
+/// registry + summary metadata Grok already writes under `~/.grok/sessions`
+/// — no network, no message content.
+final class GrokActivityMonitor {
+    private let recentWindow: TimeInterval = 30 * 60
+    private let sessionsRoot = URL(fileURLWithPath: NSHomeDirectory() + "/.grok/sessions")
+    private let activePath = NSHomeDirectory() + "/.grok/active_sessions.json"
+    private let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    /// Blocking file I/O; call off the main thread. Sorted most-recent first.
+    func scan(config: ProviderConfig) -> [ActivitySession] {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: activePath)),
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else { return [] }
+
+        let cutoff = Date().addingTimeInterval(-recentWindow)
+        var out: [ActivitySession] = []
+        for row in rows {
+            guard let id = row["session_id"] as? String else { continue }
+            let cwd = row["cwd"] as? String ?? ""
+            let pid = row["pid"] as? Int
+            let live = pid.map(ProcessFocus.processAlive) ?? false
+            let opened = parseDate(row["opened_at"] as? String) ?? Date.distantPast
+
+            var last = opened
+            var branch: String?
+            var model: String?
+            var title: String?
+            if let summary = loadSummary(cwd: cwd, id: id) {
+                if let t = parseDate(summary["last_active_at"] as? String
+                                     ?? summary["updated_at"] as? String) {
+                    last = t
+                }
+                branch = summary["head_branch"] as? String
+                model = summary["current_model_id"] as? String
+                let raw = (summary["session_summary"] as? String)
+                    ?? (summary["generated_title"] as? String)
+                title = raw.map(ClaudeActivityMonitor.shorten)
+            }
+            // Resolve TTY from the live PID so click can select the Terminal tab.
+            var tty: String?
+            if let pid, live, let info = ProcessFocus.procInfo(pid) {
+                tty = info.tty == "??" ? nil : info.tty
+            }
+            guard live || last > cutoff else { continue }
+            out.append(ActivitySession(
+                id: id,
+                providerId: config.id,
+                providerLetter: config.letter,
+                providerName: config.displayName,
+                project: (cwd as NSString).lastPathComponent,
+                cwd: cwd.isEmpty ? nil : cwd,
+                branch: branch.flatMap { $0.isEmpty ? nil : $0 },
+                title: title,
+                tokensIn: nil, tokensOut: nil,
+                model: model,
+                lastActivity: last,
+                live: live,
+                pid: pid,
+                tty: tty))
+        }
+        return out.sorted { $0.lastActivity > $1.lastActivity }
+    }
+
+    private func loadSummary(cwd: String, id: String) -> [String: Any]? {
+        let encoded = cwd.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)?
+            .replacingOccurrences(of: "/", with: "%2F") ?? cwd
+        let url = sessionsRoot
+            .appendingPathComponent(encoded)
+            .appendingPathComponent(id)
+            .appendingPathComponent("summary.json")
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return obj
+    }
+
+    private func parseDate(_ s: String?) -> Date? {
+        guard let s else { return nil }
+        return iso.date(from: s) ?? isoPlain.date(from: s)
+    }
+}
+
 // MARK: - Onboarding
 
 func claudeInstalled() -> Bool {
@@ -479,6 +1785,18 @@ func claudeInstalled() -> Bool {
     do { try p.run(); p.waitUntilExit(); return p.terminationStatus == 0 } catch { return false }
 }
 
+func grokInstalled() -> Bool {
+    let paths = ["\(NSHomeDirectory())/.grok/bin/grok",
+                 "\(NSHomeDirectory())/.local/bin/grok",
+                 "/opt/homebrew/bin/grok", "/usr/local/bin/grok"]
+    if paths.contains(where: { FileManager.default.isExecutableFile(atPath: $0) }) { return true }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    p.arguments = ["which", "grok"]
+    p.standardOutput = Pipe(); p.standardError = Pipe()
+    do { try p.run(); p.waitUntilExit(); return p.terminationStatus == 0 } catch { return false }
+}
+
 func signedInToClaude() -> Bool {
     guard let cred = try? Keychain.read(),
           let oauth = cred["claudeAiOauth"] as? [String: Any],
@@ -486,15 +1804,33 @@ func signedInToClaude() -> Bool {
     return !t.isEmpty
 }
 
+func signedInToGrok() -> Bool {
+    (try? GrokAuth.readAccessToken()) != nil
+}
+
+func signedInToCodex() -> Bool {
+    (try? CodexAuth.readTokens()) != nil
+}
+
+func cursorInstalled() -> Bool {
+    FileManager.default.fileExists(atPath: "/Applications/Cursor.app")
+        || NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.todesktop.230313mzl4w4u92") != nil
+}
+
+func anyProviderSignedIn() -> Bool {
+    signedInToClaude() || signedInToGrok() || signedInToCodex() || cursorInstalled()
+}
+
 func apiKeyConfigured() -> Bool { Keychain.readAdminKey() != nil }
 
-/// First-run window: sets up the Claude Code subscription (for the gauges) and,
-/// optionally, an Admin API key (for dollar spend).
+/// First-run window: sets up Claude Code and/or Grok (for the gauges) and,
+/// optionally, an Anthropic Admin API key (for Claude dollar spend).
 final class OnboardingController: NSObject, NSWindowDelegate {
     var onReady: (() -> Void)?
     var onKeyChanged: (() -> Void)?
     private var window: NSWindow?
     private var body: NSTextField?
+    private var grokBody: NSTextField?
     private var apiStatus: NSTextField?
     private var status: NSTextField?
     private var primary: NSButton?
@@ -511,7 +1847,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     }
 
     private func build() {
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 470),
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 580),
                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
         win.title = "Usage Monitor Setup"
         win.delegate = self
@@ -530,20 +1866,29 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         heading.spacing = 12
         heading.alignment = .centerY
 
-        // Section 1 — Claude Code subscription (powers the % gauges).
+        // Section 1 — Claude Code subscription (powers Claude % gauges).
         let sub = sectionTitle("Claude usage gauges")
         let body = NSTextField(wrappingLabelWithString: "")
         body.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         self.body = body
-        let copyBtn = button("Copy install command", #selector(copyInstall))
+        let copyBtn = button("Copy Claude install", #selector(copyInstall))
         let recheck = button("Re-check", #selector(refresh))
         let subRow = NSStackView(views: [copyBtn, NSView(), recheck])
         subRow.orientation = .horizontal; subRow.spacing = 8
 
-        // Section 2 — optional Admin API key (powers dollar spend).
-        let apiTitle = sectionTitle("API dollar spend  (optional)")
+        // Section 1b — Grok CLI (powers Grok % gauges). Either provider is enough.
+        let grokTitle = sectionTitle("Grok usage gauges")
+        let grokBody = NSTextField(wrappingLabelWithString: "")
+        grokBody.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        self.grokBody = grokBody
+        let copyGrok = button("Copy Grok install", #selector(copyGrokInstall))
+        let grokRow = NSStackView(views: [copyGrok, NSView()])
+        grokRow.orientation = .horizontal; grokRow.spacing = 8
+
+        // Section 2 — optional Admin API key (powers Claude dollar spend).
+        let apiTitle = sectionTitle("Claude API dollar spend  (optional)")
         let apiBody = NSTextField(wrappingLabelWithString:
-            "To also show what you've spent on the pay-as-you-go API, add an "
+            "To also show what you've spent on the Anthropic pay-as-you-go API, add an "
             + "Admin API key (starts with sk-ant-admin) from console.anthropic.com. "
             + "It's stored only in your macOS Keychain and used solely to read your "
             + "cost report — never shared. Skip this if you only use a Pro/Max plan.")
@@ -571,6 +1916,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         footer.orientation = .horizontal; footer.spacing = 8
 
         let stack = NSStackView(views: [heading, sub, body, subRow,
+                                        separator(), grokTitle, grokBody, grokRow,
                                         separator(), apiTitle, apiBody, apiStatus, apiRow,
                                         separator(), footer])
         stack.orientation = .vertical
@@ -587,6 +1933,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             body.widthAnchor.constraint(equalToConstant: 432),
+            grokBody.widthAnchor.constraint(equalToConstant: 432),
             apiBody.widthAnchor.constraint(equalToConstant: 432),
             footer.widthAnchor.constraint(equalToConstant: 432),
         ])
@@ -612,34 +1959,57 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     }
 
     @objc func refresh() {
-        let hasCLI = claudeInstalled()
-        let signedIn = signedInToClaude()
+        let hasClaude = claudeInstalled()
+        let claudeIn = signedInToClaude()
+        let hasGrok = grokInstalled()
+        let grokIn = signedInToGrok()
         func mark(_ ok: Bool) -> String { ok ? "✅" : "⬜️" }
         body?.stringValue = """
-        \(mark(hasCLI))  1. Install Claude Code
+        \(mark(hasClaude))  1. Install Claude Code
               curl -fsSL https://claude.ai/install.sh | bash
 
-        \(mark(signedIn))  2. Sign in to Claude Code
+        \(mark(claudeIn))  2. Sign in to Claude Code
               Run  claude  in a terminal and complete sign-in.
               (Requires a Claude Pro or Max subscription.)
         """
+        grokBody?.stringValue = """
+        \(mark(hasGrok))  1. Install Grok CLI
+              See https://docs.x.ai  (or your usual Grok install path)
+
+        \(mark(grokIn))  2. Sign in to Grok
+              Run  grok login  in a terminal and complete sign-in.
+        """
         if apiKeyConfigured() {
-            apiStatus?.stringValue = "✅  API key configured — dollar spend is on."
+            apiStatus?.stringValue = "✅  API key configured — Claude dollar spend is on."
             apiStatus?.textColor = .labelColor
         } else {
-            apiStatus?.stringValue = "⬜️  No API key — dollar spend is off."
+            apiStatus?.stringValue = "⬜️  No API key — Claude dollar spend is off."
             apiStatus?.textColor = .secondaryLabelColor
         }
-        let ready = hasCLI && signedIn
+        // Either provider is enough to start; the Admin key is optional.
+        let ready = (hasClaude && claudeIn) || (hasGrok && grokIn) || claudeIn || grokIn
         primary?.isEnabled = ready
-        status?.stringValue = ready ? "Ready. The API key is optional."
-                                    : "Do the unchecked steps above, then Re-check."
+        if ready {
+            var parts: [String] = []
+            if claudeIn { parts.append("Claude") }
+            if grokIn { parts.append("Grok") }
+            status?.stringValue = "Ready (\(parts.joined(separator: " + "))). Admin API key is optional."
+        } else {
+            status?.stringValue = "Sign in to Claude and/or Grok, then Re-check."
+        }
     }
 
     @objc func copyInstall() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString("curl -fsSL https://claude.ai/install.sh | bash", forType: .string)
-        status?.stringValue = "Install command copied — paste it into a terminal."
+        status?.stringValue = "Claude install command copied — paste it into a terminal."
+    }
+
+    @objc func copyGrokInstall() {
+        NSPasteboard.general.clearContents()
+        // Grok's install path varies by channel; point people at login once installed.
+        NSPasteboard.general.setString("grok login", forType: .string)
+        status?.stringValue = "“grok login” copied — paste it into a terminal after installing Grok."
     }
 
     // MARK: API key — scan / manual / remove
@@ -767,21 +2137,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let statusMenu = NSMenu()    // built once; rebuilt on open via NSMenuDelegate
     let client = UsageClient()
+    let grokClient = GrokUsageClient()
+    let codexClient = CodexUsageClient()
     let costClient = CostClient()
+    let activityMonitor = ClaudeActivityMonitor()
+    let grokActivity = GrokActivityMonitor()
+    let codexActivity = CodexActivityMonitor()
+    let cursorActivity = CursorActivityMonitor()
     let onboarding = OnboardingController()
+    let whatsNew = WhatsNewController()
     let updates = UpdateChecker()
     let newsletterURL = URL(string: "https://buttondown.com/jaco")!
     let communityURL = URL(string: "https://github.com/jackfieldman/usage-monitor/discussions")!
     var timer: Timer?
-    var gauges: [Gauge] = []
+    /// Configured provider slots (names, letters, bar placement).
+    var providerConfigs: [ProviderConfig] = ProviderStore.load()
+    /// Live gauge groups for enabled providers that returned data.
+    var providerGauges: [ProviderGauges] = []
     var lastError: String?
     var lastUpdated: Date?
     var updateAvailable: (version: String, page: URL, zip: URL?)?
     var updating = false
-    var monthSpend: Double?      // month-to-date USD, nil if no key or not yet fetched
+    var monthSpend: Double?
     var costError: String?
-    var hasAdminKey = false      // cached so render()/the menu don't spawn `security` each time
-    var notifiedHigh = Set<String>()   // gauges already alerted while in the red zone
+    var hasAdminKey = false
+    var notifiedHigh = Set<String>()
+    /// Unified activity across all providers that have showActivity on.
+    var activity: [ActivitySession] = []
+    var sessionTimer: Timer?
+
+    var allGauges: [Gauge] { providerGauges.flatMap(\.gauges) }
+
+    /// Clusters drawn in the menu bar, driven by layout + per-provider showInMenuBar.
+    var iconClusters: [IconCluster] {
+        let shown = providerGauges.filter { $0.config.showInMenuBar && $0.config.enabled }
+        switch ProviderStore.layout {
+        case .highestOnly:
+            let flat = shown.flatMap { g in g.gauges.map { (g.config, $0) } }
+            guard let best = flat.max(by: { $0.1.percent < $1.1.percent }) else { return [] }
+            return [IconCluster(letter: best.0.letter, name: best.0.displayName, gauges: [best.1])]
+        case .allGauges:
+            return shown.map { group in
+                IconCluster(letter: group.config.letter, name: group.config.displayName, gauges: group.gauges)
+            }
+        case .perProvider:
+            return shown.compactMap { group in
+                guard let g = Self.primaryGauge(for: group) else { return nil }
+                return IconCluster(letter: group.config.letter, name: group.config.displayName, gauges: [g])
+            }
+        }
+    }
+
+    /// Which gauge drives a provider’s letter+% in the menu bar.
+    /// Empty preference → that provider’s highest; otherwise the named limit.
+    static func numberShowsKey(_ providerId: String) -> String { "numberShows.\(providerId)" }
+
+    static func numberShows(for providerId: String) -> String {
+        UserDefaults.standard.string(forKey: numberShowsKey(providerId)) ?? ""
+    }
+
+    static func setNumberShows(_ label: String, for providerId: String) {
+        UserDefaults.standard.set(label, forKey: numberShowsKey(providerId))
+    }
+
+    static func primaryGauge(for group: ProviderGauges) -> Gauge? {
+        let pref = numberShows(for: group.config.id)
+        if !pref.isEmpty, let g = group.gauges.first(where: { $0.label == pref }) {
+            return g
+        }
+        // Kind-aware defaults when “Highest” is selected (or preference stale).
+        switch group.config.kind {
+        case .grok:
+            return group.gauges.first(where: { $0.label == "Grok" })
+                ?? group.gauges.max(by: { $0.percent < $1.percent })
+        case .codex:
+            return group.gauges.first(where: { $0.label == "Codex" })
+                ?? group.gauges.max(by: { $0.percent < $1.percent })
+        case .claude, .cursor:
+            return group.gauges.max(by: { $0.percent < $1.percent })
+        }
+    }
+
+    /// Flat gauges for shapes that still expect a single list (legacy drawing helpers).
+    var iconGauges: [Gauge] { iconClusters.flatMap(\.gauges) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -797,29 +2235,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         render()
         poll()
+        pollSessions()
         if notifyEnabled && !notifyConfirmed { requestAuthThenConfirm() }
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.poll()
         }
-        if !signedInToClaude() { onboarding.present() }   // first-run guidance
+        sessionTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            self?.pollSessions()
+        }
+        if !anyProviderSignedIn() { onboarding.present() }
     }
 
     @objc func openSetup() { onboarding.present() }
 
+    func pollSessions() {
+        let configs = providerConfigs
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            var rows: [ActivitySession] = []
+            for cfg in configs where cfg.enabled && cfg.showActivity {
+                switch cfg.kind {
+                case .claude: rows.append(contentsOf: self.activityMonitor.scan(config: cfg))
+                case .grok: rows.append(contentsOf: self.grokActivity.scan(config: cfg))
+                case .codex: rows.append(contentsOf: self.codexActivity.scan(config: cfg))
+                case .cursor: rows.append(contentsOf: self.cursorActivity.scan(config: cfg))
+                }
+            }
+            rows.sort { $0.lastActivity > $1.lastActivity }
+            DispatchQueue.main.async { self.activity = rows }
+        }
+    }
+
     @objc func poll() {
         pollCost()
         checkForUpdate()
+        let configs = providerConfigs
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            do {
-                let g = try self.client.fetchUsage()
-                DispatchQueue.main.async {
-                    self.checkNotifications(g)
-                    self.gauges = g; self.lastError = nil; self.lastUpdated = Date(); self.render()
+            var groups: [ProviderGauges] = []
+            var errors: [String] = []
+
+            for cfg in configs where cfg.enabled {
+                switch cfg.kind {
+                case .claude:
+                    guard signedInToClaude() else { continue }
+                    do {
+                        let g = try self.client.fetchUsage()
+                        if !g.isEmpty { groups.append(ProviderGauges(config: cfg, gauges: g)) }
+                    } catch {
+                        errors.append("\(cfg.displayName): "
+                            + ((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))
+                    }
+                case .grok:
+                    guard signedInToGrok() else { continue }
+                    do {
+                        let g = try self.grokClient.fetchUsage()
+                        if !g.isEmpty { groups.append(ProviderGauges(config: cfg, gauges: g)) }
+                    } catch {
+                        errors.append("\(cfg.displayName): "
+                            + ((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))
+                    }
+                case .codex:
+                    guard signedInToCodex() else { continue }
+                    do {
+                        let g = try self.codexClient.fetchUsage()
+                        if !g.isEmpty { groups.append(ProviderGauges(config: cfg, gauges: g)) }
+                    } catch {
+                        errors.append("\(cfg.displayName): "
+                            + ((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))
+                    }
+                case .cursor:
+                    // No usage gauges yet — activity/open only.
+                    continue
                 }
-            } catch {
-                let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                DispatchQueue.main.async { self.lastError = msg; self.render() }
+            }
+
+            if groups.isEmpty && errors.isEmpty {
+                errors.append("No enabled provider is signed in")
+            }
+
+            DispatchQueue.main.async {
+                let flat = groups.flatMap(\.gauges)
+                if !flat.isEmpty {
+                    self.checkNotifications(flat)
+                    self.providerGauges = groups
+                    self.lastUpdated = Date()
+                    self.lastError = errors.isEmpty ? nil : errors.joined(separator: " · ")
+                } else if self.providerGauges.isEmpty {
+                    self.lastError = errors.joined(separator: " · ")
+                } else {
+                    self.lastError = errors.joined(separator: " · ")
+                }
+                self.render()
             }
         }
     }
@@ -892,6 +2399,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openNewsletter() { NSWorkspace.shared.open(newsletterURL) }
     @objc func openCommunity() { NSWorkspace.shared.open(communityURL) }
 
+    /// Menu row: “What's New” with a blue NEW chip while this version is unread.
+    func whatsNewMenuItem() -> NSMenuItem {
+        let i = NSMenuItem(title: "What's New", action: #selector(showWhatsNew), keyEquivalent: "")
+        i.target = self
+        if WhatsNew.hasUnseen {
+            i.image = WhatsNew.newChipImage(height: 15)
+            i.toolTip = "New in \(WhatsNew.appVersion) — open to see what’s changed"
+        } else {
+            i.toolTip = "Release notes for Usage Monitor"
+        }
+        return i
+    }
+
+    @objc func showWhatsNew() {
+        whatsNew.present()
+        // Rebuild next open so the chip disappears after “Got it” / open.
+    }
+
     func pollCost() {
         guard hasAdminKey else { monthSpend = nil; costError = nil; return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -908,20 +2433,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func render() {
         guard let button = statusItem.button else { return }
-        if gauges.isEmpty {
+        let clusters = iconClusters
+        if clusters.isEmpty {
             button.image = warningImage()
             button.toolTip = lastError
         } else {
-            switch iconShape {
-            case .battery: button.image = consolidated ? consolidatedImage(gauges) : gaugeImage(gauges)
-            case .bars: button.image = barsImage(gauges)
-            case .hbars: button.image = hbarsImage(gauges)
-            case .rings: button.image = ringsImage(gauges)
+            let img = clusterImage(clusters)
+            img.isTemplate = false
+            button.image = img
+            // Prevent the status item from re-tinting multi-color letter glyphs.
+            button.appearsDisabled = false
+            var tip: [String] = []
+            for group in providerGauges {
+                tip.append("— \(group.config.displayName) —")
+                tip.append(contentsOf: group.gauges.map { "\($0.label): \(Int($0.percent))%" })
             }
-            button.toolTip = gauges.map { "\($0.label): \(Int($0.percent))%" }
-                .joined(separator: "\n")
+            button.toolTip = tip.joined(separator: "\n")
         }
         button.imagePosition = .imageOnly
+    }
+
+    /// Draws letter-badged clusters: `C:▮ 21%  G:▮ 9%` (layout-dependent gauges).
+    /// Letters use full label contrast (not secondary) so they stay readable in the
+    /// menu bar — secondaryLabelColor washes out against wallpapers / dark bars.
+    func clusterImage(_ clusters: [IconCluster]) -> NSImage {
+        // Single-provider + allGauges with one cluster can reuse classic shapes.
+        if clusters.count == 1, clusters[0].gauges.count > 1, ProviderStore.layout == .allGauges {
+            let gauges = clusters[0].gauges
+            switch iconShape {
+            case .battery: return consolidated ? consolidatedImage(gauges) : gaugeImage(gauges)
+            case .bars: return barsImage(gauges)
+            case .hbars: return hbarsImage(gauges)
+            case .rings: return ringsImage(gauges)
+            }
+        }
+
+        let h: CGFloat = 22
+        // Bold monospaced letter + colon — same weight as the percent so C:/G: read clearly.
+        let letterFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
+        let numFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let gap: CGFloat = 7, pad: CGFloat = 2
+        let barW: CGFloat = density == .comfortable ? 5.5 : 4
+        let barH: CGFloat = 14
+        let letterGap: CGFloat = 3, pctGap: CGFloat = 3
+
+        // Measure each cluster: "C:" + mini bar + "NN%"
+        struct Laid {
+            let letter: NSAttributedString
+            let pct: NSAttributedString
+            let percent: Double
+            let width: CGFloat
+        }
+        // Full labelColor for both letter and % — equal contrast in the bar.
+        let ink = NSColor.labelColor
+        let laid: [Laid] = clusters.map { c in
+            let pctVal = c.gauges.map(\.percent).max() ?? 0
+            let badge = c.letter.count == 1 ? "\(c.letter):" : c.letter
+            let letter = NSAttributedString(string: badge,
+                attributes: [.font: letterFont, .foregroundColor: ink])
+            let pct = NSAttributedString(string: "\(Int(pctVal))%",
+                attributes: [.font: numFont, .foregroundColor: ink])
+            let w = ceil(letter.size().width) + letterGap + barW + pctGap + ceil(pct.size().width)
+            return Laid(letter: letter, pct: pct, percent: pctVal, width: w)
+        }
+        let total = pad * 2 + laid.reduce(0) { $0 + $1.width } + gap * CGFloat(max(0, laid.count - 1))
+
+        let img = NSImage(size: NSSize(width: total, height: h), flipped: false) { [weak self] _ in
+            guard let self else { return false }
+            var x = pad
+            for item in laid {
+                let ly = ((h - item.letter.size().height) / 2).rounded()
+                item.letter.draw(at: NSPoint(x: x, y: ly))
+                x += ceil(item.letter.size().width) + letterGap
+
+                let by = ((h - barH) / 2).rounded()
+                NSColor.labelColor.withAlphaComponent(0.18).setFill()
+                NSBezierPath(roundedRect: NSRect(x: x, y: by, width: barW, height: barH),
+                             xRadius: barW / 2, yRadius: barW / 2).fill()
+                let p = max(0, min(100, item.percent)) / 100
+                if p > 0 {
+                    let bh = max(barW, barH * p)
+                    self.fillColor(item.percent).setFill()
+                    NSBezierPath(roundedRect: NSRect(x: x, y: by, width: barW, height: bh),
+                                 xRadius: barW / 2, yRadius: barW / 2).fill()
+                }
+                x += barW + pctGap
+
+                let py = ((h - item.pct.size().height) / 2).rounded()
+                item.pct.draw(at: NSPoint(x: x, y: py))
+                x += ceil(item.pct.size().width) + gap
+            }
+            return true
+        }
+        // Never template-tint the multi-color glyph — that would wash letters out.
+        img.isTemplate = false
+        return img
     }
 
     // MARK: notifications — alert when a limit crosses into the red zone
@@ -992,7 +2598,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         saveNotified()   // persist so a relaunch doesn't re-alert a still-maxed limit
         for g in crossed {
             let c = UNMutableNotificationContent()
-            c.title = "Claude usage — \(g.label)"
+            c.title = "Usage — \(g.label)"
             c.body = "You're at \(Int(g.percent))% of your \(g.label.lowercased()) limit."
             let id = "usage-\(g.label)"
             UNUserNotificationCenter.current().add(
@@ -1017,19 +2623,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Which limit's percent the single-glyph shapes (bars/rings/consolidated)
     /// show beside the icon. Empty = the highest of all limits.
+    /// Legacy single global number pick — only used when exactly one provider
+    /// is on the bar and layout is allGauges/highestOnly. Multi-provider uses
+    /// per-slot `numberShows.<id>` instead.
     var numberLabel: String {
         get { UserDefaults.standard.string(forKey: "numberLabel") ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: "numberLabel") }
     }
 
+    /// representedObject: ["id": providerId, "label": gaugeLabel or ""]
     @objc func pickNumber(_ sender: NSMenuItem) {
-        numberLabel = (sender.representedObject as? String) ?? ""
-        render()
+        if let obj = sender.representedObject as? [String: String], let id = obj["id"] {
+            Self.setNumberShows(obj["label"] ?? "", for: id)
+            render()
+            return
+        }
+        // Back-compat: bare string was the global numberLabel.
+        if let label = sender.representedObject as? String {
+            numberLabel = label
+            if let only = providerGauges.first, providerGauges.count == 1 {
+                Self.setNumberShows(label, for: only.config.id)
+            }
+            render()
+        }
     }
 
     func displayPercent(_ gauges: [Gauge]) -> Double {
-        if !numberLabel.isEmpty, let g = gauges.first(where: { $0.label == numberLabel }) {
-            return g.percent
+        // Single-glyph helpers (allGauges classic shapes): prefer the sole
+        // provider’s per-slot pick, then legacy global, then max.
+        if let only = providerGauges.first, providerGauges.count == 1 {
+            let pref = Self.numberShows(for: only.config.id)
+            if !pref.isEmpty, let g = gauges.first(where: { $0.label == pref })
+                ?? only.gauges.first(where: { $0.label == pref }) {
+                return g.percent
+            }
+        }
+        if !numberLabel.isEmpty {
+            if let g = gauges.first(where: { $0.label == numberLabel }) { return g.percent }
+            if let g = allGauges.first(where: { $0.label == numberLabel }) { return g.percent }
         }
         return gauges.map(\.percent).max() ?? 0
     }
@@ -1088,25 +2719,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// current without render() reconstructing the menu on every poll.
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        if gauges.isEmpty, let err = lastError {
+        if providerGauges.isEmpty, let err = lastError {
             menu.addItem(disabled("⚠︎  \(err)"))
-            if err.contains("signed in") {
-                menu.addItem(disabled("Open Claude Code and sign in, then Refresh."))
+            if err.lowercased().contains("signed") {
+                menu.addItem(disabled("Sign in to a provider, then Refresh."))
             }
         } else {
-            menu.addItem(disabled("Claude usage limits"))
-            menu.addItem(.separator())
-            for g in gauges {
-                let sub = g.sub.isEmpty ? "" : "   ·  \(g.sub)"
-                let item = disabled("\(g.label):  \(Int(g.percent))%\(sub)")
-                item.image = dotImage(levelColor(g.percent))
-                menu.addItem(item)
+            for (idx, group) in providerGauges.enumerated() {
+                if idx > 0 { menu.addItem(.separator()) }
+                let header = "\(group.config.letter):  \(group.config.displayName)"
+                menu.addItem(disabled(header))
+                for g in group.gauges {
+                    let sub = g.sub.isEmpty ? "" : "   ·  \(g.sub)"
+                    let row = disabled("\(g.label):  \(Int(g.percent))%\(sub)")
+                    row.image = dotImage(levelColor(g.percent))
+                    menu.addItem(row)
+                }
             }
-            if let err = lastError { menu.addItem(disabled("⚠︎  \(err) (showing last good data)")) }
+            if let err = lastError, !providerGauges.isEmpty {
+                menu.addItem(disabled("⚠︎  \(err) (showing last good data)"))
+            }
         }
         if hasAdminKey {
             menu.addItem(.separator())
-            menu.addItem(disabled("API spend (this month)"))
+            menu.addItem(disabled("Claude API spend (this month)"))
             if let usd = monthSpend { menu.addItem(disabled(String(format: "$%.2f used", usd))) }
             if let err = costError {
                 menu.addItem(disabled(monthSpend == nil ? "⚠︎  \(err)"
@@ -1115,6 +2751,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(disabled("Loading…"))
             }
         }
+
+        // Activity — clickable, two-line (dark title + light path line).
+        if !activity.isEmpty {
+            menu.addItem(.separator())
+            // Group by provider name for section headers.
+            var seenProviders: [String] = []
+            for s in activity {
+                if !seenProviders.contains(s.providerId) { seenProviders.append(s.providerId) }
+            }
+            let byProvider = Dictionary(grouping: activity, by: \.providerId)
+            for (pidx, pid) in seenProviders.enumerated() {
+                guard let rows = byProvider[pid], let first = rows.first else { continue }
+                if pidx > 0 { /* keep one flat list with headers */ }
+                menu.addItem(disabled("\(first.providerLetter):  \(first.providerName) activity"))
+                let shown = rows.prefix(5)
+                for s in shown {
+                    menu.addItem(activityMenuItem(s))
+                }
+                let remaining = rows.count - shown.count
+                if remaining > 0 { menu.addItem(disabled("+\(remaining) more idle")) }
+            }
+        }
+
         if let updated = lastUpdated {
             menu.addItem(.separator())
             menu.addItem(disabled("Updated \(relative(updated))"))
@@ -1125,11 +2784,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(disabled("Updating to \(up.version)…"))
             } else {
                 menu.addItem(item("Update to \(up.version) Now", #selector(installUpdate), ""))
-                menu.addItem(item("What's New…", #selector(openUpdatePage), ""))
+                menu.addItem(item("Release page…", #selector(openUpdatePage), ""))
             }
         }
         menu.addItem(.separator())
+        menu.addItem(whatsNewMenuItem())
         menu.addItem(item("Refresh now", #selector(poll), "r"))
+
+        // Providers — names, letters, what goes in the bar.
+        menu.addItem(providersMenuItem())
+
+        let layoutItem = NSMenuItem(title: "Menu Bar Layout", action: nil, keyEquivalent: "")
+        let layoutMenu = NSMenu()
+        for layout in MenuBarLayout.allCases {
+            let i = NSMenuItem(title: layout.title, action: #selector(pickLayout(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = layout.rawValue
+            i.state = layout == ProviderStore.layout ? .on : .off
+            layoutMenu.addItem(i)
+        }
+        layoutItem.submenu = layoutMenu
+        menu.addItem(layoutItem)
+
         let shapeItem = NSMenuItem(title: "Icon Shape", action: nil, keyEquivalent: "")
         let shapeMenu = NSMenu()
         for shape in IconShape.allCases {
@@ -1141,7 +2817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         shapeItem.submenu = shapeMenu
         menu.addItem(shapeItem)
-        if iconShape == .battery {   // bars/rings are single-glyph already
+        if iconShape == .battery {
             let combined = item("Consolidated Icon", #selector(toggleConsolidated), "")
             combined.state = consolidated ? .on : .off
             menu.addItem(combined)
@@ -1168,24 +2844,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         densityItem.submenu = densityMenu
         menu.addItem(densityItem)
-        // Which limit's percent the single-glyph shapes show as the number.
-        let numberItem = NSMenuItem(title: "Number Shows", action: nil, keyEquivalent: "")
-        let numberMenu = NSMenu()
-        let highest = NSMenuItem(title: "Highest", action: #selector(pickNumber(_:)), keyEquivalent: "")
-        highest.target = self
-        highest.representedObject = ""
-        highest.state = numberLabel.isEmpty ? .on : .off
-        numberMenu.addItem(highest)
-        if !gauges.isEmpty { numberMenu.addItem(.separator()) }
-        for g in gauges {
-            let i = NSMenuItem(title: g.label, action: #selector(pickNumber(_:)), keyEquivalent: "")
-            i.target = self
-            i.representedObject = g.label
-            i.state = g.label == numberLabel ? .on : .off
-            numberMenu.addItem(i)
-        }
-        numberItem.submenu = numberMenu
-        menu.addItem(numberItem)
+        // Per-provider “which % under C:/G:” — a flat Claude+Grok list is nonsense
+        // when both are on the bar.
+        menu.addItem(barPercentMenuItem())
         let notify = item("Notify near a limit (80%)", #selector(toggleNotify), "")
         notify.state = notifyEnabled ? .on : .off
         menu.addItem(notify)
@@ -1199,11 +2860,336 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(item("Subscribe to Updates…", #selector(openNewsletter), ""))
         menu.addItem(item("Join the Community…", #selector(openCommunity), ""))
-        // Target must be NSApp: with the delegate as target the action fails
-        // validation (delegate has no terminate(_:)) and Quit renders disabled.
         let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         menu.addItem(quit)
+    }
+
+    // MARK: activity rows (clickable, two-tone)
+
+    /// Dark title (currently working on) + light subline (project · branch · time · tokens).
+    /// Clickable — jumps to that session’s Terminal tab / host app.
+    func activityMenuItem(_ s: ActivitySession) -> NSMenuItem {
+        let when = s.live ? "Live" : relative(s.lastActivity)
+        var path = s.branch.map { "\(s.project) · \($0)" } ?? s.project
+        if let model = s.model, !model.isEmpty { path += "  ·  \(model)" }
+        var meta = "\(path)  —  \(when)"
+        if let tin = s.tokensIn, let tout = s.tokensOut {
+            meta += "  ·  sent \(abbreviateTokens(tin)) · recv \(abbreviateTokens(tout))"
+        }
+
+        let header: String
+        if let title = s.title, !title.isEmpty {
+            header = "\(s.providerLetter): \(title)"
+        } else {
+            header = "\(s.providerLetter): \(s.project)"
+        }
+
+        let dark: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: NSColor.labelColor,
+        ]
+        let light: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        let attr = NSMutableAttributedString(string: header + "\n", attributes: dark)
+        attr.append(NSAttributedString(string: meta, attributes: light))
+
+        let i = NSMenuItem(title: header, action: #selector(openActivity(_:)), keyEquivalent: "")
+        i.attributedTitle = attr
+        i.target = self
+        // Must be a class — struct as representedObject fails the cast on click.
+        i.representedObject = ActivitySessionBox(s)
+        i.isEnabled = true
+        i.image = dotImage(s.live ? levelColor(0) : NSColor.tertiaryLabelColor)
+        var tip = s.live
+            ? "Click to open this session’s terminal / app"
+            : "Click to open host app or project folder"
+        if let pid = s.pid { tip += "  ·  pid \(pid)" }
+        if let tty = s.tty, tty != "??" { tip += "  ·  \(tty)" }
+        i.toolTip = tip
+        return i
+    }
+
+    @objc func openActivity(_ sender: NSMenuItem) {
+        let s: ActivitySession
+        if let box = sender.representedObject as? ActivitySessionBox {
+            s = box.session
+        } else if let direct = sender.representedObject as? ActivitySession {
+            s = direct
+        } else {
+            NSLog("UsageMonitor: openActivity — no session on menu item")
+            return
+        }
+        let kind = providerConfigs.first(where: { $0.id == s.providerId })?.kind ?? .claude
+        NSLog("UsageMonitor: openActivity \(kind.rawValue) pid=\(s.pid.map(String.init) ?? "nil") tty=\(s.tty ?? "nil") cwd=\(s.cwd ?? "nil")")
+        // ps/lsof on a background queue; ProcessFocus hops to main for activate/AppleScript.
+        DispatchQueue.global(qos: .userInitiated).async {
+            ProcessFocus.open(pid: s.pid, tty: s.tty, cwd: s.cwd, providerKind: kind)
+        }
+    }
+
+    // MARK: providers menu
+
+    func providersMenuItem() -> NSMenuItem {
+        let root = NSMenuItem(title: "Providers", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for cfg in providerConfigs {
+            let row = NSMenuItem(title: "\(cfg.letter):  \(cfg.displayName)", action: nil, keyEquivalent: "")
+            let rowMenu = NSMenu()
+
+            let en = NSMenuItem(title: "Enabled", action: #selector(toggleProviderEnabled(_:)), keyEquivalent: "")
+            en.target = self; en.representedObject = cfg.id
+            en.state = cfg.enabled ? .on : .off
+            rowMenu.addItem(en)
+
+            let bar = NSMenuItem(title: "Show in Menu Bar", action: #selector(toggleProviderBar(_:)), keyEquivalent: "")
+            bar.target = self; bar.representedObject = cfg.id
+            bar.state = cfg.showInMenuBar ? .on : .off
+            rowMenu.addItem(bar)
+
+            let act = NSMenuItem(title: "Show Activity", action: #selector(toggleProviderActivity(_:)), keyEquivalent: "")
+            act.target = self; act.representedObject = cfg.id
+            act.state = cfg.showActivity ? .on : .off
+            rowMenu.addItem(act)
+
+            rowMenu.addItem(.separator())
+            let rename = NSMenuItem(title: "Rename…", action: #selector(renameProvider(_:)), keyEquivalent: "")
+            rename.target = self; rename.representedObject = cfg.id
+            rowMenu.addItem(rename)
+            let letter = NSMenuItem(title: "Set Letter…", action: #selector(setProviderLetter(_:)), keyEquivalent: "")
+            letter.target = self; letter.representedObject = cfg.id
+            rowMenu.addItem(letter)
+            if providerConfigs.count > 1 {
+                let remove = NSMenuItem(title: "Remove", action: #selector(removeProvider(_:)), keyEquivalent: "")
+                remove.target = self; remove.representedObject = cfg.id
+                rowMenu.addItem(remove)
+            }
+
+            row.submenu = rowMenu
+            sub.addItem(row)
+        }
+        sub.addItem(.separator())
+        let add = NSMenuItem(title: "Add Provider…", action: #selector(addProvider), keyEquivalent: "")
+        add.target = self
+        sub.addItem(add)
+        root.submenu = sub
+        return root
+    }
+
+    @objc func toggleProviderEnabled(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        ProviderStore.update(id) { $0.enabled.toggle() }
+        providerConfigs = ProviderStore.load()
+        poll(); pollSessions(); render()
+    }
+    @objc func toggleProviderBar(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        ProviderStore.update(id) { $0.showInMenuBar.toggle() }
+        providerConfigs = ProviderStore.load()
+        // Re-bind configs onto existing gauge groups.
+        providerGauges = providerGauges.map { g in
+            let cfg = providerConfigs.first(where: { $0.id == g.config.id }) ?? g.config
+            return ProviderGauges(config: cfg, gauges: g.gauges)
+        }
+        render()
+    }
+    @objc func toggleProviderActivity(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        ProviderStore.update(id) { $0.showActivity.toggle() }
+        providerConfigs = ProviderStore.load()
+        pollSessions()
+    }
+
+    @objc func renameProvider(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let cfg = providerConfigs.first(where: { $0.id == id }) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Rename provider"
+        alert.informativeText = "Personal name shown in the menu (e.g. “Claude Work”, “Grok Personal”)."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = cfg.displayName
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        ProviderStore.update(id) { $0.displayName = name }
+        providerConfigs = ProviderStore.load()
+        providerGauges = providerGauges.map { g in
+            let cfg = providerConfigs.first(where: { $0.id == g.config.id }) ?? g.config
+            return ProviderGauges(config: cfg, gauges: g.gauges)
+        }
+        pollSessions(); render()
+    }
+
+    @objc func setProviderLetter(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let cfg = providerConfigs.first(where: { $0.id == id }) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Menu-bar letter"
+        alert.informativeText = "One character badge next to this provider’s bar (e.g. C, G, W)."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 60, height: 24))
+        field.stringValue = cfg.letter
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let letter = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard let ch = letter.first else { return }
+        ProviderStore.update(id) { $0.letter = String(ch) }
+        providerConfigs = ProviderStore.load()
+        providerGauges = providerGauges.map { g in
+            let cfg = providerConfigs.first(where: { $0.id == g.config.id }) ?? g.config
+            return ProviderGauges(config: cfg, gauges: g.gauges)
+        }
+        pollSessions(); render()
+    }
+
+    @objc func removeProvider(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        let all = providerConfigs.filter { $0.id != id }
+        guard !all.isEmpty else { return }
+        ProviderStore.save(all)
+        providerConfigs = all
+        providerGauges = providerGauges.filter { $0.config.id != id }
+        poll(); pollSessions(); render()
+    }
+
+    @objc func addProvider() {
+        let present = Set(providerConfigs.map(\.kind))
+        // Prefer kinds not yet added; still allow a second slot of an existing kind
+        // (e.g. “Claude Work” + “Claude Personal”) with a unique id.
+        let fresh = ProviderKind.allCases.filter { !present.contains($0) }
+        let choices: [(title: String, kind: ProviderKind)] = {
+            if !fresh.isEmpty {
+                return fresh.map { kind in
+                    var note = kind.defaultName
+                    if kind == .codex { note += "  —  ChatGPT Codex limits" }
+                    if kind == .cursor { note += "  —  open app (no % yet)" }
+                    return (note, kind)
+                }
+            }
+            return ProviderKind.allCases.map { kind in
+                ("Another \(kind.defaultName) slot  (rename it)", kind)
+            }
+        }()
+
+        let alert = NSAlert()
+        alert.messageText = "Add provider"
+        alert.informativeText = fresh.isEmpty
+            ? "All built-in adapters are already listed. Add another slot and rename it (e.g. “Claude Work”)."
+            : "Pick an adapter. You can rename it and set a letter badge after adding."
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 280, height: 26))
+        for c in choices {
+            popup.addItem(withTitle: c.title)
+            popup.lastItem?.representedObject = c.kind.rawValue
+        }
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let raw = popup.selectedItem?.representedObject as? String,
+              let kind = ProviderKind(rawValue: raw) else { return }
+        var all = providerConfigs
+        var cfg = ProviderConfig.make(kind)
+        if all.contains(where: { $0.id == cfg.id }) {
+            cfg.id = "\(kind.rawValue)-\(UUID().uuidString.prefix(6))"
+            // Nudge the name so two slots aren't identical in the menu.
+            let n = all.filter { $0.kind == kind }.count + 1
+            cfg.displayName = "\(kind.defaultName) \(n)"
+        }
+        // Cursor is activity/open only — don't waste menu-bar space by default.
+        if kind == .cursor { cfg.showInMenuBar = false }
+        all.append(cfg)
+        ProviderStore.save(all)
+        providerConfigs = all
+        poll(); pollSessions(); render()
+    }
+
+    @objc func pickLayout(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let layout = MenuBarLayout(rawValue: raw) {
+            ProviderStore.layout = layout
+            render()
+        }
+    }
+
+    /// Menu: “Bar % Shows” → one submenu per provider on the bar
+    /// (`C: Claude` → Highest / Session / …). Each letter’s percent follows its own pick.
+    func barPercentMenuItem() -> NSMenuItem {
+        let multi = providerGauges.filter { $0.config.showInMenuBar && $0.config.enabled }.count > 1
+            || ProviderStore.layout == .perProvider
+        let title = multi ? "Bar % Shows" : "Number Shows"
+        let root = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+
+        let groups = providerGauges.filter { $0.config.enabled && !$0.gauges.isEmpty }
+        if groups.isEmpty {
+            sub.addItem(disabled("No gauges yet"))
+            root.submenu = sub
+            return root
+        }
+
+        if multi {
+            // One nested menu per provider — never mix Session with Grok Build.
+            for group in groups {
+                let head = "\(group.config.letter):  \(group.config.displayName)"
+                let item = NSMenuItem(title: head, action: nil, keyEquivalent: "")
+                let nest = NSMenu()
+                nest.addItem(numberPickItem(
+                    title: "Highest",
+                    providerId: group.config.id,
+                    label: "",
+                    selected: Self.numberShows(for: group.config.id).isEmpty))
+                nest.addItem(.separator())
+                let pref = Self.numberShows(for: group.config.id)
+                for g in group.gauges {
+                    nest.addItem(numberPickItem(
+                        title: "\(g.label)  (\(Int(g.percent))%)",
+                        providerId: group.config.id,
+                        label: g.label,
+                        selected: pref == g.label))
+                }
+                item.submenu = nest
+                sub.addItem(item)
+            }
+            if ProviderStore.layout == .highestOnly {
+                sub.addItem(.separator())
+                sub.addItem(disabled("Layout “Highest Only” ignores these picks"))
+            }
+        } else if let group = groups.first {
+            // Single provider — flat list, same as classic Number Shows.
+            let pref = Self.numberShows(for: group.config.id)
+            sub.addItem(numberPickItem(
+                title: "Highest",
+                providerId: group.config.id,
+                label: "",
+                selected: pref.isEmpty && numberLabel.isEmpty))
+            sub.addItem(.separator())
+            for g in group.gauges {
+                sub.addItem(numberPickItem(
+                    title: g.label,
+                    providerId: group.config.id,
+                    label: g.label,
+                    selected: pref == g.label || (pref.isEmpty && numberLabel == g.label)))
+            }
+        }
+
+        root.submenu = sub
+        return root
+    }
+
+    private func numberPickItem(title: String, providerId: String, label: String, selected: Bool) -> NSMenuItem {
+        let i = NSMenuItem(title: title, action: #selector(pickNumber(_:)), keyEquivalent: "")
+        i.target = self
+        i.representedObject = ["id": providerId, "label": label]
+        i.state = selected ? .on : .off
+        return i
     }
 
     func disabled(_ title: String) -> NSMenuItem {

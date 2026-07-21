@@ -3,6 +3,70 @@
 All notable changes to Usage Monitor are recorded here. Versions follow the
 `CFBundleShortVersionString` in `build.sh`.
 
+## 2.3
+
+- **Smarter provider defaults.** New installs seed only providers that are
+  signed in / installed on that Mac. Order is **Grok-first** on JV’s machines
+  (user `jv` / personal Grok email); everyone else gets **Claude-first** when
+  Claude is present, otherwise whatever they have.
+- **One-time reorder** on upgrade for JV installs so Grok appears before Claude
+  without wiping renames or toggles.
+
+## 2.2
+
+- **What's New.** Menu item with a blue **NEW** chip until you’ve opened it;
+  in-app release notes for recent versions (activity click, multi-provider,
+  Codex, Bar % Shows, …). Chip clears after you open the panel.
+
+## 2.1
+
+- **Codex provider.** Real gauges from ChatGPT’s WHAM usage endpoint (same
+  source as Codex): weekly limit % + reset time, via `~/.codex/auth.json`
+  (read-only). Activity from `session_index.jsonl` + live `codex` processes.
+- **Cursor provider.** Add slot that opens Cursor desktop; live activity when
+  the app is running (no public % API yet — bar off by default).
+- **Add Provider fixed.** No more dead-end dialog: offers Codex / Cursor when
+  missing, or another named Claude/Grok/… slot. **Remove** per provider.
+
+## 2.0
+
+- **Multi-provider slots.** Claude and Grok are configurable slots with personal
+  names (“Claude Work”, “Grok Personal”), letter badges (C / G / …), and
+  independent toggles for enabled / show in menu bar / show activity. **Add
+  Provider…** for extra slots; the architecture is N-provider ready.
+- **Menu Bar Layout.** Per-provider (letter + %), all gauges, or highest only —
+  pick what the glyph packs.
+- **Clickable activity.** Activity rows open the live host: Terminal tab (by
+  TTY), iTerm session, Warp/Ghostty/Orbit/Claude desktop when that process is
+  the parent, else the project folder. Process-aware via PID + cwd matching.
+- **Two-line activity rows.** Dark header = letter + currently-working-on
+  title (Claude `lastPrompt` / Grok session summary); light subline =
+  project · branch · Live/time · tokens.
+
+## 1.9
+
+- **Grok usage.** Shows Grok credit / product limits alongside Claude: reads the
+  Grok CLI session from `~/.grok/auth.json` (read-only — never refreshes the
+  token) and polls the same billing endpoint Grok's `/usage` uses. Menu lists
+  overall **Grok** plus any product rows that report a percent (Build, API,
+  Chat, Imagine). The menu-bar glyph includes the overall Grok gauge with the
+  Claude ones so the bar stays compact.
+- **Grok activity.** New menu section lists live/recent Grok CLI sessions from
+  the local registry (`active_sessions.json` + session summaries) — no chat
+  content, no network.
+- **Either provider is enough.** Setup and the menu work with Claude only,
+  Grok only, or both. Onboarding covers both sign-ins; the Anthropic Admin
+  key remains optional Claude API spend.
+
+## 1.8
+
+- **Claude Code activity.** New menu section shows which Claude Code CLI
+  sessions (across terminals/projects/worktrees) are active or recently
+  active, with a live/idle indicator and cumulative tokens sent/received per
+  session. Reads only the local transcripts Claude Code already writes to
+  `~/.claude/projects` — no network, no proxy, no message content, just
+  per-turn token counts and metadata (project, git branch, timestamps).
+
 ## 1.7
 
 - **Horizontal bar chart.** New **Bar Chart (Horizontal)** icon shape — one
