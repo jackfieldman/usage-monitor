@@ -801,11 +801,6 @@ enum ProviderStore {
         if cursorInstalled() { s.insert(.cursor) }
         return s
     }
-
-    /// No-op keep: older builds wrote a one-time reorder flag; configs are left as-is.
-    private static func applyPreferredOrderOnce(_ configs: [ProviderConfig]) -> [ProviderConfig] {
-        configs
-    }
 }
 
 // MARK: - Process focus (open the terminal / app hosting a session)

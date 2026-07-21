@@ -3,9 +3,10 @@
 All notable changes to Usage Monitor are recorded here. Versions follow the
 `CFBundleShortVersionString` in `build.sh`.
 
-> **Public product voice:** Never write maintainer-specific notes (e.g. “JV’s
-> Mac”, private emails, internal nicknames). Release notes and in-app What’s New
-> must read as a professional public app for any user.
+> **Public product voice (required):** This is a public app. Never ship
+> maintainer-specific notes — personal machine names, private emails, internal
+> nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
+> New, and UI copy must read as professional product text for any user.
 
 ## 2.3.3
 
