@@ -8,6 +8,18 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.6.0
+
+- **Update checks ~4× per day** (every 6 hours) instead of once daily.
+- **Menu-bar scroll:** when an update is waiting, “Update available” marquee
+  runs **once per hour** (click the item → **Updates** menu).
+- **Updates menu:**
+  - Update to *x.y* Now / Release page
+  - Install Updates Automatically
+  - Check for Updates Now
+  - Skip This Version / Skip All Future Updates
+  - Pause for 1 day · 3 days · 1 week · 2 weeks · 4 weeks · Resume
+
 ## 2.5.2
 
 - **Tighter menu-bar footprint.** Status item width is pinned to the gauge

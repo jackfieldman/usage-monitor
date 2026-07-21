@@ -64,11 +64,12 @@ chooses how clusters pack: per-provider letter+%, all gauges, or highest only.
 - **Community** — questions, ideas, and show-and-tell live in
   [GitHub Discussions](https://github.com/jackfieldman/usage-monitor/discussions)
   (**Join the Community…** in the app menu).
-- The app itself checks GitHub once a day; when there's a new release it
-  notifies you and the menu offers **Update to x.y Now** (one click: download,
-  signature-verify, swap in place, relaunch). Turn on **Install Updates
-  Automatically** to skip the ask. Updates are only installed if the download's
-  code signature matches the app's own Developer ID team.
+- The app checks GitHub for releases **about four times a day**. When a new
+  version is waiting, **Update available** scrolls across the menu bar **once
+  an hour**. Open **Updates** in the menu to install now, turn on **Install
+  Updates Automatically**, skip this version, skip all future updates, or pause
+  for days/weeks. Updates install only if the download’s code signature matches
+  the app’s own Developer ID team.
 
 ## Requirements
 

@@ -168,6 +168,11 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.6", "Smarter updates", [
+            "Checks for new releases ~4 times per day",
+            "When an update is waiting: “Update available” scrolls across the menu bar once an hour",
+            "Updates menu: install now, auto-update, skip this version, skip all, pause for days/weeks",
+        ]),
         ("2.5.2", "Caffeinate Mode & polish", [
             "Caffeinate Mode: keep desktops and laptops awake; laptop lid-shut option",
             "Glowing menu-bar cup while active — click for a reminder",
@@ -1423,11 +1428,115 @@ func abbreviateTokens(_ n: Int) -> String {
     return "\(n)"
 }
 
+// MARK: - Update preferences (check cadence, skip, pause)
+
+/// User choices for update checks and surfacing. No telemetry — only GitHub
+/// latest-release requests on the schedule below.
+enum UpdatePrefs {
+    /// Four checks per day ≈ every 6 hours.
+    static let checkInterval: TimeInterval = 6 * 60 * 60
+    /// Marquee “Update available” in the menu bar at most once per hour.
+    static let marqueeInterval: TimeInterval = 60 * 60
+
+    private static let lastCheckKey = "lastUpdateCheck"
+    private static let skipAllKey = "updates.skipAll"
+    private static let skipVersionKey = "updates.skipVersion"
+    private static let pauseUntilKey = "updates.pauseUntil"
+    private static let lastMarqueeKey = "updates.lastMarquee"
+    private static let autoKey = "autoUpdate"
+
+    static var lastCheckAt: TimeInterval {
+        get { UserDefaults.standard.double(forKey: lastCheckKey) }
+        set { UserDefaults.standard.set(newValue, forKey: lastCheckKey) }
+    }
+
+    static var skipAllFuture: Bool {
+        get { UserDefaults.standard.bool(forKey: skipAllKey) }
+        set { UserDefaults.standard.set(newValue, forKey: skipAllKey) }
+    }
+
+    /// Specific version the user chose to ignore (e.g. “2.6.0”).
+    static var skippedVersion: String {
+        get { UserDefaults.standard.string(forKey: skipVersionKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: skipVersionKey) }
+    }
+
+    static var pauseUntil: Date? {
+        get {
+            let t = UserDefaults.standard.double(forKey: pauseUntilKey)
+            return t > 0 ? Date(timeIntervalSince1970: t) : nil
+        }
+        set {
+            if let d = newValue {
+                UserDefaults.standard.set(d.timeIntervalSince1970, forKey: pauseUntilKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: pauseUntilKey)
+            }
+        }
+    }
+
+    static var lastMarqueeAt: TimeInterval {
+        get { UserDefaults.standard.double(forKey: lastMarqueeKey) }
+        set { UserDefaults.standard.set(newValue, forKey: lastMarqueeKey) }
+    }
+
+    static var autoUpdateEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: autoKey) }
+        set { UserDefaults.standard.set(newValue, forKey: autoKey) }
+    }
+
+    static var isPaused: Bool {
+        guard let until = pauseUntil else { return false }
+        if until <= Date() {
+            pauseUntil = nil
+            return false
+        }
+        return true
+    }
+
+    /// Network check allowed now?
+    static func shouldNetworkCheck(force: Bool = false) -> Bool {
+        if force { return true }
+        if skipAllFuture { return false }
+        if isPaused { return false }
+        return Date().timeIntervalSince1970 - lastCheckAt >= checkInterval
+    }
+
+    /// Should this version appear in UI / marquee / auto-install?
+    static func shouldSurface(version: String) -> Bool {
+        if skipAllFuture { return false }
+        if isPaused { return false }
+        if !skippedVersion.isEmpty, skippedVersion == version { return false }
+        return true
+    }
+
+    static func shouldMarquee() -> Bool {
+        Date().timeIntervalSince1970 - lastMarqueeAt >= marqueeInterval
+    }
+
+    static func pause(for days: Int) {
+        pauseUntil = Calendar.current.date(byAdding: .day, value: days, to: Date())
+    }
+
+    static func pause(forWeeks weeks: Int) {
+        pause(for: weeks * 7)
+    }
+
+    static func clearPause() { pauseUntil = nil }
+
+    static func clearSkipVersion() { skippedVersion = "" }
+
+    static func resumeAll() {
+        skipAllFuture = false
+        clearSkipVersion()
+        clearPause()
+    }
+}
+
 // MARK: - Update check (GitHub releases)
 
-/// Once a day, asks GitHub for the latest release and remembers if it's newer
-/// than the running app. Only the standard HTTP request is sent — no
-/// identifiers, no telemetry.
+/// Asks GitHub for the latest release (cadence owned by `UpdatePrefs`).
+/// Only the standard HTTP request is sent — no identifiers, no telemetry.
 final class UpdateChecker {
     let latestURL = URL(string: "https://api.github.com/repos/jackfieldman/usage-monitor/releases/latest")!
 
@@ -3077,6 +3186,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastUpdated: Date?
     var updateAvailable: (version: String, page: URL, zip: URL?)?
     var updating = false
+    /// Hourly marquee state (“Update available” scrolling across the bar).
+    var marqueeTickTimer: Timer?
+    var marqueeAnimTimer: Timer?
+    var marqueeActive = false
+    var marqueeOffset: CGFloat = 0
+    var marqueeText = "Update available"
+    var marqueeFullWidth: CGFloat = 0
     var monthSpend: Double?
     var costError: String?
     var hasAdminKey = false
@@ -3171,6 +3287,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sessionTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.pollSessions()
         }
+        // Update marquee: check every minute whether an hourly scroll is due.
+        marqueeTickTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.maybeRunUpdateMarquee()
+        }
+        if let t = marqueeTickTimer { RunLoop.main.add(t, forMode: .common) }
         if !anyProviderSignedIn() { onboarding.present() }
     }
 
@@ -3285,29 +3406,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// At most one GitHub hit per day, whatever the poll cadence.
-    func checkForUpdate() {
-        let last = UserDefaults.standard.double(forKey: "lastUpdateCheck")
-        guard Date().timeIntervalSince1970 - last > 86_400 else { return }
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastUpdateCheck")
+    /// GitHub latest-release check — up to **4× per day** (every 6 hours).
+    /// Respects skip-all, skip-version, and pause. Call with `force: true`
+    /// from “Check for Updates Now” to ignore the schedule (still honours skip-all
+    /// only as a soft preference: force still checks, but won’t surface skipped).
+    func checkForUpdate(force: Bool = false) {
+        guard UpdatePrefs.shouldNetworkCheck(force: force) else { return }
+        // Record attempt so we don't hammer GitHub on repeated polls.
+        if !force { UpdatePrefs.lastCheckAt = Date().timeIntervalSince1970 }
+        else { UpdatePrefs.lastCheckAt = Date().timeIntervalSince1970 }
+
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self, let found = self.updates.check() else { return }
+            guard let self else { return }
+            let found = self.updates.check()
             DispatchQueue.main.async {
-                self.updateAvailable = found
-                if self.autoUpdateEnabled { self.installUpdate() }
-                else { self.notifyUpdateOnce(found.version) }
+                guard let found else {
+                    // No newer release (or network fail) — clear stale banner only on success path.
+                    // Keep existing updateAvailable if we already know of one and check failed silently.
+                    if force { self.updateAvailable = nil }
+                    return
+                }
+                if UpdatePrefs.shouldSurface(version: found.version) {
+                    let isNew = self.updateAvailable?.version != found.version
+                    self.updateAvailable = found
+                    if UpdatePrefs.autoUpdateEnabled {
+                        self.installUpdate()
+                    } else {
+                        self.notifyUpdateOnce(found.version)
+                        // First sighting: marquee soon (don't wait a full hour).
+                        if isNew { UpdatePrefs.lastMarqueeAt = 0; self.maybeRunUpdateMarquee() }
+                    }
+                } else {
+                    // User skipped this version / paused — don't show.
+                    if self.updateAvailable?.version == found.version {
+                        self.updateAvailable = nil
+                    }
+                }
             }
         }
     }
 
     var autoUpdateEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: "autoUpdate") }
-        set { UserDefaults.standard.set(newValue, forKey: "autoUpdate") }
+        get { UpdatePrefs.autoUpdateEnabled }
+        set { UpdatePrefs.autoUpdateEnabled = newValue }
     }
 
     @objc func toggleAutoUpdate() {
         autoUpdateEnabled.toggle()
-        if autoUpdateEnabled, updateAvailable != nil { installUpdate() }
+        // Enabling auto-update while paused/skipped still installs if something is pending.
+        if autoUpdateEnabled {
+            UpdatePrefs.skipAllFuture = false
+            if updateAvailable != nil { installUpdate() }
+        }
+    }
+
+    @objc func checkForUpdateNow() {
+        checkForUpdate(force: true)
+    }
+
+    @objc func skipThisUpdate() {
+        guard let v = updateAvailable?.version else { return }
+        UpdatePrefs.skippedVersion = v
+        updateAvailable = nil
+        stopUpdateMarquee(restore: true)
+        render()
+    }
+
+    @objc func toggleSkipAllFutureUpdates() {
+        UpdatePrefs.skipAllFuture.toggle()
+        if UpdatePrefs.skipAllFuture {
+            updateAvailable = nil
+            stopUpdateMarquee(restore: true)
+        }
+        render()
+    }
+
+    @objc func pauseUpdatesDays(_ sender: NSMenuItem) {
+        let days = sender.tag
+        guard days > 0 else { return }
+        UpdatePrefs.pause(for: days)
+        updateAvailable = nil
+        stopUpdateMarquee(restore: true)
+        render()
+    }
+
+    @objc func clearUpdatePause() {
+        UpdatePrefs.clearPause()
+        checkForUpdate(force: true)
+    }
+
+    @objc func resumeUpdateChecks() {
+        UpdatePrefs.resumeAll()
+        checkForUpdate(force: true)
     }
 
     /// One notification per version, so a quietly ignored update doesn't nag.
@@ -3316,7 +3506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UserDefaults.standard.set(version, forKey: "notifiedUpdate")
         let c = UNMutableNotificationContent()
         c.title = "Usage Monitor \(version) is available"
-        c.body = "Choose “Update to \(version) Now” from the menu to install it."
+        c.body = "Open Updates in the menu — or wait for the menu-bar scroll once an hour."
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: "update-\(version)", content: c, trigger: nil))
     }
@@ -3325,8 +3515,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// the release page so the user can update by hand.
     @objc func installUpdate() {
         guard let up = updateAvailable, !updating else { return }
+        // Manual install from the Updates menu always allowed if we still hold the release.
         guard let zip = up.zip else { openUpdatePage(); return }
         updating = true
+        stopUpdateMarquee(restore: false)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let ok = self.updates.downloadAndInstall(zip)
@@ -3347,7 +3539,222 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func openUpdatePage() {
-        if let page = updateAvailable?.page { NSWorkspace.shared.open(page) }
+        if let page = updateAvailable?.page {
+            NSWorkspace.shared.open(page)
+        } else {
+            NSWorkspace.shared.open(URL(string: "https://github.com/jackfieldman/usage-monitor/releases")!)
+        }
+    }
+
+    // MARK: Update marquee (menu bar scroll once per hour)
+
+    /// If an update is pending and an hour has passed, scroll “Update available”.
+    func maybeRunUpdateMarquee() {
+        guard !marqueeActive, !updating else { return }
+        guard let up = updateAvailable, UpdatePrefs.shouldSurface(version: up.version) else { return }
+        guard UpdatePrefs.shouldMarquee() else { return }
+        startUpdateMarquee(version: up.version)
+    }
+
+    func startUpdateMarquee(version: String) {
+        guard let button = statusItem.button else { return }
+        marqueeActive = true
+        UpdatePrefs.lastMarqueeAt = Date().timeIntervalSince1970
+        marqueeText = "  Update available · \(version)  ·  open Updates menu  ·  "
+        let font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let attr = NSAttributedString(string: marqueeText,
+            attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+        marqueeFullWidth = ceil(attr.size().width)
+        marqueeOffset = 0
+        // Viewport ≈ current gauges width (or a readable minimum).
+        let viewport = max(statusItem.length > 10 ? statusItem.length : 96, 88)
+        statusItem.length = viewport
+
+        marqueeAnimTimer?.invalidate()
+        marqueeAnimTimer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            self.marqueeOffset += 1.6
+            // One full pass of the text, then stop.
+            if self.marqueeOffset > self.marqueeFullWidth + viewport {
+                self.stopUpdateMarquee(restore: true)
+                return
+            }
+            let img = self.marqueeImage(viewport: viewport, offset: self.marqueeOffset, text: self.marqueeText)
+            button.image = img
+            button.imageScaling = .scaleNone
+            button.imagePosition = .imageOnly
+            button.appearsDisabled = false
+        }
+        if let t = marqueeAnimTimer { RunLoop.main.add(t, forMode: .common) }
+    }
+
+    func stopUpdateMarquee(restore: Bool) {
+        marqueeAnimTimer?.invalidate()
+        marqueeAnimTimer = nil
+        marqueeActive = false
+        marqueeOffset = 0
+        if restore { render() }
+    }
+
+    private func marqueeImage(viewport: CGFloat, offset: CGFloat, text: String) -> NSImage {
+        let h: CGFloat = 18
+        let font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let accent = NSColor(srgbRed: 0.35, green: 0.55, blue: 1.0, alpha: 1)
+        let attr: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: accent]
+        let s = NSAttributedString(string: text, attributes: attr)
+        let fullW = max(marqueeFullWidth, ceil(s.size().width))
+        let img = NSImage(size: NSSize(width: viewport, height: h), flipped: false) { _ in
+            // Soft blue wash so it reads as “update”, not a gauge.
+            NSColor(srgbRed: 0.25, green: 0.45, blue: 0.95, alpha: 0.12).setFill()
+            NSBezierPath(roundedRect: NSRect(x: 0, y: 1, width: viewport, height: h - 2),
+                         xRadius: 4, yRadius: 4).fill()
+            let y = ((h - s.size().height) / 2).rounded()
+            // Draw two copies for seamless loop.
+            let x0 = -offset
+            s.draw(at: NSPoint(x: x0, y: y))
+            s.draw(at: NSPoint(x: x0 + fullW, y: y))
+            return true
+        }
+        img.isTemplate = false
+        return img
+    }
+
+    /// Updates submenu — install, auto, skip, pause.
+    func updatesMenuItem() -> NSMenuItem {
+        let root = NSMenuItem(title: "Updates", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+
+        // Status line
+        if updating {
+            sub.addItem(disabled("Status: installing…"))
+        } else if let up = updateAvailable, UpdatePrefs.shouldSurface(version: up.version) {
+            let row = disabled("Status: \(up.version) available")
+            row.attributedTitle = NSAttributedString(
+                string: "Status: \(up.version) available",
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: 0),
+                    .foregroundColor: NSColor(srgbRed: 0.35, green: 0.55, blue: 1.0, alpha: 1),
+                ])
+            sub.addItem(row)
+        } else if UpdatePrefs.skipAllFuture {
+            sub.addItem(disabled("Status: all future updates skipped"))
+        } else if UpdatePrefs.isPaused, let until = UpdatePrefs.pauseUntil {
+            let fmt = DateFormatter()
+            fmt.dateStyle = .medium
+            fmt.timeStyle = .short
+            sub.addItem(disabled("Status: paused until \(fmt.string(from: until))"))
+        } else if !UpdatePrefs.skippedVersion.isEmpty {
+            sub.addItem(disabled("Status: skipped \(UpdatePrefs.skippedVersion)"))
+        } else {
+            sub.addItem(disabled("Status: up to date"))
+        }
+
+        sub.addItem(.separator())
+
+        if let up = updateAvailable, UpdatePrefs.shouldSurface(version: up.version) {
+            if updating {
+                sub.addItem(disabled("Updating to \(up.version)…"))
+            } else {
+                let now = NSMenuItem(title: "Update to \(up.version) Now",
+                                     action: #selector(installUpdate), keyEquivalent: "")
+                now.target = self
+                sub.addItem(now)
+                let page = NSMenuItem(title: "Release page…",
+                                      action: #selector(openUpdatePage), keyEquivalent: "")
+                page.target = self
+                sub.addItem(page)
+            }
+            sub.addItem(.separator())
+        }
+
+        let auto = NSMenuItem(title: "Install Updates Automatically",
+                              action: #selector(toggleAutoUpdate), keyEquivalent: "")
+        auto.target = self
+        auto.state = autoUpdateEnabled ? .on : .off
+        auto.toolTip = "When on, a found update downloads, signature-checks, and installs without asking."
+        sub.addItem(auto)
+
+        let check = NSMenuItem(title: "Check for Updates Now",
+                               action: #selector(checkForUpdateNow), keyEquivalent: "")
+        check.target = self
+        check.toolTip = "Checks GitHub now (normally 4 times per day)."
+        sub.addItem(check)
+
+        sub.addItem(.separator())
+
+        if let up = updateAvailable {
+            let skipOne = NSMenuItem(title: "Skip This Version (\(up.version))",
+                                     action: #selector(skipThisUpdate), keyEquivalent: "")
+            skipOne.target = self
+            skipOne.toolTip = "Hide this release. You’ll still hear about later versions."
+            sub.addItem(skipOne)
+        } else if !UpdatePrefs.skippedVersion.isEmpty {
+            let skipped = NSMenuItem(title: "Clear Skip for \(UpdatePrefs.skippedVersion)",
+                                     action: #selector(resumeUpdateChecks), keyEquivalent: "")
+            skipped.target = self
+            sub.addItem(skipped)
+        }
+
+        let skipAll = NSMenuItem(title: "Skip All Future Updates",
+                                 action: #selector(toggleSkipAllFutureUpdates), keyEquivalent: "")
+        skipAll.target = self
+        skipAll.state = UpdatePrefs.skipAllFuture ? .on : .off
+        skipAll.toolTip = "Stops checking and banners. Turn off anytime, or use Check for Updates Now."
+        sub.addItem(skipAll)
+
+        // Pause submenu
+        let pauseRoot = NSMenuItem(title: "Pause Updates", action: nil, keyEquivalent: "")
+        let pauseMenu = NSMenu()
+        let pauses: [(String, Int)] = [
+            ("For 1 day", 1),
+            ("For 3 days", 3),
+            ("For 1 week", 7),
+            ("For 2 weeks", 14),
+            ("For 4 weeks", 28),
+        ]
+        for (title, days) in pauses {
+            let i = NSMenuItem(title: title, action: #selector(pauseUpdatesDays(_:)), keyEquivalent: "")
+            i.target = self
+            i.tag = days
+            pauseMenu.addItem(i)
+        }
+        if UpdatePrefs.isPaused {
+            pauseMenu.addItem(.separator())
+            let clear = NSMenuItem(title: "Resume Now", action: #selector(clearUpdatePause), keyEquivalent: "")
+            clear.target = self
+            pauseMenu.addItem(clear)
+        }
+        pauseRoot.submenu = pauseMenu
+        pauseRoot.toolTip = "Temporarily stop checks and the menu-bar scroll."
+        sub.addItem(pauseRoot)
+
+        if UpdatePrefs.skipAllFuture || UpdatePrefs.isPaused || !UpdatePrefs.skippedVersion.isEmpty {
+            sub.addItem(.separator())
+            let resume = NSMenuItem(title: "Resume Normal Update Checks",
+                                    action: #selector(resumeUpdateChecks), keyEquivalent: "")
+            resume.target = self
+            sub.addItem(resume)
+        }
+
+        sub.addItem(.separator())
+        sub.addItem(disabled("Checks ~4× per day · scroll once per hour when pending"))
+
+        root.submenu = sub
+        // Badge the parent when an update is waiting.
+        if let up = updateAvailable, UpdatePrefs.shouldSurface(version: up.version), !updating {
+            let attr = NSMutableAttributedString(
+                string: "Updates  ·  ",
+                attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: NSColor.labelColor])
+            attr.append(NSAttributedString(
+                string: up.version,
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: 0),
+                    .foregroundColor: NSColor(srgbRed: 0.35, green: 0.55, blue: 1.0, alpha: 1),
+                ]))
+            root.attributedTitle = attr
+        }
+        return root
     }
 
     @objc func openNewsletter() { NSWorkspace.shared.open(newsletterURL) }
@@ -3386,6 +3793,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func render() {
+        // Don't stomp the hourly “Update available” scroll mid-animation.
+        if marqueeActive { return }
         guard let button = statusItem.button else { return }
         let clusters = iconClusters
         if clusters.isEmpty {
@@ -3398,6 +3807,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for group in providerGauges {
                 tip.append("— \(group.config.displayName) —")
                 tip.append(contentsOf: group.gauges.map { "\($0.label): \(Int($0.percent))%" })
+            }
+            if let up = updateAvailable, UpdatePrefs.shouldSurface(version: up.version) {
+                tip.append("")
+                tip.append("Update \(up.version) available — open Updates in the menu")
             }
             if laptopMode.isActive {
                 tip.append("")
@@ -3946,17 +4359,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
             menu.addItem(disabled("Updated \(relative(updated))"))
         }
-        if let up = updateAvailable {
-            menu.addItem(.separator())
-            if updating {
-                menu.addItem(disabled("Updating to \(up.version)…"))
-            } else {
-                menu.addItem(item("Update to \(up.version) Now", #selector(installUpdate), ""))
-                menu.addItem(item("Release page…", #selector(openUpdatePage), ""))
-            }
-        }
         menu.addItem(.separator())
         menu.addItem(whatsNewMenuItem())
+        menu.addItem(updatesMenuItem())
         menu.addItem(item("Refresh now", #selector(poll), "r"))
 
         // Caffeinate Mode — keep awake + optional lid-shut + hotspot.
@@ -4054,9 +4459,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let notify = item("Notify near a limit (80%)", #selector(toggleNotify), "")
         notify.state = notifyEnabled ? .on : .off
         menu.addItem(notify)
-        let auto = item("Install Updates Automatically", #selector(toggleAutoUpdate), "")
-        auto.state = autoUpdateEnabled ? .on : .off
-        menu.addItem(auto)
         let login = item("Open at Login", #selector(toggleLogin), "")
         login.state = loginEnabled ? .on : .off
         menu.addItem(login)
