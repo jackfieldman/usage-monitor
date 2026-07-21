@@ -3,6 +3,15 @@
 All notable changes to Usage Monitor are recorded here. Versions follow the
 `CFBundleShortVersionString` in `build.sh`.
 
+> **Public product voice:** Never write maintainer-specific notes (e.g. “JV’s
+> Mac”, private emails, internal nicknames). Release notes and in-app What’s New
+> must read as a professional public app for any user.
+
+## 2.3.3
+
+- **Public voice.** Removed maintainer-specific What’s New / changelog wording
+  and personal default-order special cases. Same smart defaults for everyone.
+
 ## 2.3.2
 
 - **Menu freeze / keyboard capture fixed.** Opening the menu no longer runs a
@@ -22,11 +31,8 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 ## 2.3
 
 - **Smarter provider defaults.** New installs seed only providers that are
-  signed in / installed on that Mac. Order is **Grok-first** on JV’s machines
-  (user `jv` / personal Grok email); everyone else gets **Claude-first** when
-  Claude is present, otherwise whatever they have.
-- **One-time reorder** on upgrade for JV installs so Grok appears before Claude
-  without wiping renames or toggles.
+  signed in / installed on that Mac, in a stable public order (Claude, Grok,
+  Codex, Cursor — only kinds present).
 
 ## 2.2
 

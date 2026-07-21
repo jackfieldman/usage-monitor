@@ -1,7 +1,12 @@
 // UsageMonitor — a self-contained macOS menu-bar app that shows multi-provider
 // AI usage limits as tiny battery gauges. No external dependencies.
 //
-// Providers are configurable slots (Claude, Grok, …) with personal names and
+// PUBLIC PRODUCT VOICE (non-negotiable):
+// - Never ship maintainer-specific copy (names, “my Mac”, private emails, etc.).
+// - Release notes, UI strings, and defaults must read as a professional public app.
+// - Prefer “this Mac” / “you” over any personal branding in user-visible text.
+//
+// Providers are configurable slots (Claude, Grok, …) with custom names and
 // letter badges. Credentials are always read-only — each CLI owns refresh.
 //
 // Build:  ./build.sh      Run:  open UsageMonitor.app
@@ -134,10 +139,15 @@ enum WhatsNew {
     }
 
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
+    /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.3.3", "Public polish", [
+            "Neutral product copy in What’s New and release notes",
+            "Same smart defaults for every user (no special-case machines)",
+        ]),
         ("2.3", "Smarter defaults", [
             "Seeds providers from what you actually use (signed-in CLIs)",
-            "Grok-first ordering on JV’s Macs; Claude-first for everyone else",
+            "Stable order: Claude, Grok, Codex, Cursor — only kinds present on this Mac",
         ]),
         ("2.2", "What's New polish", [
             "Blue NEW chip on What’s New until you’ve opened it",
@@ -729,7 +739,6 @@ final class CostClient {
 enum ProviderStore {
     private static let key = "providerConfigs.v1"
     private static let layoutKey = "menuBarLayout"
-    private static let orderMigrateKey = "providerOrderMigrated.v2"
 
     static var layout: MenuBarLayout {
         get { MenuBarLayout(rawValue: UserDefaults.standard.string(forKey: layoutKey) ?? "") ?? .perProvider }
@@ -740,7 +749,7 @@ enum ProviderStore {
         if let data = UserDefaults.standard.data(forKey: key),
            let decoded = try? JSONDecoder().decode([ProviderConfig].self, from: data),
            !decoded.isEmpty {
-            return applyPreferredOrderOnce(decoded)
+            return decoded
         }
         let seed = smartDefaults()
         save(seed)
@@ -754,13 +763,13 @@ enum ProviderStore {
     }
 
     /// Seed from what's actually signed in / installed on this Mac.
-    /// Order: Grok-first on JV's machines; otherwise Claude-first among present providers.
+    /// Public product: same rules for every user — no maintainer-specific ordering.
     static func smartDefaults() -> [ProviderConfig] {
         let present = presentKinds()
         let order = preferredKindOrder()
         let kinds = order.filter { present.contains($0) }
         if kinds.isEmpty {
-            // Nothing signed in yet — seed preferred pair so setup still makes sense.
+            // Nothing signed in yet — seed the first two adapters for setup.
             return preferredKindOrder().prefix(2).map { ProviderConfig.make($0) }
         }
         return kinds.map { ProviderConfig.make($0) }
@@ -776,25 +785,11 @@ enum ProviderStore {
         save(all)
     }
 
-    // MARK: preference / detection
+    // MARK: detection
 
-    /// True on JV's personal Macs (home user) or when Grok is signed in as him.
-    /// Everyone else gets neutral “whatever you have” ordering (Claude first if present).
-    static func prefersGrokFirst() -> Bool {
-        let user = NSUserName().lowercased()
-        if user == "jv" || user == "jaco" || user.hasPrefix("jaco") { return true }
-        if let email = grokAccountEmail()?.lowercased(),
-           email.contains("jaco.veldsman") || email.hasPrefix("jaco.") {
-            return true
-        }
-        return false
-    }
-
+    /// Canonical public order. Only kinds present on the machine are seeded.
     static func preferredKindOrder() -> [ProviderKind] {
-        if prefersGrokFirst() {
-            return [.grok, .claude, .codex, .cursor]
-        }
-        return [.claude, .grok, .codex, .cursor]
+        [.claude, .grok, .codex, .cursor]
     }
 
     /// Which adapters look usable right now (signed in / installed).
@@ -807,39 +802,9 @@ enum ProviderStore {
         return s
     }
 
-    /// One-time reorder for existing installs so JV gets Grok first without wiping renames.
+    /// No-op keep: older builds wrote a one-time reorder flag; configs are left as-is.
     private static func applyPreferredOrderOnce(_ configs: [ProviderConfig]) -> [ProviderConfig] {
-        guard prefersGrokFirst(),
-              !UserDefaults.standard.bool(forKey: orderMigrateKey) else {
-            return configs
-        }
-        UserDefaults.standard.set(true, forKey: orderMigrateKey)
-        let order = preferredKindOrder()
-        let sorted = configs.sorted { a, b in
-            let ia = order.firstIndex(of: a.kind) ?? 100
-            let ib = order.firstIndex(of: b.kind) ?? 100
-            if ia != ib { return ia < ib }
-            return a.displayName < b.displayName
-        }
-        if sorted.map(\.id) != configs.map(\.id) {
-            save(sorted)
-            return sorted
-        }
-        return configs
-    }
-
-    /// Best-effort email from Grok auth (for personal-machine detection only).
-    private static func grokAccountEmail() -> String? {
-        let path = NSHomeDirectory() + "/.grok/auth.json"
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
-        for (_, value) in obj {
-            guard let entry = value as? [String: Any],
-                  let email = entry["email"] as? String, !email.isEmpty else { continue }
-            return email
-        }
-        return nil
+        configs
     }
 }
 
