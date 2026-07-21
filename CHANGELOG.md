@@ -8,6 +8,13 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.3.6
+
+- **Battery Fill** submenu: **Fill Shows Used** or **Fill Shows Remaining**
+  (colour still tracks usage severity).
+- **Horizontal bar chart** disabled when more than one menu-bar cluster is
+  shown (multi-provider); tooltip explains how to enable it again.
+
 ## 2.3.5
 
 - **Feature NEW chips.** Light blue **NEW** badges appear next to menu items

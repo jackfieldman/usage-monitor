@@ -511,6 +511,23 @@ enum IconShape: String, CaseIterable {
     }
 }
 
+/// How a battery glyph is filled — length of the charge bar.
+enum BatteryFillMode: String, CaseIterable {
+    case used, remaining
+    var title: String {
+        switch self {
+        case .used: return "Fill Shows Used"
+        case .remaining: return "Fill Shows Remaining"
+        }
+    }
+    var subtitle: String {
+        switch self {
+        case .used: return "Charge bar = % of limit used"
+        case .remaining: return "Charge bar = % of limit left"
+        }
+    }
+}
+
 /// How wide the glyphs draw. Comfortable widens the charts a touch for
 /// readability; Compact is the classic tight menu-bar footprint.
 enum Density: String, CaseIterable {
@@ -2644,14 +2661,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let width: CGFloat
         }
         let laid: [Laid] = clusters.map { c in
-            let pctVal = c.gauges.map(\.percent).max() ?? 0
+            let used = c.gauges.map(\.percent).max() ?? 0
+            let shown = batteryDisplayPercent(used)
             let badge = c.letter.count == 1 ? "\(c.letter):" : c.letter
             let letter = NSAttributedString(string: badge,
                 attributes: [.font: letterFont, .foregroundColor: ink])
-            let pct = NSAttributedString(string: "\(Int(pctVal))%",
+            let pct = NSAttributedString(string: "\(Int(shown))%",
                 attributes: [.font: numFont, .foregroundColor: ink])
             let w = ceil(letter.size().width) + letterGap + glyphW + pctGap + ceil(pct.size().width)
-            return Laid(letter: letter, pct: pct, percent: pctVal, width: w)
+            return Laid(letter: letter, pct: pct, percent: used, width: w)
         }
         let total = pad * 2 + laid.reduce(0) { $0 + $1.width } + gap * CGFloat(max(0, laid.count - 1))
 
@@ -2666,7 +2684,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                 let gy = ((h - glyphH) / 2).rounded()
                 let gRect = NSRect(x: x, y: gy, width: glyphW, height: glyphH)
-                self.drawShapeGlyph(shape, percent: item.percent, in: gRect)
+                self.drawShapeGlyph(shape, usedPercent: item.percent, in: gRect)
                 x += glyphW + pctGap
 
                 let py = ((h - item.pct.size().height) / 2).rounded()
@@ -2680,15 +2698,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Mini gauge for one percent, matching the selected Icon Shape.
-    private func drawShapeGlyph(_ shape: IconShape, percent: Double, in rect: NSRect) {
-        let p = max(0, min(100, percent)) / 100
+    /// `usedPercent` is always “% of limit used”; battery fill mode may invert length.
+    private func drawShapeGlyph(_ shape: IconShape, usedPercent: Double, in rect: NSRect) {
+        let fillPct = shape == .battery ? batteryDisplayPercent(usedPercent) : usedPercent
+        let p = max(0, min(100, fillPct)) / 100
+        // Severity colour always tracks usage, even when the bar shows remaining.
+        let colorPct = usedPercent
         switch shape {
         case .bars:
             NSColor.labelColor.withAlphaComponent(0.18).setFill()
             NSBezierPath(roundedRect: rect, xRadius: rect.width / 2, yRadius: rect.width / 2).fill()
             if p > 0 {
                 let bh = max(rect.width, rect.height * p)
-                fillColor(percent).setFill()
+                fillColor(colorPct).setFill()
                 NSBezierPath(roundedRect: NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: bh),
                              xRadius: rect.width / 2, yRadius: rect.width / 2).fill()
             }
@@ -2697,7 +2719,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2).fill()
             if p > 0 {
                 let bw = max(rect.height, rect.width * p)
-                fillColor(percent).setFill()
+                fillColor(colorPct).setFill()
                 NSBezierPath(roundedRect: NSRect(x: rect.minX, y: rect.minY, width: bw, height: rect.height),
                              xRadius: rect.height / 2, yRadius: rect.height / 2).fill()
             }
@@ -2715,11 +2737,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 arc.lineCapStyle = .round
                 arc.appendArc(withCenter: c, radius: r,
                               startAngle: 90, endAngle: 90 - p * 360, clockwise: true)
-                fillColor(percent).setStroke()
+                fillColor(colorPct).setStroke()
                 arc.stroke()
             }
         case .battery:
-            // Tiny battery shell + fill.
             let body = rect.insetBy(dx: 0, dy: 1)
             let tint = NSColor.labelColor.withAlphaComponent(0.5)
             let outline = NSBezierPath(roundedRect: body.insetBy(dx: 0.5, dy: 0.5),
@@ -2733,7 +2754,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if p > 0 {
                 let inner = body.insetBy(dx: 2, dy: 2)
                 let w = max(1, inner.width * p)
-                fillColor(percent).setFill()
+                fillColor(colorPct).setFill()
                 NSBezierPath(roundedRect: NSRect(x: inner.minX, y: inner.minY, width: w, height: inner.height),
                              xRadius: 1, yRadius: 1).fill()
             }
@@ -2852,6 +2873,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "iconShape") }
     }
 
+    var batteryFill: BatteryFillMode {
+        get { BatteryFillMode(rawValue: UserDefaults.standard.string(forKey: "batteryFill") ?? "") ?? .used }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "batteryFill") }
+    }
+
+    /// Horizontal bars only work cleanly with a single menu-bar cluster
+    /// (one provider / one glyph group). Multi-provider letter rows break the layout.
+    var horizontalBarsAvailable: Bool {
+        iconClusters.count <= 1
+    }
+
+    /// Convert stored “% used” into the value that drives battery fill + number.
+    /// Colour severity always stays based on *used* (high usage → red).
+    func batteryDisplayPercent(_ used: Double) -> Double {
+        guard iconShape == .battery else { return used }
+        switch batteryFill {
+        case .used: return used
+        case .remaining: return max(0, min(100, 100 - used))
+        }
+    }
+
     /// Which limit's percent the single-glyph shapes (bars/rings/consolidated)
     /// show beside the icon. Empty = the highest of all limits.
     /// Legacy single global number pick — only used when exactly one provider
@@ -2897,10 +2939,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func pickShape(_ sender: NSMenuItem) {
-        if let raw = sender.representedObject as? String, let shape = IconShape(rawValue: raw) {
-            iconShape = shape
+        guard let raw = sender.representedObject as? String,
+              let shape = IconShape(rawValue: raw) else { return }
+        if shape == .hbars && !horizontalBarsAvailable {
+            return   // disabled item; ignore
         }
+        iconShape = shape
         render()
+    }
+
+    @objc func pickBatteryFill(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String,
+           let mode = BatteryFillMode(rawValue: raw) {
+            batteryFill = mode
+            render()
+        }
     }
 
     var density: Density {
@@ -3025,16 +3078,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let shapeItem = NSMenuItem(title: "Icon Shape", action: nil, keyEquivalent: "")
         let shapeMenu = NSMenu()
+        let multiCluster = !horizontalBarsAvailable
         for shape in IconShape.allCases {
             let i = NSMenuItem(title: shape.title, action: #selector(pickShape(_:)), keyEquivalent: "")
             i.target = self
             i.representedObject = shape.rawValue
             i.state = shape == iconShape ? .on : .off
+            if shape == .hbars && multiCluster {
+                i.isEnabled = false
+                i.state = .off
+                i.toolTip = "Horizontal bars need a single menu-bar cluster. Turn off other providers under Providers → Show in Menu Bar, or use Menu Bar Layout → Highest Only."
+            }
             shapeMenu.addItem(i)
+        }
+        // If horizontal was selected but is no longer valid, fall back.
+        if iconShape == .hbars && multiCluster {
+            iconShape = .bars
+            render()
         }
         shapeItem.submenu = shapeMenu
         menu.addItem(shapeItem)
         if iconShape == .battery {
+            let fillItem = NSMenuItem(title: "Battery Fill", action: nil, keyEquivalent: "")
+            let fillMenu = NSMenu()
+            for mode in BatteryFillMode.allCases {
+                let i = NSMenuItem(title: mode.title, action: #selector(pickBatteryFill(_:)), keyEquivalent: "")
+                i.target = self
+                i.representedObject = mode.rawValue
+                i.state = mode == batteryFill ? .on : .off
+                i.toolTip = mode.subtitle
+                fillMenu.addItem(i)
+            }
+            fillItem.submenu = fillMenu
+            menu.addItem(fillItem)
+
             let combined = item("Consolidated Icon", #selector(toggleConsolidated), "")
             combined.state = consolidated ? .on : .off
             menu.addItem(combined)
@@ -3521,12 +3598,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSBezierPath(roundedRect: cap, xRadius: 0.75, yRadius: 0.75).fill()
     }
 
-    /// Colour charge bar inside a shell; `track` is the full-width area at 100%.
-    private func drawFill(_ track: NSRect, percent: Double) {
-        let w = track.width * max(0, min(100, percent)) / 100
+    /// Colour charge bar inside a shell; `usedPercent` drives colour; fill length
+    /// follows battery fill mode (used vs remaining).
+    private func drawFill(_ track: NSRect, usedPercent: Double) {
+        let fillPct = batteryDisplayPercent(usedPercent)
+        let w = track.width * max(0, min(100, fillPct)) / 100
         guard w > 0.5 else { return }
         let r = min(2, track.height / 2, w / 2)
-        fillColor(percent).setFill()
+        fillColor(usedPercent).setFill()
         NSBezierPath(roundedRect: NSRect(x: track.minX, y: track.minY, width: w, height: track.height),
                      xRadius: r, yRadius: r).fill()
     }
@@ -3541,7 +3620,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let numAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
 
         let items: [(g: Gauge, s: NSAttributedString, w: CGFloat)] = gauges.map { g in
-            let s = NSAttributedString(string: "\(Int(g.percent))%", attributes: numAttrs)
+            let shown = batteryDisplayPercent(g.percent)
+            let s = NSAttributedString(string: "\(Int(shown))%", attributes: numAttrs)
             return (g, s, bodyW + capExt + gap + ceil(s.size().width))
         }
         let total = items.isEmpty ? 8
@@ -3554,7 +3634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for it in items {
                 let body = NSRect(x: x, y: by, width: bodyW, height: bodyH)
                 self.drawShell(body)
-                self.drawFill(body.insetBy(dx: 2, dy: 2), percent: it.g.percent)
+                self.drawFill(body.insetBy(dx: 2, dy: 2), usedPercent: it.g.percent)
                 let sy = ((h - it.s.size().height) / 2).rounded()
                 it.s.draw(at: NSPoint(x: x + bodyW + capExt + gap, y: sy))
                 x += it.w + gaugeGap
@@ -3565,7 +3645,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func peakLabel(_ gauges: [Gauge]) -> NSAttributedString {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        return NSAttributedString(string: "\(Int(displayPercent(gauges)))%",
+        let used = displayPercent(gauges)
+        let shown = batteryDisplayPercent(used)
+        return NSAttributedString(string: "\(Int(shown))%",
                                   attributes: [.font: font, .foregroundColor: NSColor.labelColor])
     }
 
@@ -3691,7 +3773,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for (i, g) in gauges.enumerated() {
                 let y = inner.maxY - barH - CGFloat(i) * (barH + barGap)
                 self.drawFill(NSRect(x: inner.minX, y: y, width: inner.width, height: barH),
-                              percent: g.percent)
+                              usedPercent: g.percent)
             }
             let sy = ((h - s.size().height) / 2).rounded()
             s.draw(at: NSPoint(x: body.maxX + capExt + gap, y: sy))
