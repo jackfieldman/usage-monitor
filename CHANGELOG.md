@@ -8,6 +8,28 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.5.2
+
+- **Tighter menu-bar footprint.** Status item width is pinned to the gauge
+  image (no extra variable-length dead air). Smaller fonts/glyphs, zero outer
+  pad, tighter gaps between G:/C: clusters.
+
+## 2.5.1
+
+- **Active AI desktops: no false Live.** Stopped counting Dock Extra /
+  helpers (e.g. “Dock Extra (ChatGPT.app)”) as open ChatGPT — click was a
+  no-op. Only regular apps count; ChatGPT.app’s real bundle (`com.openai.codex`)
+  is recognized; click focuses or launches the real app.
+
+## 2.5.0
+
+- **Caffeinate Mode** (expanded keep-awake):
+  - Keeps **desktops and laptops** from sleeping due to idle.
+  - Laptop-only option: **Keep laptop on with lid shut**.
+  - **Glowing cup** in the menu bar while Active — click for a reminder.
+  - Modern activation card with heat / bag / battery guidance.
+- **Horizontal bars** greying copy: **limited to 1 provider** (was “needs 1 cluster”).
+
 ## 2.4.1
 
 - **Closed Lid Mode** (was Laptop Mode): parent row shows warm amber **Active**

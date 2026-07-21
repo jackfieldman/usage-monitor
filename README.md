@@ -40,14 +40,18 @@ the moment any limit first crosses into the red zone — so you hear about it
 without watching the menu bar. It alerts once per crossing and re-arms after the
 limit resets below 80%.
 
-The menu also has **clickable activity** (per provider that has it enabled):
+The menu has **Active AI** collapsed under a disclosure arrow (so the main menu
+stays short):
 
-- **Dark line** — letter badge + what the session is working on (Claude’s
-  last prompt summary, Grok’s session title).
-- **Light line** — project · branch · Live/time · tokens (Claude) or model.
-- **Click** — focuses the live host process: Terminal tab by TTY, iTerm,
-  Warp, Ghostty, Orbit, or Claude desktop when that’s the parent; otherwise
-  opens the project folder.
+- **Active AI terminals** — live CLI sessions (what each is working on). Click
+  to jump to that Terminal / iTerm / Warp / Ghostty / Orbit tab.
+- **Active AI desktops** — Claude, ChatGPT, Cursor when the real app is running
+  (not Dock helpers). Click to bring it forward.
+
+**Caffeinate Mode** keeps the Mac awake (desktop or laptop). On a MacBook you
+can also **keep the laptop on with the lid shut**. While active, a glowing cup
+appears in the menu bar — click it for a short reminder (heat / battery notes).
+Optional: join a favorite hotspot when turning the mode on.
 
 Under **Providers** you can rename slots, set letter badges, toggle menu-bar
 and activity visibility, and add another provider slot. **Menu Bar Layout**
@@ -77,10 +81,17 @@ chooses how clusters pack: per-provider letter+%, all gauges, or highest only.
 
 ## Install
 
+### Download (recommended)
+
+Grab the latest signed build from
+**[GitHub Releases](https://github.com/jackfieldman/usage-monitor/releases)**
+(`UsageMonitor.zip`). Unzip, move `UsageMonitor.app` to `/Applications` if you
+like, then open it. The app can update itself from later releases.
+
 ### Build from source
 
 ```sh
-git clone <repo-url> usage-monitor
+git clone https://github.com/jackfieldman/usage-monitor.git
 cd usage-monitor
 ./build.sh
 open UsageMonitor.app

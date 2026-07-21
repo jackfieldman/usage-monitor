@@ -160,7 +160,7 @@ enum WhatsNew {
             case .menuBarLayout: return "2.0"
             case .codexCursor: return "2.1"
             case .whatsNewPanel: return "2.2"
-            case .laptopMode: return "2.4"
+            case .laptopMode: return "2.5"
             }
         }
     }
@@ -168,6 +168,13 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.5.2", "Caffeinate Mode & polish", [
+            "Caffeinate Mode: keep desktops and laptops awake; laptop lid-shut option",
+            "Glowing menu-bar cup while active — click for a reminder",
+            "Active AI desktops: only real apps (no false ChatGPT Live)",
+            "Tighter menu-bar gauges — less dead space next to G:/C:",
+            "Horizontal bars: limited to 1 provider (clearer wording)",
+        ]),
         ("2.4.1", "Closed Lid Mode & Active AI", [
             "Closed Lid Mode: amber Active / grey Inactive on the menu row",
             "Active AI terminals (live only) and Active AI desktops (Claude, ChatGPT, …)",
@@ -1003,6 +1010,11 @@ enum ProcessFocus {
         } else {
             app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
         }
+    }
+
+    /// Public: activate an already-resolved running app (desktop AI rows).
+    static func activateRunningApp(_ app: NSRunningApplication) {
+        activateApp(app)
     }
 
     @discardableResult
@@ -2314,34 +2326,59 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
 // MARK: - App
 
-// MARK: - Closed Lid Mode (favorite hotspot + lid-closed keep-awake)
+// MARK: - Caffeinate Mode (keep awake + optional lid-shut + hotspot)
 
-/// Settings + live state for “Closed Lid Mode”: join a preferred hotspot and hold a
-/// system-sleep assertion so the Mac can keep working with the lid closed.
+/// “Caffeinate Mode” keeps this Mac from sleeping due to idle — desktops and
+/// laptops. On a portable Mac, an extra option holds a stronger assertion so
+/// work can continue with the lid closed. Optional favorite-hotspot join.
 ///
 /// Security: prefer known/preferred networks and Keychain passwords — never
 /// require an admin password. CoreWLAN scans may prompt for Location (system
 /// dialog); callers must warn the user first.
-///
-/// Clamshell note: Apple’s strongest guarantee for lid-closed operation is
-/// classic clamshell (external display + AC). This mode holds a
-/// `PreventSystemSleep` assertion (and a `caffeinate -s` helper) so the machine
-/// stays awake without an external display when the system allows it. Prefer AC
-/// power; on battery macOS may still sleep on lid close on some models.
 final class LaptopModeController {
     static let shared = LaptopModeController()
 
+    /// Short names so they surface cleanly in `pmset -g assertions`.
+    static let idleAssertionName = "Usage Monitor Caffeinate"
+    static let lidAssertionName = "Usage Monitor Lid Shut"
+
     private let hotspotKey = "laptopMode.favoriteHotspot"
     private let joinKey = "laptopMode.joinHotspot"
-    private let clamshellKey = "laptopMode.clamshell"
+    private let clamshellKey = "laptopMode.clamshell"   // lid-shut option
     private let activeKey = "laptopMode.wasActive"
     private let keychainService = "com.usagemonitor.app.hotspot"
 
-    private var assertionID: IOPMAssertionID = 0
-    private var assertionHeld = false
+    private var idleAssertionID: IOPMAssertionID = 0
+    private var idleAssertionHeld = false
+    private var lidAssertionID: IOPMAssertionID = 0
+    private var lidAssertionHeld = false
     private var caffeinate: Process?
     private(set) var lastProof: String = ""
     private(set) var lastError: String?
+
+    /// True on MacBooks / portables (internal battery or clamshell hardware).
+    static var isPortableMac: Bool = {
+        // Internal battery present → almost certainly a laptop.
+        let batt = Process()
+        batt.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
+        batt.arguments = ["-r", "-c", "AppleSmartBattery", "-d", "1"]
+        let pipe = Pipe()
+        batt.standardOutput = pipe
+        batt.standardError = FileHandle.nullDevice
+        try? batt.run(); batt.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if out.contains("AppleSmartBattery") { return true }
+        // Clamshell keys exist on lid-equipped Macs even if battery probe failed.
+        let clam = Process()
+        clam.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
+        clam.arguments = ["-r", "-k", "AppleClamshellState", "-d", "1"]
+        let pipe2 = Pipe()
+        clam.standardOutput = pipe2
+        clam.standardError = FileHandle.nullDevice
+        try? clam.run(); clam.waitUntilExit()
+        let out2 = String(data: pipe2.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return out2.contains("AppleClamshellState")
+    }()
 
     var favoriteHotspot: String {
         get { UserDefaults.standard.string(forKey: hotspotKey) ?? "" }
@@ -2357,13 +2394,24 @@ final class LaptopModeController {
         set { UserDefaults.standard.set(newValue, forKey: joinKey) }
     }
 
-    /// Default on — keep running with the lid closed.
-    var clamshellOnActivate: Bool {
+    /// Laptop only — keep running with the lid closed (stronger sleep block).
+    /// Defaults on for portables; forced off on desktops.
+    var lidShutOnActivate: Bool {
         get {
+            guard Self.isPortableMac else { return false }
             if UserDefaults.standard.object(forKey: clamshellKey) == nil { return true }
             return UserDefaults.standard.bool(forKey: clamshellKey)
         }
-        set { UserDefaults.standard.set(newValue, forKey: clamshellKey) }
+        set {
+            guard Self.isPortableMac else { return }
+            UserDefaults.standard.set(newValue, forKey: clamshellKey)
+        }
+    }
+
+    /// Back-compat alias used by older menu selectors / self-test.
+    var clamshellOnActivate: Bool {
+        get { lidShutOnActivate }
+        set { lidShutOnActivate = newValue }
     }
 
     var isActive: Bool {
@@ -2371,8 +2419,12 @@ final class LaptopModeController {
         set { UserDefaults.standard.set(newValue, forKey: activeKey) }
     }
 
-    /// True when a sleep assertion is currently held by this process.
-    var clamshellEngaged: Bool { assertionHeld }
+    /// True when the base keep-awake (caffeinate) assertion is held.
+    var caffeinateEngaged: Bool { idleAssertionHeld }
+    /// True when the lid-shut (PreventSystemSleep) assertion is held.
+    var lidShutEngaged: Bool { lidAssertionHeld }
+    /// Back-compat.
+    var clamshellEngaged: Bool { lidAssertionHeld || idleAssertionHeld }
 
     // MARK: activate / deactivate
 
@@ -2382,6 +2434,26 @@ final class LaptopModeController {
         var lines: [String] = []
         var ok = true
 
+        // 1) Always hold idle keep-awake when Caffeinate Mode is on.
+        let idle = engageIdleKeepAwake()
+        lines.append(idle.line)
+        if !idle.ok { ok = false; lastError = idle.line }
+
+        // 2) Optional lid-shut (portable Macs only).
+        if Self.isPortableMac && lidShutOnActivate {
+            let lid = engageLidShut()
+            lines.append(lid.line)
+            if !lid.ok { ok = false; lastError = lid.line }
+        } else {
+            releaseLidShut()
+            if Self.isPortableMac {
+                lines.append("Lid shut: off (option disabled)")
+            } else {
+                lines.append("Lid shut: n/a (desktop Mac)")
+            }
+        }
+
+        // 3) Optional hotspot join.
         if joinHotspotOnActivate {
             let ssid = favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
             if ssid.isEmpty {
@@ -2395,43 +2467,32 @@ final class LaptopModeController {
             lines.append("Hotspot: skipped (join toggle off)")
         }
 
-        if clamshellOnActivate {
-            let result = engageClamshell()
-            lines.append(result.line)
-            if !result.ok { ok = false; lastError = result.line }
-        } else {
-            releaseClamshell()
-            lines.append("Clamshell: off (toggle disabled)")
-        }
-
-        // Active if at least one requested action is engaged, or both skipped intentionally.
-        let engaged = (joinHotspotOnActivate && currentSSID() != nil)
-            || (clamshellOnActivate && assertionHeld)
-        isActive = engaged || (ok && (joinHotspotOnActivate || clamshellOnActivate))
-        if !joinHotspotOnActivate && !clamshellOnActivate {
-            isActive = false
-            lines.append("Nothing to do — turn on hotspot join and/or clamshell.")
+        isActive = idleAssertionHeld
+        if !isActive {
+            lines.append("Caffeinate Mode could not engage keep-awake.")
             ok = false
         }
 
         lines.append(contentsOf: statusSnapshot())
         lastProof = lines.joined(separator: "\n")
-        NSLog("UsageMonitor Closed Lid Mode activate:\n\(lastProof)")
+        NSLog("UsageMonitor Caffeinate Mode activate:\n\(lastProof)")
         return (ok, lastProof)
     }
 
     func deactivate() {
-        releaseClamshell()
+        releaseLidShut()
+        releaseIdleKeepAwake()
         isActive = false
-        lastProof = (["Closed Lid Mode deactivated.", "Clamshell assertion released."]
+        lastProof = (["Caffeinate Mode turned off.", "Sleep assertions released."]
             + statusSnapshot()).joined(separator: "\n")
-        NSLog("UsageMonitor Closed Lid Mode deactivate:\n\(lastProof)")
+        NSLog("UsageMonitor Caffeinate Mode deactivate:\n\(lastProof)")
     }
 
-    /// Re-assert after relaunch if the user left Closed Lid Mode on.
+    /// Re-assert after relaunch if the user left Caffeinate Mode on.
     func restoreIfNeeded() {
         guard isActive else { return }
-        if clamshellOnActivate { _ = engageClamshell() }
+        _ = engageIdleKeepAwake()
+        if Self.isPortableMac && lidShutOnActivate { _ = engageLidShut() }
         // Do not force a Wi‑Fi rejoin on every launch — only re-hold sleep.
     }
 
@@ -2533,51 +2594,83 @@ final class LaptopModeController {
         }
         let detail = out.trimmingCharacters(in: .whitespacesAndNewlines)
         if password.isEmpty {
-            return (false, "Hotspot: could not join “\(ssid)” — set the password under Closed Lid Mode"
+            return (false, "Hotspot: could not join “\(ssid)” — set the password under Caffeinate Mode"
                 + (detail.isEmpty ? "" : " (\(detail))"))
         }
         return (false, "Hotspot: could not join “\(ssid)”"
             + (detail.isEmpty ? "" : " — \(detail)"))
     }
 
-    // MARK: clamshell / sleep assertion
+    // MARK: sleep assertions
 
-    private func engageClamshell() -> (ok: Bool, line: String) {
-        if assertionHeld { return (true, "Clamshell: already holding PreventSystemSleep (#\(assertionID))") }
-
+    /// Base keep-awake: prevent idle sleep (desktops + laptops).
+    private func engageIdleKeepAwake() -> (ok: Bool, line: String) {
+        if idleAssertionHeld {
+            startCaffeinateHelper(lidShut: lidAssertionHeld)
+            return (true, "Caffeinate: already holding NoIdleSleep (#\(idleAssertionID))")
+        }
         var id: IOPMAssertionID = 0
-        // Keep the name short — long / fancy names sometimes don't surface in `pmset -g assertions`.
-        let name = "Usage Monitor Closed Lid Mode" as CFString
+        let status = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            Self.idleAssertionName as CFString,
+            &id)
+        guard status == kIOReturnSuccess else {
+            return (false, "Caffeinate: failed to create idle assertion (IOReturn \(status))")
+        }
+        idleAssertionID = id
+        idleAssertionHeld = true
+        startCaffeinateHelper(lidShut: false)
+        return (true, "Caffeinate: system stays awake (NoIdleSleep #\(id))")
+    }
+
+    private func releaseIdleKeepAwake() {
+        stopCaffeinateHelper()
+        if idleAssertionHeld {
+            IOPMAssertionRelease(idleAssertionID)
+            idleAssertionHeld = false
+            idleAssertionID = 0
+        }
+    }
+
+    /// Stronger: prevent system sleep so a laptop can stay on with the lid shut.
+    private func engageLidShut() -> (ok: Bool, line: String) {
+        if lidAssertionHeld {
+            startCaffeinateHelper(lidShut: true)
+            return (true, "Lid shut: already holding PreventSystemSleep (#\(lidAssertionID))")
+        }
+        var id: IOPMAssertionID = 0
         let status = IOPMAssertionCreateWithName(
             kIOPMAssertionTypePreventSystemSleep as CFString,
             IOPMAssertionLevel(kIOPMAssertionLevelOn),
-            name,
+            Self.lidAssertionName as CFString,
             &id)
         guard status == kIOReturnSuccess else {
-            return (false, "Clamshell: failed to create power assertion (IOReturn \(status))")
+            return (false, "Lid shut: failed to create system-sleep assertion (IOReturn \(status))")
         }
-        assertionID = id
-        assertionHeld = true
-        startCaffeinateHelper()
-        return (true, "Clamshell: PreventSystemSleep held (assertion #\(id))")
+        lidAssertionID = id
+        lidAssertionHeld = true
+        startCaffeinateHelper(lidShut: true)
+        return (true, "Lid shut: PreventSystemSleep held (#\(id)) — lid may stay closed")
     }
 
-    private func releaseClamshell() {
-        stopCaffeinateHelper()
-        if assertionHeld {
-            IOPMAssertionRelease(assertionID)
-            assertionHeld = false
-            assertionID = 0
+    private func releaseLidShut() {
+        if lidAssertionHeld {
+            IOPMAssertionRelease(lidAssertionID)
+            lidAssertionHeld = false
+            lidAssertionID = 0
         }
+        // Downgrade caffeinate helper flags if idle is still held.
+        if idleAssertionHeld { startCaffeinateHelper(lidShut: false) }
     }
 
-    /// Extra belt-and-braces: `caffeinate -s` prevents idle system sleep (best on AC).
-    private func startCaffeinateHelper() {
+    /// `caffeinate` helper mirrors assertions (belt-and-braces).
+    private func startCaffeinateHelper(lidShut: Bool) {
         stopCaffeinateHelper()
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
-        // -s system sleep (strongest on AC), -i idle, -d display, -m disk
-        p.arguments = ["-s", "-i", "-d", "-m"]
+        // -i idle sleep, -d display, -m disk; -s system sleep (AC) when lid-shut
+        p.arguments = lidShut ? ["-s", "-i", "-d", "-m"] : ["-i", "-d", "-m"]
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         do {
@@ -2602,6 +2695,7 @@ final class LaptopModeController {
     func statusSnapshot() -> [String] {
         var lines: [String] = []
         lines.append("Mode: \(isActive ? "ACTIVE" : "off")")
+        lines.append("Hardware: \(Self.isPortableMac ? "laptop / portable" : "desktop")")
         lines.append("Wi‑Fi now: \(currentSSID() ?? "(not associated)")")
         if let fav = optionalNonEmpty(favoriteHotspot) {
             lines.append("Favorite hotspot: \(fav)")
@@ -2609,28 +2703,34 @@ final class LaptopModeController {
             lines.append("Favorite hotspot: (not set)")
         }
         lines.append("Join on activate: \(joinHotspotOnActivate ? "yes" : "no")")
-        lines.append("Clamshell on activate: \(clamshellOnActivate ? "yes" : "no")")
-        lines.append("Assertion held: \(assertionHeld ? "yes #\(assertionID)" : "no")")
+        if Self.isPortableMac {
+            lines.append("Lid shut option: \(lidShutOnActivate ? "yes" : "no")")
+        }
+        lines.append("Idle keep-awake: \(idleAssertionHeld ? "yes #\(idleAssertionID)" : "no")")
+        lines.append("Lid-shut assertion: \(lidAssertionHeld ? "yes #\(lidAssertionID)" : "no")")
         if let pid = caffeinate?.processIdentifier {
             lines.append("caffeinate helper: pid \(pid)")
         }
-        // Independent system proof via pmset (brief settle so powerd lists us).
         Thread.sleep(forTimeInterval: 0.35)
         let pm = shell("/usr/bin/pmset -g assertions")
-        if assertionHeld && pm.contains("Usage Monitor Closed Lid Mode") {
-            lines.append("pmset proof: assertion listed ✓")
-        } else if assertionHeld {
-            lines.append("pmset proof: assertion held in-process (#\(assertionID)); name not yet in pmset")
-        } else if pm.contains("Usage Monitor Closed Lid Mode") {
-            lines.append("pmset: stale name still listed")
-        } else {
-            lines.append("pmset proof: no Laptop Mode assertion")
+        if idleAssertionHeld && pm.contains(Self.idleAssertionName) {
+            lines.append("pmset: caffeinate assertion listed ✓")
+        } else if idleAssertionHeld {
+            lines.append("pmset: idle assertion held in-process (#\(idleAssertionID))")
+        }
+        if lidAssertionHeld && pm.contains(Self.lidAssertionName) {
+            lines.append("pmset: lid-shut assertion listed ✓")
+        } else if lidAssertionHeld {
+            lines.append("pmset: lid assertion held in-process (#\(lidAssertionID))")
+        }
+        if !idleAssertionHeld && !lidAssertionHeld {
+            lines.append("pmset: no Caffeinate Mode assertions")
         }
         let batt = shell("/usr/bin/pmset -g batt")
         if batt.lowercased().contains("ac power") {
-            lines.append("Power: AC (best for lid-closed)")
+            lines.append("Power: AC (best for long keep-awake / lid shut)")
         } else if batt.lowercased().contains("battery") {
-            lines.append("Power: Battery (lid-closed may still sleep on some Macs — use AC if you can)")
+            lines.append("Power: Battery — will drain; avoid closed bag (heat)")
         }
         return lines
     }
@@ -2706,13 +2806,254 @@ final class LaptopModeController {
     }
 
     deinit {
-        releaseClamshell()
+        releaseLidShut()
+        releaseIdleKeepAwake()
+    }
+}
+
+// MARK: - Caffeinate Mode notice (modern panel)
+
+/// Compact, modern card explaining that Caffeinate Mode is on (or reminding
+/// when the menu-bar glow is clicked). Not a plain NSAlert.
+final class CaffeinateNoticeController: NSObject, NSWindowDelegate {
+    private var window: NSWindow?
+    var onTurnOff: (() -> Void)?
+
+    enum Kind { case activated, reminder }
+
+    func present(kind: Kind, lidShut: Bool, isPortable: Bool, onBattery: Bool) {
+        window?.close()
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 360),
+            styleMask: [.titled, .closable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false)
+        panel.title = ""
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
+        panel.level = .floating
+        panel.isReleasedWhenClosed = false
+        panel.backgroundColor = NSColor(calibratedWhite: 0.09, alpha: 1)
+        panel.delegate = self
+
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 360))
+        root.wantsLayer = true
+        root.layer?.backgroundColor = NSColor(calibratedWhite: 0.09, alpha: 1).cgColor
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(stack)
+
+        // Accent pill
+        let pill = NSTextField(labelWithString: kind == .activated ? "NOW ACTIVE" : "STILL ON")
+        pill.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        pill.textColor = NSColor(srgbRed: 1, green: 0.78, blue: 0.28, alpha: 1)
+        pill.wantsLayer = true
+        pill.layer?.backgroundColor = NSColor(srgbRed: 1, green: 0.72, blue: 0.15, alpha: 0.14).cgColor
+        pill.layer?.cornerRadius = 6
+        pill.drawsBackground = false
+        // Pad via container
+        let pillBox = NSView()
+        pillBox.wantsLayer = true
+        pillBox.layer?.backgroundColor = NSColor(srgbRed: 1, green: 0.72, blue: 0.15, alpha: 0.14).cgColor
+        pillBox.layer?.cornerRadius = 6
+        pillBox.translatesAutoresizingMaskIntoConstraints = false
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        pillBox.addSubview(pill)
+        NSLayoutConstraint.activate([
+            pill.leadingAnchor.constraint(equalTo: pillBox.leadingAnchor, constant: 10),
+            pill.trailingAnchor.constraint(equalTo: pillBox.trailingAnchor, constant: -10),
+            pill.topAnchor.constraint(equalTo: pillBox.topAnchor, constant: 4),
+            pill.bottomAnchor.constraint(equalTo: pillBox.bottomAnchor, constant: -4),
+        ])
+        stack.addArrangedSubview(pillBox)
+
+        let title = NSTextField(labelWithString: "Caffeinate Mode is on")
+        title.font = NSFont.systemFont(ofSize: 22, weight: .semibold)
+        title.textColor = .white
+        title.lineBreakMode = .byWordWrapping
+        title.maximumNumberOfLines = 2
+        stack.addArrangedSubview(title)
+
+        let subtitle = NSTextField(wrappingLabelWithString: kind == .activated
+            ? "This Mac will stay awake instead of sleeping from idle. Your usage gauges keep running in the menu bar."
+            : "Reminder: Caffeinate Mode is still preventing sleep. Click the glowing cup in the menu bar anytime for this note.")
+        subtitle.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        subtitle.textColor = NSColor(calibratedWhite: 0.72, alpha: 1)
+        subtitle.preferredMaxLayoutWidth = 360
+        stack.addArrangedSubview(subtitle)
+
+        // Feature rows
+        stack.addArrangedSubview(noticeRow(
+            symbol: "cup.and.saucer.fill",
+            title: "Keeps the system on",
+            body: "Desktops and laptops stay awake through idle — same idea as the caffeinate command."))
+        if isPortable {
+            stack.addArrangedSubview(noticeRow(
+                symbol: lidShut ? "laptopcomputer" : "laptopcomputer.slash",
+                title: lidShut ? "Lid-shut keep-awake is on" : "Lid-shut keep-awake is off",
+                body: lidShut
+                    ? "The laptop can keep working with the lid closed (when the system allows)."
+                    : "Closing the lid may still sleep the Mac. Turn on “Keep laptop on with lid shut” if you need that."))
+        }
+
+        // Warnings card
+        let warnCard = NSView()
+        warnCard.wantsLayer = true
+        warnCard.layer?.backgroundColor = NSColor(srgbRed: 1, green: 0.45, blue: 0.2, alpha: 0.1).cgColor
+        warnCard.layer?.cornerRadius = 10
+        warnCard.layer?.borderWidth = 1
+        warnCard.layer?.borderColor = NSColor(srgbRed: 1, green: 0.5, blue: 0.25, alpha: 0.28).cgColor
+        warnCard.translatesAutoresizingMaskIntoConstraints = false
+        let warnStack = NSStackView()
+        warnStack.orientation = .vertical
+        warnStack.alignment = .leading
+        warnStack.spacing = 6
+        warnStack.translatesAutoresizingMaskIntoConstraints = false
+        warnCard.addSubview(warnStack)
+        NSLayoutConstraint.activate([
+            warnStack.leadingAnchor.constraint(equalTo: warnCard.leadingAnchor, constant: 14),
+            warnStack.trailingAnchor.constraint(equalTo: warnCard.trailingAnchor, constant: -14),
+            warnStack.topAnchor.constraint(equalTo: warnCard.topAnchor, constant: 12),
+            warnStack.bottomAnchor.constraint(equalTo: warnCard.bottomAnchor, constant: -12),
+        ])
+        let warnTitle = NSTextField(labelWithString: "Please keep in mind")
+        warnTitle.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        warnTitle.textColor = NSColor(srgbRed: 1, green: 0.72, blue: 0.4, alpha: 1)
+        warnStack.addArrangedSubview(warnTitle)
+        var warns = [
+            "Let the Mac breathe — don’t leave it running sealed in a bag (heat risk).",
+            "Keep-awake uses more power; plug in for long sessions.",
+        ]
+        if onBattery {
+            warns.append("You’re on battery right now — expect faster drain.")
+        }
+        if lidShut && isPortable {
+            warns.append("Lid closed + bag is a bad combo. Open lid or use a hard surface if it gets warm.")
+        }
+        for w in warns {
+            let line = NSTextField(wrappingLabelWithString: "·  \(w)")
+            line.font = NSFont.systemFont(ofSize: 12)
+            line.textColor = NSColor(calibratedWhite: 0.78, alpha: 1)
+            line.preferredMaxLayoutWidth = 330
+            warnStack.addArrangedSubview(line)
+        }
+        stack.addArrangedSubview(warnCard)
+
+        // Buttons
+        let buttons = NSStackView()
+        buttons.orientation = .horizontal
+        buttons.spacing = 10
+        buttons.alignment = .centerY
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        buttons.addArrangedSubview(spacer)
+
+        let offBtn = NSButton(title: "Turn off", target: self, action: #selector(turnOff))
+        offBtn.bezelStyle = .rounded
+        offBtn.keyEquivalent = ""
+        buttons.addArrangedSubview(offBtn)
+
+        let okBtn = NSButton(title: "Got it", target: self, action: #selector(close))
+        okBtn.bezelStyle = .rounded
+        okBtn.keyEquivalent = "\r"
+        if #available(macOS 11, *) {
+            okBtn.hasDestructiveAction = false
+        }
+        buttons.addArrangedSubview(okBtn)
+        stack.addArrangedSubview(buttons)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 28),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -28),
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 36),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -24),
+        ])
+
+        panel.contentView = root
+        // Size to fit content
+        root.layoutSubtreeIfNeeded()
+        let fitting = stack.fittingSize
+        let h = max(320, fitting.height + 60)
+        panel.setContentSize(NSSize(width: 420, height: h))
+        panel.center()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        window = panel
+    }
+
+    private func noticeRow(symbol: String, title: String, body: String) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .top
+        row.spacing = 10
+        let icon = NSImageView()
+        if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+            let cfg = NSImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+            icon.image = img.withSymbolConfiguration(cfg)
+        }
+        icon.contentTintColor = NSColor(srgbRed: 1, green: 0.78, blue: 0.28, alpha: 1)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 22),
+            icon.heightAnchor.constraint(equalToConstant: 22),
+        ])
+        let col = NSStackView()
+        col.orientation = .vertical
+        col.alignment = .leading
+        col.spacing = 2
+        let t = NSTextField(labelWithString: title)
+        t.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        t.textColor = .white
+        let b = NSTextField(wrappingLabelWithString: body)
+        b.font = NSFont.systemFont(ofSize: 12)
+        b.textColor = NSColor(calibratedWhite: 0.65, alpha: 1)
+        b.preferredMaxLayoutWidth = 320
+        col.addArrangedSubview(t)
+        col.addArrangedSubview(b)
+        row.addArrangedSubview(icon)
+        row.addArrangedSubview(col)
+        return row
+    }
+
+    @objc private func turnOff() {
+        window?.close()
+        onTurnOff?()
+    }
+
+    @objc private func close() {
+        window?.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        window = nil
+    }
+
+    static func isOnBattery() -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        p.arguments = ["-g", "batt"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        try? p.run(); p.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return out.lowercased().contains("battery power")
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let statusMenu = NSMenu()    // built once; rebuilt on open via NSMenuDelegate
+    /// Glowing cup in the menu bar while Caffeinate Mode is on — click for reminder.
+    var caffeinateStatusItem: NSStatusItem?
+    var caffeinateGlowTimer: Timer?
+    var caffeinateGlowPhase: CGFloat = 0
+    let caffeinateNotice = CaffeinateNoticeController()
     let client = UsageClient()
     let grokClient = GrokUsageClient()
     let codexClient = CodexUsageClient()
@@ -2817,7 +3158,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         WhatsNew.recordLaunch()
         laptopMode.restoreIfNeeded()
+        caffeinateNotice.onTurnOff = { [weak self] in self?.deactivateLaptopModeQuiet() }
         render()
+        updateCaffeinateGlow()
         poll()
         pollSessions()
         if notifyEnabled && !notifyConfirmed { requestAuthThenConfirm() }
@@ -3046,26 +3389,131 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let button = statusItem.button else { return }
         let clusters = iconClusters
         if clusters.isEmpty {
-            button.image = warningImage()
+            applyMenuBarImage(warningImage(), to: statusItem, button: button)
             button.toolTip = lastError
         } else {
             let img = clusterImage(clusters)
-            img.isTemplate = false
-            button.image = img
-            // Prevent the status item from re-tinting multi-color letter glyphs.
-            button.appearsDisabled = false
+            applyMenuBarImage(img, to: statusItem, button: button)
             var tip: [String] = []
             for group in providerGauges {
                 tip.append("— \(group.config.displayName) —")
                 tip.append(contentsOf: group.gauges.map { "\($0.label): \(Int($0.percent))%" })
             }
+            if laptopMode.isActive {
+                tip.append("")
+                tip.append("Caffeinate Mode is on — glowing cup keeps the system awake.")
+                if laptopMode.lidShutEngaged {
+                    tip.append("Lid-shut keep-awake is also on.")
+                }
+            }
             button.toolTip = tip.joined(separator: "\n")
         }
+        updateCaffeinateGlow()
+    }
+
+    /// Pin status-item width to the bitmap so macOS doesn’t pad a “variable” slot
+    /// wider than the gauges. Keeps the menu bar lean.
+    private func applyMenuBarImage(_ image: NSImage, to item: NSStatusItem, button: NSStatusBarButton) {
+        image.isTemplate = false
+        // Point size must match pixels-at-1x used when drawing (no extra margin).
+        let w = max(1, ceil(image.size.width))
+        let h = max(1, ceil(image.size.height))
+        image.size = NSSize(width: w, height: h)
+        button.image = image
+        button.imageScaling = .scaleNone
         button.imagePosition = .imageOnly
+        button.appearsDisabled = false
+        // Explicit length ≈ image width. `variableLength` often leaves dead air
+        // on either side of multi-glyph images.
+        item.length = w
+    }
+
+    // MARK: Caffeinate glow (menu-bar cup)
+
+    func updateCaffeinateGlow() {
+        if laptopMode.isActive {
+            if caffeinateStatusItem == nil {
+                let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+                item.button?.target = self
+                item.button?.action = #selector(caffeinateGlowClicked)
+                item.button?.sendAction(on: [.leftMouseUp])
+                caffeinateStatusItem = item
+            }
+            applyCaffeinateGlowImage(alpha: 0.55 + 0.45 * abs(sin(caffeinateGlowPhase)))
+            if caffeinateGlowTimer == nil {
+                caffeinateGlowTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+                    guard let self else { return }
+                    self.caffeinateGlowPhase += 0.12
+                    let a = 0.55 + 0.45 * abs(sin(self.caffeinateGlowPhase))
+                    self.applyCaffeinateGlowImage(alpha: a)
+                }
+                if let t = caffeinateGlowTimer {
+                    RunLoop.main.add(t, forMode: .common)
+                }
+            }
+            var tip = "Caffeinate Mode is on — click for details"
+            if laptopMode.lidShutEngaged { tip += "\nLid-shut keep-awake engaged" }
+            caffeinateStatusItem?.button?.toolTip = tip
+        } else {
+            caffeinateGlowTimer?.invalidate()
+            caffeinateGlowTimer = nil
+            if let item = caffeinateStatusItem {
+                NSStatusBar.system.removeStatusItem(item)
+                caffeinateStatusItem = nil
+            }
+        }
+    }
+
+    func applyCaffeinateGlowImage(alpha: CGFloat) {
+        guard let button = caffeinateStatusItem?.button else { return }
+        let amber = NSColor(srgbRed: 1, green: 0.72, blue: 0.2, alpha: max(0.35, min(1, alpha)))
+        let size = NSSize(width: 16, height: 16)
+        let img = NSImage(size: size, flipped: false) { _ in
+            // Soft amber halo
+            let halo = NSBezierPath(ovalIn: NSRect(x: 1, y: 1, width: 14, height: 14))
+            amber.withAlphaComponent(amber.alphaComponent * 0.35).setFill()
+            halo.fill()
+            if let cup = NSImage(systemSymbolName: "cup.and.saucer.fill",
+                                 accessibilityDescription: "Caffeinate Mode") {
+                let cfg = NSImage.SymbolConfiguration(pointSize: 11, weight: .bold)
+                let sym = (cup.withSymbolConfiguration(cfg) ?? cup).copy() as! NSImage
+                let draw = NSRect(x: 2.5, y: 2.5, width: 11, height: 11)
+                sym.isTemplate = true
+                // Tint: fill then destinationIn
+                NSGraphicsContext.saveGraphicsState()
+                amber.set()
+                draw.fill()
+                sym.draw(in: draw, from: .zero, operation: .destinationIn, fraction: 1)
+                NSGraphicsContext.restoreGraphicsState()
+            } else {
+                amber.setFill()
+                NSBezierPath(ovalIn: NSRect(x: 7, y: 7, width: 8, height: 8)).fill()
+            }
+            return true
+        }
+        if let item = caffeinateStatusItem {
+            applyMenuBarImage(img, to: item, button: button)
+            // Cup is a small hit target — allow 1pt either side without looking padded.
+            item.length = max(16, ceil(img.size.width))
+        }
+    }
+
+    @objc func caffeinateGlowClicked() {
+        showCaffeinateNotice(kind: .reminder)
+    }
+
+    func showCaffeinateNotice(kind: CaffeinateNoticeController.Kind) {
+        caffeinateNotice.onTurnOff = { [weak self] in self?.deactivateLaptopModeQuiet() }
+        caffeinateNotice.present(
+            kind: kind,
+            lidShut: laptopMode.lidShutEngaged || (laptopMode.isActive && laptopMode.lidShutOnActivate),
+            isPortable: LaptopModeController.isPortableMac,
+            onBattery: CaffeinateNoticeController.isOnBattery())
     }
 
     /// Draws letter-badged clusters, respecting **Icon Shape** for the glyph
     /// next to each letter (`G:▮ 11%` / battery / rings / horizontal).
+    /// Layout is intentionally tight — menu-bar real estate is scarce.
     func clusterImage(_ clusters: [IconCluster]) -> NSImage {
         // Classic multi-gauge shapes when one provider shows all its gauges.
         if clusters.count == 1, clusters[0].gauges.count > 1 {
@@ -3081,23 +3529,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return letterPrefixed(clusters[0].letter, body: body)
         }
 
-        let h: CGFloat = 22
-        let letterFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
-        let numFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        let gap: CGFloat = 7, pad: CGFloat = 2
-        let letterGap: CGFloat = 3, pctGap: CGFloat = 3
+        let comfortable = density == .comfortable
+        let h: CGFloat = 18
+        // Proportional letter (not full monospaced) — “G:” was wider than it looked.
+        let letterFont = NSFont.systemFont(ofSize: comfortable ? 11.5 : 11, weight: .semibold)
+        let numFont = NSFont.monospacedDigitSystemFont(ofSize: comfortable ? 11.5 : 11, weight: .medium)
+        let gap: CGFloat = comfortable ? 5 : 3          // between providers
+        let pad: CGFloat = 0                             // no outer dead air
+        let letterGap: CGFloat = comfortable ? 2 : 1.5   // letter → glyph
+        let pctGap: CGFloat = comfortable ? 2 : 1.5      // glyph → %
         let ink = NSColor.labelColor
 
         // Per-cluster glyph size depends on Icon Shape.
         let glyphW: CGFloat = {
             switch iconShape {
-            case .bars: return density == .comfortable ? 6.5 : 5
-            case .hbars: return density == .comfortable ? 18 : 14
-            case .rings: return 16
-            case .battery: return density == .comfortable ? 22 : 18
+            case .bars: return comfortable ? 5.5 : 4.5
+            case .hbars: return comfortable ? 16 : 12
+            case .rings: return comfortable ? 14 : 12
+            case .battery: return comfortable ? 18 : 15
             }
         }()
-        let glyphH: CGFloat = 14
+        let glyphH: CGFloat = comfortable ? 13 : 12
 
         struct Laid {
             let letter: NSAttributedString
@@ -3116,13 +3568,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let w = ceil(letter.size().width) + letterGap + glyphW + pctGap + ceil(pct.size().width)
             return Laid(letter: letter, pct: pct, percent: used, width: w)
         }
+        // No trailing gap after the last cluster (only between items).
         let total = pad * 2 + laid.reduce(0) { $0 + $1.width } + gap * CGFloat(max(0, laid.count - 1))
 
         let shape = iconShape
         let img = NSImage(size: NSSize(width: total, height: h), flipped: false) { [weak self] _ in
             guard let self else { return false }
             var x = pad
-            for item in laid {
+            for (idx, item) in laid.enumerated() {
                 let ly = ((h - item.letter.size().height) / 2).rounded()
                 item.letter.draw(at: NSPoint(x: x, y: ly))
                 x += ceil(item.letter.size().width) + letterGap
@@ -3134,7 +3587,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                 let py = ((h - item.pct.size().height) / 2).rounded()
                 item.pct.draw(at: NSPoint(x: x, y: py))
-                x += ceil(item.pct.size().width) + gap
+                x += ceil(item.pct.size().width)
+                if idx < laid.count - 1 { x += gap }
             }
             return true
         }
@@ -3209,11 +3663,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Prepends a bold letter badge to a classic multi-gauge image.
     private func letterPrefixed(_ letter: String, body: NSImage) -> NSImage {
         let badge = letter.count == 1 ? "\(letter):" : letter
-        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
+        let font = NSFont.systemFont(ofSize: 11, weight: .semibold)
         let s = NSAttributedString(string: badge,
             attributes: [.font: font, .foregroundColor: NSColor.labelColor])
-        let gap: CGFloat = 3, pad: CGFloat = 2
-        let h = max(22, body.size.height)
+        let gap: CGFloat = 2, pad: CGFloat = 0
+        let h = max(18, body.size.height)
         let w = pad + ceil(s.size().width) + gap + body.size.width + pad
         let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { _ in
             let ly = ((h - s.size().height) / 2).rounded()
@@ -3505,7 +3959,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(whatsNewMenuItem())
         menu.addItem(item("Refresh now", #selector(poll), "r"))
 
-        // Closed Lid Mode — favorite hotspot + lid-closed keep-awake.
+        // Caffeinate Mode — keep awake + optional lid-shut + hotspot.
         menu.addItem(laptopModeMenuItem())
 
         // Providers — names, letters, what goes in the bar.
@@ -3539,12 +3993,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // Grey title (isEnabled alone is subtle in some themes).
                 let grey = NSColor.secondaryLabelColor.withAlphaComponent(0.55)
                 i.attributedTitle = NSAttributedString(
-                    string: "\(shape.title)  (needs 1 cluster)",
+                    string: "\(shape.title)  (limited to 1 provider)",
                     attributes: [
                         .font: NSFont.menuFont(ofSize: 0),
                         .foregroundColor: grey,
                     ])
-                i.toolTip = "Unavailable with multiple menu-bar providers.\nShow only one under Providers → Show in Menu Bar, or use Menu Bar Layout → Highest Only."
+                i.toolTip = "Horizontal bars work with a single provider on the menu bar.\nTurn off extra providers under Providers → Show in Menu Bar, or use Menu Bar Layout → Highest Only."
             }
             shapeMenu.addItem(i)
         }
@@ -3615,30 +4069,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(quit)
     }
 
-    // MARK: Closed Lid Mode menu
+    // MARK: Caffeinate Mode menu
 
     /// Warm amber for Active status (not a traffic-light red/green).
-    private var closedLidActiveColor: NSColor {
+    private var caffeinateActiveColor: NSColor {
         NSColor(srgbRed: 0.95, green: 0.62, blue: 0.18, alpha: 1)
     }
 
     func laptopModeMenuItem() -> NSMenuItem {
         let active = laptopMode.isActive
-        let root = NSMenuItem(title: "Closed Lid Mode", action: nil, keyEquivalent: "")
+        let root = NSMenuItem(title: "Caffeinate Mode", action: nil, keyEquivalent: "")
         WhatsNew.applyFeatureChip(root, .laptopMode)
-        // Status on the parent row — amber Active / grey Inactive (no hover required).
-        let status = active ? "Active" : "Inactive"
-        let statusColor = active ? closedLidActiveColor : NSColor.secondaryLabelColor.withAlphaComponent(0.7)
+        let status = active ? "Active" : "Off"
+        let statusColor = active ? caffeinateActiveColor : NSColor.secondaryLabelColor.withAlphaComponent(0.7)
         let attr = NSMutableAttributedString(
-            string: "Closed Lid Mode  ·  ",
+            string: "Caffeinate Mode  ·  ",
             attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: NSColor.labelColor])
         attr.append(NSAttributedString(
             string: status,
             attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: statusColor]))
         root.attributedTitle = attr
-        root.toolTip = active
-            ? "Closed Lid Mode is Active — keep-awake (and optional hotspot join) engaged"
-            : "Closed Lid Mode is Inactive"
+        root.toolTip = """
+        Keeps this Mac awake so it doesn’t sleep from idle — desktops and laptops.
+        On a laptop you can also keep it running with the lid closed.
+        A glowing cup appears in the menu bar while Active; click it for a reminder.
+        """
 
         let sub = NSMenu()
         sub.autoenablesItems = false
@@ -3646,11 +4101,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let wifi = laptopMode.currentSSID() ?? "not associated"
         let fav = laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
         let favLabel = fav.isEmpty ? "(not set)" : fav
-        let statusRow = disabled(active ? "Status: Active" : "Status: Inactive")
+        let statusText: String
+        if active {
+            statusText = laptopMode.lidShutEngaged
+                ? "Status: Active — system on + lid-shut keep-awake"
+                : "Status: Active — system stays awake"
+        } else {
+            statusText = "Status: Off — Mac may sleep as usual"
+        }
+        let statusRow = disabled(statusText)
         if active {
             statusRow.attributedTitle = NSAttributedString(
-                string: "Status: Active",
-                attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: closedLidActiveColor])
+                string: statusText,
+                attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: caffeinateActiveColor])
         }
         sub.addItem(statusRow)
         sub.addItem(disabled("Wi‑Fi: \(wifi)"))
@@ -3658,34 +4121,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sub.addItem(.separator())
 
         if active {
-            let off = NSMenuItem(title: "Turn Off Closed Lid Mode",
+            let off = NSMenuItem(title: "Turn Off Caffeinate Mode",
                                  action: #selector(deactivateLaptopMode), keyEquivalent: "")
             off.target = self
             sub.addItem(off)
+            let remind = NSMenuItem(title: "Show Active Notice…",
+                                    action: #selector(showCaffeinateReminderFromMenu), keyEquivalent: "")
+            remind.target = self
+            sub.addItem(remind)
         } else {
-            var title = "Turn On Closed Lid Mode"
+            var title = "Turn On Caffeinate Mode"
             if !fav.isEmpty && laptopMode.joinHotspotOnActivate {
-                title = "Turn On Closed Lid Mode → \(fav)"
+                title = "Turn On Caffeinate Mode → \(fav)"
             }
             let on = NSMenuItem(title: title, action: #selector(activateLaptopMode), keyEquivalent: "l")
             on.target = self
+            on.toolTip = "Prevent idle sleep so this Mac (desktop or laptop) stays on."
             sub.addItem(on)
         }
 
         sub.addItem(.separator())
 
+        // Lid-shut only on portables — greyed/hidden on desktops.
+        if LaptopModeController.isPortableMac {
+            let lid = NSMenuItem(title: "Keep laptop on with lid shut",
+                                 action: #selector(toggleLaptopClamshell), keyEquivalent: "")
+            lid.target = self
+            lid.state = laptopMode.lidShutOnActivate ? .on : .off
+            lid.toolTip = """
+            Extra keep-awake for MacBooks: stronger sleep block so the machine can \
+            stay running with the lid closed (when macOS allows). AC power recommended. \
+            Don’t seal a running laptop in a bag — it can overheat.
+            """
+            sub.addItem(lid)
+        }
+
         let join = NSMenuItem(title: "Join favorite hotspot when turning on",
                               action: #selector(toggleLaptopJoinHotspot), keyEquivalent: "")
         join.target = self
         join.state = laptopMode.joinHotspotOnActivate ? .on : .off
+        join.toolTip = "When you turn Caffeinate Mode on, also connect to your favorite hotspot."
         sub.addItem(join)
-
-        let clamToggle = NSMenuItem(title: "Keep Mac awake with lid closed",
-                                    action: #selector(toggleLaptopClamshell), keyEquivalent: "")
-        clamToggle.target = self
-        clamToggle.state = laptopMode.clamshellOnActivate ? .on : .off
-        clamToggle.toolTip = "Holds a PreventSystemSleep assertion so the Mac can stay awake with the lid closed. AC power recommended. No admin password."
-        sub.addItem(clamToggle)
 
         sub.addItem(.separator())
 
@@ -3715,13 +4191,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func activateLaptopMode() {
         NSApp.activate(ignoringOtherApps: true)
-        // Clear consent before any Wi‑Fi scan/join that might trigger Location.
         if laptopMode.joinHotspotOnActivate,
            !laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let warn = NSAlert()
             warn.messageText = "About to use Wi‑Fi"
             warn.informativeText = """
-            Closed Lid Mode will try to join your favorite hotspot using only \
+            Caffeinate Mode will try to join your favorite hotspot using only \
             normal Wi‑Fi APIs (no admin password).
 
             macOS may show a Location / Wi‑Fi permission prompt so the app can \
@@ -3736,24 +4211,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard warn.runModal() == .alertFirstButtonReturn else { return }
         }
         let result = laptopMode.activate()
-        let alert = NSAlert()
-        alert.messageText = result.ok ? "Closed Lid Mode is Active" : "Closed Lid Mode — check details"
-        alert.informativeText = result.proof
-        alert.alertStyle = result.ok ? .informational : .warning
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
         render()
+        if result.ok {
+            showCaffeinateNotice(kind: .activated)
+        } else {
+            let alert = NSAlert()
+            alert.messageText = "Caffeinate Mode — check details"
+            alert.informativeText = result.proof
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
     }
 
     @objc func deactivateLaptopMode() {
-        laptopMode.deactivate()
+        deactivateLaptopModeQuiet()
         let alert = NSAlert()
-        alert.messageText = "Closed Lid Mode is Inactive"
-        alert.informativeText = laptopMode.lastProof
+        alert.messageText = "Caffeinate Mode is off"
+        alert.informativeText = "Sleep will work normally again. The glowing cup has left the menu bar."
         alert.addButton(withTitle: "OK")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
+    }
+
+    /// Turn off without an extra alert (used by the modern notice panel).
+    func deactivateLaptopModeQuiet() {
+        laptopMode.deactivate()
         render()
+    }
+
+    @objc func showCaffeinateReminderFromMenu() {
+        showCaffeinateNotice(kind: .reminder)
     }
 
     @objc func toggleLaptopJoinHotspot() {
@@ -3761,8 +4249,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleLaptopClamshell() {
-        laptopMode.clamshellOnActivate.toggle()
-        if laptopMode.isActive { _ = laptopMode.activate() }
+        laptopMode.lidShutOnActivate.toggle()
+        if laptopMode.isActive { _ = laptopMode.activate(); render() }
     }
 
     @objc func setFavoriteHotspot() {
@@ -3873,7 +4361,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func showLaptopModeProof() {
         let proof = laptopMode.refreshProof()
         let alert = NSAlert()
-        alert.messageText = "Closed Lid Mode status"
+        alert.messageText = "Caffeinate Mode status"
         alert.informativeText = proof
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Copy")
@@ -3887,11 +4375,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Active AI (terminals + desktops)
 
-    /// Desktop AI apps we can detect as running (no admin).
+    /// Real user-facing desktop AI apps (bundle ids).
+    /// Note: current `/Applications/ChatGPT.app` is `com.openai.codex` (not a separate Codex GUI).
     private static let desktopAIApps: [(name: String, bundleIds: [String], letter: String)] = [
         ("Claude", ["com.anthropic.claudefordesktop"], "C"),
-        ("ChatGPT", ["com.openai.chat", "com.openai.chat-macos"], "GPT"),
-        ("Codex", ["com.openai.codex"], "X"),
+        ("ChatGPT", [
+            "com.openai.codex",       // ChatGPT.app (current branding)
+            "com.openai.chat",        // ChatGPT Classic.app
+            "com.openai.chat-macos",
+            "com.openai.atlas",
+        ], "GPT"),
         ("Cursor", ["com.todesktop.230313mzl4w4u92", "com.cursor.Cursor", "com.anysphere.cursor"], "U"),
     ]
 
@@ -3902,28 +4395,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pid: Int
     }
 
+    /// NSMenuItem.representedObject must be a class for reliable click delivery.
+    final class DesktopAIAppBox: NSObject {
+        let app: DesktopAIApp
+        init(_ app: DesktopAIApp) { self.app = app }
+    }
+
+    /// Only count **regular** foreground apps — not Dock extras, helpers, XPCs.
+    private static func isUserFacingDesktopAI(_ r: NSRunningApplication) -> Bool {
+        guard r.processIdentifier > 0, !r.isTerminated else { return false }
+        // Dock Extra / menu extras / agents are .accessory or .prohibited
+        guard r.activationPolicy == .regular else { return false }
+        let n = (r.localizedName ?? "").lowercased()
+        let bid = (r.bundleIdentifier ?? "").lowercased()
+        if n.contains("dock extra") || n.contains("helper") || n.contains("agent") { return false }
+        if bid.hasPrefix("com.apple.dock") { return false }
+        if bid.contains("chrome-extension") || bid.contains("extension-host") { return false }
+        return true
+    }
+
     func runningDesktopAI() -> [DesktopAIApp] {
         var out: [DesktopAIApp] = []
+        var seenPids = Set<Int>()
         for app in Self.desktopAIApps {
             for bid in app.bundleIds {
                 let running = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
-                if let r = running.first, r.processIdentifier > 0 {
+                    .filter(Self.isUserFacingDesktopAI)
+                if let r = running.first {
+                    let pid = Int(r.processIdentifier)
+                    guard !seenPids.contains(pid) else { continue }
+                    seenPids.insert(pid)
                     out.append(DesktopAIApp(name: app.name, letter: app.letter,
-                                            bundleId: bid, pid: Int(r.processIdentifier)))
+                                            bundleId: bid, pid: pid))
                     break
                 }
             }
         }
-        // Also match by app name for ChatGPT.app branded as codex bundle.
+        // Exact display-name fallback only (never substring — “Dock Extra (ChatGPT.app)” was a false Live).
         if !out.contains(where: { $0.name == "ChatGPT" }) {
-            for r in NSWorkspace.shared.runningApplications {
-                let n = (r.localizedName ?? "").lowercased()
-                if n == "chatgpt" || n.contains("chatgpt") {
-                    out.append(DesktopAIApp(name: "ChatGPT", letter: "GPT",
-                                            bundleId: r.bundleIdentifier ?? "",
-                                            pid: Int(r.processIdentifier)))
-                    break
-                }
+            for r in NSWorkspace.shared.runningApplications where Self.isUserFacingDesktopAI(r) {
+                let n = (r.localizedName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard n.caseInsensitiveCompare("ChatGPT") == .orderedSame else { continue }
+                let pid = Int(r.processIdentifier)
+                guard !seenPids.contains(pid) else { continue }
+                out.append(DesktopAIApp(name: "ChatGPT", letter: "GPT",
+                                        bundleId: r.bundleIdentifier ?? "com.openai.codex",
+                                        pid: pid))
+                break
             }
         }
         return out
@@ -3993,10 +4511,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     action: #selector(openDesktopAI(_:)),
                     keyEquivalent: "")
                 i.target = self
-                i.representedObject = d.bundleId.isEmpty ? d.name : d.bundleId
+                i.representedObject = DesktopAIAppBox(d)
                 i.isEnabled = true
                 i.image = dotImage(levelColor(0))
-                i.toolTip = "Bring \(d.name) to the front"
+                i.toolTip = "Bring \(d.name) to the front (pid \(d.pid))"
                 sub.addItem(i)
             }
         }
@@ -4046,25 +4564,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func openDesktopAI(_ sender: NSMenuItem) {
-        guard let key = sender.representedObject as? String else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            if key.contains(".") {
-                // Bundle id
-                if ProcessFocus.activateBundlePublic(key) { return }
+        let box = sender.representedObject as? DesktopAIAppBox
+        let name = box?.app.name
+        let bid = box?.app.bundleId
+        let pid = box?.app.pid
+        // Wait for menu tracking to end — mid-menu activate is a no-op on recent macOS.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            // 1) Prefer the exact process we listed (if still alive and user-facing).
+            if let pid, pid > 0,
+               let app = NSRunningApplication(processIdentifier: pid_t(pid)),
+               Self.isUserFacingDesktopAI(app) {
+                ProcessFocus.activateRunningApp(app)
+                return
             }
-            // Fallback by name
-            for r in NSWorkspace.shared.runningApplications {
-                if (r.localizedName ?? "").localizedCaseInsensitiveContains(key)
-                    || (r.bundleIdentifier ?? "") == key {
-                    NSApp.activate(ignoringOtherApps: true)
-                    if #available(macOS 14.0, *) {
-                        r.activate(from: NSRunningApplication.current)
-                    } else {
-                        r.activate(options: [.activateAllWindows])
-                    }
+            // 2) Known bundle id(s) for this product.
+            var bids: [String] = []
+            if let bid, !bid.isEmpty { bids.append(bid) }
+            if let name {
+                for entry in Self.desktopAIApps where entry.name == name {
+                    bids.append(contentsOf: entry.bundleIds)
+                }
+            }
+            for id in bids {
+                if ProcessFocus.activateBundlePublic(id) { return }
+            }
+            // 3) Launch from /Applications by product name.
+            if let name {
+                let paths = [
+                    "/Applications/\(name).app",
+                    "/Applications/\(name) Classic.app",
+                    "/System/Applications/\(name).app",
+                ]
+                for path in paths where FileManager.default.fileExists(atPath: path) {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
                     return
                 }
             }
+            NSLog("UsageMonitor: openDesktopAI failed name=\(name ?? "-") bid=\(bid ?? "-") pid=\(pid.map(String.init) ?? "-")")
             NSSound.beep()
         }
     }
@@ -4072,6 +4608,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Keep activity actions enabled even when the app is inactive.
     @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(openActivity(_:)) { return true }
+        if menuItem.action == #selector(openDesktopAI(_:)) { return true }
         return true
     }
 
@@ -4432,11 +4969,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// One battery per gauge, with its percentage alongside.
     func gaugeImage(_ gauges: [Gauge]) -> NSImage {
-        let h: CGFloat = 22, bodyH: CGFloat = 12
-        let bodyW: CGFloat = density == .comfortable ? 32 : 26
-        let capExt: CGFloat = 2.5   // gap + cap nub beyond the shell
-        let gap: CGFloat = 4, gaugeGap: CGFloat = 10, pad: CGFloat = 2
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let h: CGFloat = 18, bodyH: CGFloat = 11
+        let bodyW: CGFloat = density == .comfortable ? 28 : 22
+        let capExt: CGFloat = 2.0   // gap + cap nub beyond the shell
+        let gap: CGFloat = 3, gaugeGap: CGFloat = 6, pad: CGFloat = 0
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         let numAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
 
         let items: [(g: Gauge, s: NSAttributedString, w: CGFloat)] = gauges.map { g in
@@ -4464,7 +5001,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func peakLabel(_ gauges: [Gauge]) -> NSAttributedString {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         let used = displayPercent(gauges)
         let shown = batteryDisplayPercent(used)
         return NSAttributedString(string: "\(Int(shown))%",
@@ -4474,10 +5011,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// One rounded column per gauge over a faint full-height track,
     /// with the highest percentage alongside.
     func barsImage(_ gauges: [Gauge]) -> NSImage {
-        let h: CGFloat = 22, chartH: CGFloat = 15
-        let barW: CGFloat = density == .comfortable ? 6.5 : 4.5
-        let barGap: CGFloat = density == .comfortable ? 3 : 2
-        let gap: CGFloat = 4, pad: CGFloat = 2
+        let h: CGFloat = 18, chartH: CGFloat = 13
+        let barW: CGFloat = density == .comfortable ? 5.5 : 4
+        let barGap: CGFloat = density == .comfortable ? 2 : 1.5
+        let gap: CGFloat = 3, pad: CGFloat = 0
         let s = peakLabel(gauges)
         let chartW = barW * CGFloat(gauges.count) + barGap * CGFloat(max(0, gauges.count - 1))
         let total = pad * 2 + chartW + gap + ceil(s.size().width)
@@ -4508,9 +5045,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// stacked top-to-bottom in gauge order, with the highest percentage
     /// alongside. The sideways twin of barsImage.
     func hbarsImage(_ gauges: [Gauge]) -> NSImage {
-        let h: CGFloat = 22, chartH: CGFloat = 16, rowGap: CGFloat = 1.5
-        let trackW: CGFloat = density == .comfortable ? 26 : 18
-        let gap: CGFloat = 4, pad: CGFloat = 2
+        let h: CGFloat = 18, chartH: CGFloat = 14, rowGap: CGFloat = 1.5
+        let trackW: CGFloat = density == .comfortable ? 22 : 16
+        let gap: CGFloat = 3, pad: CGFloat = 0
         let s = peakLabel(gauges)
         let total = pad * 2 + trackW + gap + ceil(s.size().width)
 
@@ -4541,8 +5078,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Concentric activity-style rings, outermost = first gauge, sweeping
     /// clockwise from 12 o'clock, with the highest percentage alongside.
     func ringsImage(_ gauges: [Gauge]) -> NSImage {
-        let h: CGFloat = 22, d: CGFloat = 18, stroke: CGFloat = 2.2, ringGap: CGFloat = 0.6
-        let gap: CGFloat = 4, pad: CGFloat = 2
+        let h: CGFloat = 18, d: CGFloat = 15, stroke: CGFloat = 2.0, ringGap: CGFloat = 0.5
+        let gap: CGFloat = 3, pad: CGFloat = 0
         let s = peakLabel(gauges)
         let total = pad * 2 + d + gap + ceil(s.size().width)
 
@@ -4576,9 +5113,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// All gauges as stacked colour bars inside a single battery shell,
     /// with the highest percentage alongside.
     func consolidatedImage(_ gauges: [Gauge]) -> NSImage {
-        let h: CGFloat = 22, bodyH: CGFloat = 16
-        let bodyW: CGFloat = density == .comfortable ? 34 : 28
-        let capExt: CGFloat = 2.5, gap: CGFloat = 4, pad: CGFloat = 2
+        let h: CGFloat = 18, bodyH: CGFloat = 14
+        let bodyW: CGFloat = density == .comfortable ? 28 : 24
+        let capExt: CGFloat = 2.0, gap: CGFloat = 3, pad: CGFloat = 0
         let s = peakLabel(gauges)
         let total = pad * 2 + bodyW + capExt + gap + ceil(s.size().width)
 
@@ -4602,10 +5139,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-// CLI self-test (no menu UI): prove Closed Lid Mode clamshell assertion + optional Wi‑Fi.
+// CLI self-test: prove Caffeinate Mode keep-awake (+ optional lid-shut / Wi‑Fi).
 //   UsageMonitor.app/Contents/MacOS/UsageMonitor --laptop-mode-self-test
 //   … --laptop-mode-self-test --hotspot "MyPhone"   # also try join
-//   … --laptop-mode-self-test --keep                 # leave mode active (default: clean up)
+//   … --laptop-mode-self-test --keep                 # leave mode active
 if CommandLine.arguments.contains("--laptop-mode-self-test") {
     let lm = LaptopModeController.shared
     let keep = CommandLine.arguments.contains("--keep")
@@ -4614,14 +5151,15 @@ if CommandLine.arguments.contains("--laptop-mode-self-test") {
         lm.favoriteHotspot = CommandLine.arguments[idx + 1]
         lm.joinHotspotOnActivate = true
     } else {
-        // Pure clamshell proof unless a favorite is already configured.
         lm.joinHotspotOnActivate = !lm.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && CommandLine.arguments.contains("--join")
     }
-    lm.clamshellOnActivate = true
-    // Unbuffered so logs stay in order under pipes.
+    if LaptopModeController.isPortableMac {
+        lm.lidShutOnActivate = true
+    }
     setbuf(stdout, nil)
-    print("=== Closed Lid Mode self-test ===")
+    print("=== Caffeinate Mode self-test ===")
+    print("portable:", LaptopModeController.isPortableMac)
     let result = lm.activate()
     print(result.proof)
     print("---")
@@ -4637,29 +5175,31 @@ if CommandLine.arguments.contains("--laptop-mode-self-test") {
         p.waitUntilExit()
         return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     }()
-    let listed = pm.contains("Usage Monitor Closed Lid Mode")
-    print(listed
-        ? "PASS: pmset lists PreventSystemSleep for Usage Monitor Closed Lid Mode"
-        : "FAIL: pmset does not list Usage Monitor Closed Lid Mode assertion")
-    if let line = pm.split(separator: "\n").first(where: { $0.contains("Usage Monitor Closed Lid Mode") }) {
+    let idleOK = pm.contains(LaptopModeController.idleAssertionName) || lm.caffeinateEngaged
+    let lidOK = !LaptopModeController.isPortableMac
+        || !lm.lidShutOnActivate
+        || pm.contains(LaptopModeController.lidAssertionName)
+        || lm.lidShutEngaged
+    print(idleOK
+        ? "PASS: caffeinate keep-awake engaged"
+        : "FAIL: caffeinate keep-awake missing")
+    if let line = pm.split(separator: "\n").first(where: {
+        $0.contains(LaptopModeController.idleAssertionName)
+            || $0.contains(LaptopModeController.lidAssertionName)
+    }) {
         print("  ", line)
     }
-    if lm.clamshellEngaged {
-        print("PASS: in-process assertion held")
-    } else {
-        print("FAIL: in-process assertion not held")
-    }
+    print(lidOK ? "PASS: lid-shut path OK" : "FAIL: lid-shut assertion missing")
     if keep {
-        print("Keeping Closed Lid Mode active (--keep). Quit the app or Turn Off from the menu to release.")
-        // Stay alive holding the assertion.
+        print("Keeping Caffeinate Mode active (--keep).")
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
         app.run()
     } else {
         lm.deactivate()
-        print("Cleaned up (assertion released). Use --keep to leave active.")
-        exit(listed && result.ok ? 0 : 1)
+        print("Cleaned up. Use --keep to leave active.")
+        exit(idleOK && lidOK && result.ok ? 0 : 1)
     }
 }
 
