@@ -11,6 +11,8 @@
 //
 // Build:  ./build.sh      Run:  open UsageMonitor.app
 import AppKit
+import CoreWLAN
+import IOKit.pwr_mgt
 import ServiceManagement
 import Security
 import UserNotifications
@@ -147,6 +149,7 @@ enum WhatsNew {
         case menuBarLayout
         case codexCursor
         case whatsNewPanel
+        case laptopMode
 
         /// First app version that included this surface.
         var introduced: String {
@@ -157,6 +160,7 @@ enum WhatsNew {
             case .menuBarLayout: return "2.0"
             case .codexCursor: return "2.1"
             case .whatsNewPanel: return "2.2"
+            case .laptopMode: return "2.4"
             }
         }
     }
@@ -164,6 +168,16 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.4.1", "Closed Lid Mode & Active AI", [
+            "Closed Lid Mode: amber Active / grey Inactive on the menu row",
+            "Active AI terminals (live only) and Active AI desktops (Claude, ChatGPT, …)",
+            "Hotspot from known networks first; Wi‑Fi scan only after consent (no admin)",
+            "Horizontal bars greyed when more than one menu-bar cluster is shown",
+        ]),
+        ("2.4", "Closed Lid Mode (introduced)", [
+            "Join a favorite hotspot and keep the Mac awake with the lid closed",
+            "No admin password — Location prompt only if you choose to scan Wi‑Fi",
+        ]),
         ("2.3.4", "Terminal sessions reliability", [
             "Sessions appear immediately (Grok first; Claude loads without blocking)",
             "Menu no longer freezes while scanning transcripts",
@@ -1131,6 +1145,10 @@ enum ProcessFocus {
         }
         return false
     }
+
+    /// Public entry for menu actions (desktop AI apps).
+    @discardableResult
+    static func activateBundlePublic(_ id: String) -> Bool { activateBundle(id) }
 
     static func processAlive(_ pid: Int) -> Bool {
         guard pid > 0 else { return false }
@@ -2296,6 +2314,402 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
 // MARK: - App
 
+// MARK: - Closed Lid Mode (favorite hotspot + lid-closed keep-awake)
+
+/// Settings + live state for “Closed Lid Mode”: join a preferred hotspot and hold a
+/// system-sleep assertion so the Mac can keep working with the lid closed.
+///
+/// Security: prefer known/preferred networks and Keychain passwords — never
+/// require an admin password. CoreWLAN scans may prompt for Location (system
+/// dialog); callers must warn the user first.
+///
+/// Clamshell note: Apple’s strongest guarantee for lid-closed operation is
+/// classic clamshell (external display + AC). This mode holds a
+/// `PreventSystemSleep` assertion (and a `caffeinate -s` helper) so the machine
+/// stays awake without an external display when the system allows it. Prefer AC
+/// power; on battery macOS may still sleep on lid close on some models.
+final class LaptopModeController {
+    static let shared = LaptopModeController()
+
+    private let hotspotKey = "laptopMode.favoriteHotspot"
+    private let joinKey = "laptopMode.joinHotspot"
+    private let clamshellKey = "laptopMode.clamshell"
+    private let activeKey = "laptopMode.wasActive"
+    private let keychainService = "com.usagemonitor.app.hotspot"
+
+    private var assertionID: IOPMAssertionID = 0
+    private var assertionHeld = false
+    private var caffeinate: Process?
+    private(set) var lastProof: String = ""
+    private(set) var lastError: String?
+
+    var favoriteHotspot: String {
+        get { UserDefaults.standard.string(forKey: hotspotKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: hotspotKey) }
+    }
+
+    /// Default on so a configured hotspot is used when activating.
+    var joinHotspotOnActivate: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: joinKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: joinKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: joinKey) }
+    }
+
+    /// Default on — keep running with the lid closed.
+    var clamshellOnActivate: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: clamshellKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: clamshellKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: clamshellKey) }
+    }
+
+    var isActive: Bool {
+        get { UserDefaults.standard.bool(forKey: activeKey) }
+        set { UserDefaults.standard.set(newValue, forKey: activeKey) }
+    }
+
+    /// True when a sleep assertion is currently held by this process.
+    var clamshellEngaged: Bool { assertionHeld }
+
+    // MARK: activate / deactivate
+
+    @discardableResult
+    func activate() -> (ok: Bool, proof: String) {
+        lastError = nil
+        var lines: [String] = []
+        var ok = true
+
+        if joinHotspotOnActivate {
+            let ssid = favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
+            if ssid.isEmpty {
+                lines.append("Hotspot: skipped (set a favorite SSID first)")
+            } else {
+                let result = joinWiFi(ssid: ssid)
+                lines.append(result.line)
+                if !result.ok { ok = false; lastError = result.line }
+            }
+        } else {
+            lines.append("Hotspot: skipped (join toggle off)")
+        }
+
+        if clamshellOnActivate {
+            let result = engageClamshell()
+            lines.append(result.line)
+            if !result.ok { ok = false; lastError = result.line }
+        } else {
+            releaseClamshell()
+            lines.append("Clamshell: off (toggle disabled)")
+        }
+
+        // Active if at least one requested action is engaged, or both skipped intentionally.
+        let engaged = (joinHotspotOnActivate && currentSSID() != nil)
+            || (clamshellOnActivate && assertionHeld)
+        isActive = engaged || (ok && (joinHotspotOnActivate || clamshellOnActivate))
+        if !joinHotspotOnActivate && !clamshellOnActivate {
+            isActive = false
+            lines.append("Nothing to do — turn on hotspot join and/or clamshell.")
+            ok = false
+        }
+
+        lines.append(contentsOf: statusSnapshot())
+        lastProof = lines.joined(separator: "\n")
+        NSLog("UsageMonitor Closed Lid Mode activate:\n\(lastProof)")
+        return (ok, lastProof)
+    }
+
+    func deactivate() {
+        releaseClamshell()
+        isActive = false
+        lastProof = (["Closed Lid Mode deactivated.", "Clamshell assertion released."]
+            + statusSnapshot()).joined(separator: "\n")
+        NSLog("UsageMonitor Closed Lid Mode deactivate:\n\(lastProof)")
+    }
+
+    /// Re-assert after relaunch if the user left Closed Lid Mode on.
+    func restoreIfNeeded() {
+        guard isActive else { return }
+        if clamshellOnActivate { _ = engageClamshell() }
+        // Do not force a Wi‑Fi rejoin on every launch — only re-hold sleep.
+    }
+
+    // MARK: Wi‑Fi
+
+    func currentSSID() -> String? {
+        if let s = CWWiFiClient.shared().interface()?.ssid(), !s.isEmpty { return s }
+        // Fallback when CoreWLAN returns nil (common without Location permission).
+        guard let dev = wifiDevice() else { return nil }
+        let out = shell("/usr/sbin/networksetup -getairportnetwork \(dev)")
+        // "Current Wi-Fi Network: Foo" or "You are not associated..."
+        if let r = out.range(of: "Current Wi-Fi Network: ") {
+            let name = String(out[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return name.isEmpty ? nil : name
+        }
+        return nil
+    }
+
+    func wifiDevice() -> String? {
+        let out = shell("/usr/sbin/networksetup -listallhardwareports")
+        var takeNext = false
+        for line in out.components(separatedBy: "\n") {
+            if line.contains("Wi-Fi") || line.contains("AirPort") {
+                takeNext = true
+            } else if takeNext, line.hasPrefix("Device:") {
+                return line.split(separator: " ").last.map(String.init)
+            } else if line.hasPrefix("Hardware Port:") {
+                takeNext = false
+            }
+        }
+        return CWWiFiClient.shared().interface()?.interfaceName
+    }
+
+    /// Networks this Mac already knows (preferred list) — no admin, no Location.
+    func preferredNetworkNames() -> [String] {
+        guard let dev = wifiDevice() else { return [] }
+        let out = shell("/usr/sbin/networksetup -listpreferredwirelessnetworks \(dev)")
+        var names: [String] = []
+        for line in out.components(separatedBy: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty || t.hasPrefix("Preferred networks") { continue }
+            // Lines are typically "\tSSID"
+            names.append(t)
+        }
+        return names
+    }
+
+    /// Nearby SSIDs via CoreWLAN. May trigger Location permission — call only after consent.
+    func scanNearbyNetworkNames() -> [String] {
+        guard let iface = CWWiFiClient.shared().interface() else { return [] }
+        do {
+            let nets = try iface.scanForNetworks(withName: nil)
+            let names = nets.compactMap { $0.ssid }.filter { !$0.isEmpty }
+            return Array(Set(names)).sorted()
+        } catch {
+            NSLog("UsageMonitor Wi‑Fi scan: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    private func joinWiFi(ssid: String) -> (ok: Bool, line: String) {
+        if let cur = currentSSID(), cur.caseInsensitiveCompare(ssid) == .orderedSame {
+            return (true, "Hotspot: already on “\(ssid)”")
+        }
+
+        let password = loadHotspotPassword(for: ssid) ?? ""
+
+        // 1) CoreWLAN associate when we can see the network.
+        if let iface = CWWiFiClient.shared().interface() {
+            do {
+                let networks = try iface.scanForNetworks(withName: ssid)
+                if let net = networks.first {
+                    try iface.associate(to: net, password: password.isEmpty ? nil : password)
+                    Thread.sleep(forTimeInterval: 1.2)
+                    if let cur = currentSSID(), cur.caseInsensitiveCompare(ssid) == .orderedSame {
+                        return (true, "Hotspot: joined “\(ssid)” (CoreWLAN)")
+                    }
+                }
+            } catch {
+                NSLog("UsageMonitor CoreWLAN join: \(error.localizedDescription)")
+            }
+        }
+
+        // 2) networksetup — uses the system preferred-network password when known.
+        guard let dev = wifiDevice() else {
+            return (false, "Hotspot: no Wi‑Fi device found")
+        }
+        let escapedSSID = shellEscape(ssid)
+        let cmd: String
+        if password.isEmpty {
+            cmd = "/usr/sbin/networksetup -setairportnetwork \(dev) \(escapedSSID)"
+        } else {
+            cmd = "/usr/sbin/networksetup -setairportnetwork \(dev) \(escapedSSID) \(shellEscape(password))"
+        }
+        let out = shell(cmd)
+        Thread.sleep(forTimeInterval: 1.5)
+        if let cur = currentSSID(), cur.caseInsensitiveCompare(ssid) == .orderedSame {
+            return (true, "Hotspot: joined “\(ssid)”")
+        }
+        let detail = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if password.isEmpty {
+            return (false, "Hotspot: could not join “\(ssid)” — set the password under Closed Lid Mode"
+                + (detail.isEmpty ? "" : " (\(detail))"))
+        }
+        return (false, "Hotspot: could not join “\(ssid)”"
+            + (detail.isEmpty ? "" : " — \(detail)"))
+    }
+
+    // MARK: clamshell / sleep assertion
+
+    private func engageClamshell() -> (ok: Bool, line: String) {
+        if assertionHeld { return (true, "Clamshell: already holding PreventSystemSleep (#\(assertionID))") }
+
+        var id: IOPMAssertionID = 0
+        // Keep the name short — long / fancy names sometimes don't surface in `pmset -g assertions`.
+        let name = "Usage Monitor Closed Lid Mode" as CFString
+        let status = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventSystemSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            name,
+            &id)
+        guard status == kIOReturnSuccess else {
+            return (false, "Clamshell: failed to create power assertion (IOReturn \(status))")
+        }
+        assertionID = id
+        assertionHeld = true
+        startCaffeinateHelper()
+        return (true, "Clamshell: PreventSystemSleep held (assertion #\(id))")
+    }
+
+    private func releaseClamshell() {
+        stopCaffeinateHelper()
+        if assertionHeld {
+            IOPMAssertionRelease(assertionID)
+            assertionHeld = false
+            assertionID = 0
+        }
+    }
+
+    /// Extra belt-and-braces: `caffeinate -s` prevents idle system sleep (best on AC).
+    private func startCaffeinateHelper() {
+        stopCaffeinateHelper()
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
+        // -s system sleep (strongest on AC), -i idle, -d display, -m disk
+        p.arguments = ["-s", "-i", "-d", "-m"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            caffeinate = p
+        } catch {
+            NSLog("UsageMonitor caffeinate start failed: \(error)")
+            caffeinate = nil
+        }
+    }
+
+    private func stopCaffeinateHelper() {
+        if let p = caffeinate, p.isRunning {
+            p.terminate()
+            p.waitUntilExit()
+        }
+        caffeinate = nil
+    }
+
+    // MARK: proof / status
+
+    func statusSnapshot() -> [String] {
+        var lines: [String] = []
+        lines.append("Mode: \(isActive ? "ACTIVE" : "off")")
+        lines.append("Wi‑Fi now: \(currentSSID() ?? "(not associated)")")
+        if let fav = optionalNonEmpty(favoriteHotspot) {
+            lines.append("Favorite hotspot: \(fav)")
+        } else {
+            lines.append("Favorite hotspot: (not set)")
+        }
+        lines.append("Join on activate: \(joinHotspotOnActivate ? "yes" : "no")")
+        lines.append("Clamshell on activate: \(clamshellOnActivate ? "yes" : "no")")
+        lines.append("Assertion held: \(assertionHeld ? "yes #\(assertionID)" : "no")")
+        if let pid = caffeinate?.processIdentifier {
+            lines.append("caffeinate helper: pid \(pid)")
+        }
+        // Independent system proof via pmset (brief settle so powerd lists us).
+        Thread.sleep(forTimeInterval: 0.35)
+        let pm = shell("/usr/bin/pmset -g assertions")
+        if assertionHeld && pm.contains("Usage Monitor Closed Lid Mode") {
+            lines.append("pmset proof: assertion listed ✓")
+        } else if assertionHeld {
+            lines.append("pmset proof: assertion held in-process (#\(assertionID)); name not yet in pmset")
+        } else if pm.contains("Usage Monitor Closed Lid Mode") {
+            lines.append("pmset: stale name still listed")
+        } else {
+            lines.append("pmset proof: no Laptop Mode assertion")
+        }
+        let batt = shell("/usr/bin/pmset -g batt")
+        if batt.lowercased().contains("ac power") {
+            lines.append("Power: AC (best for lid-closed)")
+        } else if batt.lowercased().contains("battery") {
+            lines.append("Power: Battery (lid-closed may still sleep on some Macs — use AC if you can)")
+        }
+        return lines
+    }
+
+    func refreshProof() -> String {
+        lastProof = statusSnapshot().joined(separator: "\n")
+        return lastProof
+    }
+
+    // MARK: password Keychain (app-scoped; optional)
+
+    func saveHotspotPassword(_ password: String, for ssid: String) {
+        let ssid = ssid.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !ssid.isEmpty else { return }
+        let data = password.data(using: .utf8) ?? Data()
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: ssid,
+        ]
+        SecItemDelete(query as CFDictionary)
+        if password.isEmpty { return }
+        var add = query
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        SecItemAdd(add as CFDictionary, nil)
+    }
+
+    func loadHotspotPassword(for ssid: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: ssid,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let data = item as? Data,
+              let s = String(data: data, encoding: .utf8), !s.isEmpty else { return nil }
+        return s
+    }
+
+    func hasStoredPassword(for ssid: String) -> Bool {
+        loadHotspotPassword(for: ssid) != nil
+    }
+
+    // MARK: helpers
+
+    private func optionalNonEmpty(_ s: String) -> String? {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    private func shellEscape(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func shell(_ cmd: String) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-c", cmd]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do {
+            try p.run()
+            p.waitUntilExit()
+        } catch {
+            return ""
+        }
+        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    }
+
+    deinit {
+        releaseClamshell()
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let statusMenu = NSMenu()    // built once; rebuilt on open via NSMenuDelegate
@@ -2310,6 +2724,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let onboarding = OnboardingController()
     let whatsNew = WhatsNewController()
     let updates = UpdateChecker()
+    let laptopMode = LaptopModeController.shared
     let newsletterURL = URL(string: "https://buttondown.com/jaco")!
     let communityURL = URL(string: "https://github.com/jackfieldman/usage-monitor/discussions")!
     var timer: Timer?
@@ -2401,6 +2816,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.pollCost()
         }
         WhatsNew.recordLaunch()
+        laptopMode.restoreIfNeeded()
         render()
         poll()
         pollSessions()
@@ -3089,6 +3505,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(whatsNewMenuItem())
         menu.addItem(item("Refresh now", #selector(poll), "r"))
 
+        // Closed Lid Mode — favorite hotspot + lid-closed keep-awake.
+        menu.addItem(laptopModeMenuItem())
+
         // Providers — names, letters, what goes in the bar.
         menu.addItem(providersMenuItem())
 
@@ -3107,6 +3526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let shapeItem = NSMenuItem(title: "Icon Shape", action: nil, keyEquivalent: "")
         let shapeMenu = NSMenu()
+        shapeMenu.autoenablesItems = false   // honour isEnabled greying
         let multiCluster = !horizontalBarsAvailable
         for shape in IconShape.allCases {
             let i = NSMenuItem(title: shape.title, action: #selector(pickShape(_:)), keyEquivalent: "")
@@ -3116,11 +3536,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if shape == .hbars && multiCluster {
                 i.isEnabled = false
                 i.state = .off
-                i.toolTip = "Horizontal bars need a single menu-bar cluster. Turn off other providers under Providers → Show in Menu Bar, or use Menu Bar Layout → Highest Only."
+                // Grey title (isEnabled alone is subtle in some themes).
+                let grey = NSColor.secondaryLabelColor.withAlphaComponent(0.55)
+                i.attributedTitle = NSAttributedString(
+                    string: "\(shape.title)  (needs 1 cluster)",
+                    attributes: [
+                        .font: NSFont.menuFont(ofSize: 0),
+                        .foregroundColor: grey,
+                    ])
+                i.toolTip = "Unavailable with multiple menu-bar providers.\nShow only one under Providers → Show in Menu Bar, or use Menu Bar Layout → Highest Only."
             }
             shapeMenu.addItem(i)
         }
-        // If horizontal was selected but is no longer valid, fall back.
         if iconShape == .hbars && multiCluster {
             iconShape = .bars
             render()
@@ -3188,71 +3615,409 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(quit)
     }
 
-    // MARK: activity rows (clickable → terminal / app)
+    // MARK: Closed Lid Mode menu
+
+    /// Warm amber for Active status (not a traffic-light red/green).
+    private var closedLidActiveColor: NSColor {
+        NSColor(srgbRed: 0.95, green: 0.62, blue: 0.18, alpha: 1)
+    }
+
+    func laptopModeMenuItem() -> NSMenuItem {
+        let active = laptopMode.isActive
+        let root = NSMenuItem(title: "Closed Lid Mode", action: nil, keyEquivalent: "")
+        WhatsNew.applyFeatureChip(root, .laptopMode)
+        // Status on the parent row — amber Active / grey Inactive (no hover required).
+        let status = active ? "Active" : "Inactive"
+        let statusColor = active ? closedLidActiveColor : NSColor.secondaryLabelColor.withAlphaComponent(0.7)
+        let attr = NSMutableAttributedString(
+            string: "Closed Lid Mode  ·  ",
+            attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: NSColor.labelColor])
+        attr.append(NSAttributedString(
+            string: status,
+            attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: statusColor]))
+        root.attributedTitle = attr
+        root.toolTip = active
+            ? "Closed Lid Mode is Active — keep-awake (and optional hotspot join) engaged"
+            : "Closed Lid Mode is Inactive"
+
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+
+        let wifi = laptopMode.currentSSID() ?? "not associated"
+        let fav = laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
+        let favLabel = fav.isEmpty ? "(not set)" : fav
+        let statusRow = disabled(active ? "Status: Active" : "Status: Inactive")
+        if active {
+            statusRow.attributedTitle = NSAttributedString(
+                string: "Status: Active",
+                attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: closedLidActiveColor])
+        }
+        sub.addItem(statusRow)
+        sub.addItem(disabled("Wi‑Fi: \(wifi)"))
+        sub.addItem(disabled("Favorite hotspot: \(favLabel)"))
+        sub.addItem(.separator())
+
+        if active {
+            let off = NSMenuItem(title: "Turn Off Closed Lid Mode",
+                                 action: #selector(deactivateLaptopMode), keyEquivalent: "")
+            off.target = self
+            sub.addItem(off)
+        } else {
+            var title = "Turn On Closed Lid Mode"
+            if !fav.isEmpty && laptopMode.joinHotspotOnActivate {
+                title = "Turn On Closed Lid Mode → \(fav)"
+            }
+            let on = NSMenuItem(title: title, action: #selector(activateLaptopMode), keyEquivalent: "l")
+            on.target = self
+            sub.addItem(on)
+        }
+
+        sub.addItem(.separator())
+
+        let join = NSMenuItem(title: "Join favorite hotspot when turning on",
+                              action: #selector(toggleLaptopJoinHotspot), keyEquivalent: "")
+        join.target = self
+        join.state = laptopMode.joinHotspotOnActivate ? .on : .off
+        sub.addItem(join)
+
+        let clamToggle = NSMenuItem(title: "Keep Mac awake with lid closed",
+                                    action: #selector(toggleLaptopClamshell), keyEquivalent: "")
+        clamToggle.target = self
+        clamToggle.state = laptopMode.clamshellOnActivate ? .on : .off
+        clamToggle.toolTip = "Holds a PreventSystemSleep assertion so the Mac can stay awake with the lid closed. AC power recommended. No admin password."
+        sub.addItem(clamToggle)
+
+        sub.addItem(.separator())
+
+        let setHot = NSMenuItem(title: "Choose Favorite Hotspot…",
+                                action: #selector(setFavoriteHotspot), keyEquivalent: "")
+        setHot.target = self
+        setHot.toolTip = "Pick from networks this Mac already knows — no admin rights."
+        sub.addItem(setHot)
+
+        let setPass = NSMenuItem(title: "Set Hotspot Password…",
+                                 action: #selector(setHotspotPassword), keyEquivalent: "")
+        setPass.target = self
+        if !fav.isEmpty && laptopMode.hasStoredPassword(for: fav) {
+            setPass.title = "Set Hotspot Password… (saved)"
+        }
+        setPass.toolTip = "Optional. Stored in Keychain only. Prefer networks already saved in System Settings."
+        sub.addItem(setPass)
+
+        let proof = NSMenuItem(title: "Show Status…",
+                               action: #selector(showLaptopModeProof), keyEquivalent: "")
+        proof.target = self
+        sub.addItem(proof)
+
+        root.submenu = sub
+        return root
+    }
+
+    @objc func activateLaptopMode() {
+        NSApp.activate(ignoringOtherApps: true)
+        // Clear consent before any Wi‑Fi scan/join that might trigger Location.
+        if laptopMode.joinHotspotOnActivate,
+           !laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let warn = NSAlert()
+            warn.messageText = "About to use Wi‑Fi"
+            warn.informativeText = """
+            Closed Lid Mode will try to join your favorite hotspot using only \
+            normal Wi‑Fi APIs (no admin password).
+
+            macOS may show a Location / Wi‑Fi permission prompt so the app can \
+            see or join the network. That is system-controlled — Usage Monitor \
+            does not request elevated admin rights.
+
+            Continue only if you are ready for that system prompt (if it appears).
+            """
+            warn.alertStyle = .informational
+            warn.addButton(withTitle: "Continue")
+            warn.addButton(withTitle: "Cancel")
+            guard warn.runModal() == .alertFirstButtonReturn else { return }
+        }
+        let result = laptopMode.activate()
+        let alert = NSAlert()
+        alert.messageText = result.ok ? "Closed Lid Mode is Active" : "Closed Lid Mode — check details"
+        alert.informativeText = result.proof
+        alert.alertStyle = result.ok ? .informational : .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+        render()
+    }
+
+    @objc func deactivateLaptopMode() {
+        laptopMode.deactivate()
+        let alert = NSAlert()
+        alert.messageText = "Closed Lid Mode is Inactive"
+        alert.informativeText = laptopMode.lastProof
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+        render()
+    }
+
+    @objc func toggleLaptopJoinHotspot() {
+        laptopMode.joinHotspotOnActivate.toggle()
+    }
+
+    @objc func toggleLaptopClamshell() {
+        laptopMode.clamshellOnActivate.toggle()
+        if laptopMode.isActive { _ = laptopMode.activate() }
+    }
+
+    @objc func setFavoriteHotspot() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        // Prefer known networks (no admin, no Location). Optional scan after consent.
+        var names = laptopMode.preferredNetworkNames()
+        if let cur = laptopMode.currentSSID(), !names.contains(where: { $0.caseInsensitiveCompare(cur) == .orderedSame }) {
+            names.insert(cur, at: 0)
+        }
+
+        let askScan = NSAlert()
+        askScan.messageText = "Choose favorite hotspot"
+        askScan.informativeText = """
+        Pick a network this Mac already knows (recommended — no admin rights).
+
+        Or scan for nearby networks: macOS may then ask for Location access so \
+        Wi‑Fi names can be listed. We will not request an admin password.
+        """
+        askScan.addButton(withTitle: "Pick from known networks")
+        askScan.addButton(withTitle: "Scan nearby…")
+        askScan.addButton(withTitle: "Type name…")
+        askScan.addButton(withTitle: "Cancel")
+        let pick = askScan.runModal()
+        if pick == .alertThirdButtonReturn {
+            // Type name
+            let alert = NSAlert()
+            alert.messageText = "Hotspot name (SSID)"
+            alert.informativeText = "Exact Wi‑Fi name. Prefer a network already saved in System Settings."
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+            field.stringValue = laptopMode.favoriteHotspot
+            field.placeholderString = "e.g. iPhone hotspot name"
+            alert.accessoryView = field
+            alert.addButton(withTitle: "Save")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            laptopMode.favoriteHotspot = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            return
+        }
+        if pick == .alertSecondButtonReturn {
+            // Explicit consent before CoreWLAN scan (Location).
+            let consent = NSAlert()
+            consent.messageText = "Allow Wi‑Fi scan?"
+            consent.informativeText = """
+            Next, the app will scan for nearby Wi‑Fi networks using CoreWLAN.
+
+            macOS may show a system Location permission dialog. That is required \
+            by Apple to read SSIDs — not an admin password. You can Deny and \
+            still pick from known networks.
+            """
+            consent.addButton(withTitle: "Scan")
+            consent.addButton(withTitle: "Cancel")
+            guard consent.runModal() == .alertFirstButtonReturn else { return }
+            let scanned = laptopMode.scanNearbyNetworkNames()
+            for s in scanned where !names.contains(where: { $0.caseInsensitiveCompare(s) == .orderedSame }) {
+                names.append(s)
+            }
+        } else if pick != .alertFirstButtonReturn {
+            return
+        }
+
+        guard !names.isEmpty else {
+            let empty = NSAlert()
+            empty.messageText = "No known networks found"
+            empty.informativeText = "Join a hotspot once in System Settings, or use “Type name…”."
+            empty.addButton(withTitle: "OK")
+            empty.runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Favorite hotspot"
+        alert.informativeText = "Networks known to this Mac (and any just scanned). No admin rights."
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26))
+        for n in names { popup.addItem(withTitle: n) }
+        let favNow = laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !favNow.isEmpty,
+           let idx = names.firstIndex(where: { $0.caseInsensitiveCompare(favNow) == .orderedSame }) {
+            popup.selectItem(at: idx)
+        }
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        laptopMode.favoriteHotspot = popup.titleOfSelectedItem ?? ""
+    }
+
+    @objc func setHotspotPassword() {
+        var ssid = laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ssid.isEmpty {
+            setFavoriteHotspot()
+            ssid = laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !ssid.isEmpty else { return }
+        }
+        let alert = NSAlert()
+        alert.messageText = "Hotspot password"
+        alert.informativeText = "Optional. Stored only in your Keychain for “\(ssid)”. Networks already saved in System Settings often work without this. No admin rights."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.placeholderString = "Wi‑Fi password"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        laptopMode.saveHotspotPassword(field.stringValue, for: ssid)
+    }
+
+    @objc func showLaptopModeProof() {
+        let proof = laptopMode.refreshProof()
+        let alert = NSAlert()
+        alert.messageText = "Closed Lid Mode status"
+        alert.informativeText = proof
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Copy")
+        NSApp.activate(ignoringOtherApps: true)
+        let resp = alert.runModal()
+        if resp == .alertSecondButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(proof, forType: .string)
+        }
+    }
+
+    // MARK: Active AI (terminals + desktops)
+
+    /// Desktop AI apps we can detect as running (no admin).
+    private static let desktopAIApps: [(name: String, bundleIds: [String], letter: String)] = [
+        ("Claude", ["com.anthropic.claudefordesktop"], "C"),
+        ("ChatGPT", ["com.openai.chat", "com.openai.chat-macos"], "GPT"),
+        ("Codex", ["com.openai.codex"], "X"),
+        ("Cursor", ["com.todesktop.230313mzl4w4u92", "com.cursor.Cursor", "com.anysphere.cursor"], "U"),
+    ]
+
+    struct DesktopAIApp {
+        let name: String
+        let letter: String
+        let bundleId: String
+        let pid: Int
+    }
+
+    func runningDesktopAI() -> [DesktopAIApp] {
+        var out: [DesktopAIApp] = []
+        for app in Self.desktopAIApps {
+            for bid in app.bundleIds {
+                let running = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+                if let r = running.first, r.processIdentifier > 0 {
+                    out.append(DesktopAIApp(name: app.name, letter: app.letter,
+                                            bundleId: bid, pid: Int(r.processIdentifier)))
+                    break
+                }
+            }
+        }
+        // Also match by app name for ChatGPT.app branded as codex bundle.
+        if !out.contains(where: { $0.name == "ChatGPT" }) {
+            for r in NSWorkspace.shared.runningApplications {
+                let n = (r.localizedName ?? "").lowercased()
+                if n == "chatgpt" || n.contains("chatgpt") {
+                    out.append(DesktopAIApp(name: "ChatGPT", letter: "GPT",
+                                            bundleId: r.bundleIdentifier ?? "",
+                                            pid: Int(r.processIdentifier)))
+                    break
+                }
+            }
+        }
+        return out
+    }
 
     func addActivitySection(to menu: NSMenu) {
-        let liveCount = activity.filter(\.live).count
-        if activity.isEmpty {
+        // Only *live* AI processes — terminals + desktops.
+        let liveTerms = activity.filter(\.live)
+        let desktops = runningDesktopAI()
+        let liveCount = liveTerms.count + desktops.count
+
+        if liveCount == 0 {
             if activityScanCompleted {
-                let none = disabled("Terminal sessions  ·  none right now")
+                let none = disabled("Active AI  ·  none right now")
                 WhatsNew.applyFeatureChip(none, .terminalSessions)
                 menu.addItem(none)
-                menu.addItem(disabled("  Run claude / grok in a terminal, then reopen"))
             } else {
-                let scan = disabled("Terminal sessions  ·  scanning…")
+                let scan = disabled("Active AI  ·  scanning…")
                 WhatsNew.applyFeatureChip(scan, .terminalSessions)
                 menu.addItem(scan)
             }
             return
         }
-        let head = liveCount > 0
-            ? "Terminal sessions  ·  \(liveCount) live  ·  click to open"
-            : "Terminal sessions  ·  click to open"
-        let headerItem = disabled(head)
-        WhatsNew.applyFeatureChip(headerItem, .terminalSessions)
-        menu.addItem(headerItem)
 
-        var seenProviders: [String] = []
-        for s in activity {
-            if !seenProviders.contains(s.providerId) { seenProviders.append(s.providerId) }
-        }
-        let byProvider = Dictionary(grouping: activity, by: \.providerId)
-        for pid in seenProviders {
-            guard let rows = byProvider[pid], let first = rows.first else { continue }
-            menu.addItem(disabled("  \(first.providerLetter):  \(first.providerName)"))
-            // Live first, then recent — cap so the menu stays usable.
-            let ordered = rows.sorted {
-                if $0.live != $1.live { return $0.live && !$1.live }
-                return $0.lastActivity > $1.lastActivity
+        var summary = "Active AI"
+        var bits: [String] = []
+        if !liveTerms.isEmpty { bits.append("\(liveTerms.count) terminal") }
+        if !desktops.isEmpty { bits.append("\(desktops.count) desktop") }
+        if !bits.isEmpty { summary += "  ·  " + bits.joined(separator: "  ·  ") }
+
+        let root = NSMenuItem(title: summary, action: nil, keyEquivalent: "")
+        WhatsNew.applyFeatureChip(root, .terminalSessions)
+        root.toolTip = "Live AI terminals and desktop apps — click a row to open."
+        root.image = dotImage(levelColor(0))
+
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+
+        // —— Terminals ——
+        if !liveTerms.isEmpty {
+            sub.addItem(disabled("Active AI terminals  ·  click to open"))
+            var seenProviders: [String] = []
+            for s in liveTerms {
+                if !seenProviders.contains(s.providerId) { seenProviders.append(s.providerId) }
             }
-            let shown = ordered.prefix(8)
-            for s in shown {
-                menu.addItem(activityMenuItem(s))
+            let byProvider = Dictionary(grouping: liveTerms, by: \.providerId)
+            for pid in seenProviders {
+                guard let rows = byProvider[pid], let first = rows.first else { continue }
+                sub.addItem(disabled("  \(first.providerLetter):  \(first.providerName)"))
+                let ordered = rows.sorted { $0.lastActivity > $1.lastActivity }
+                for s in ordered.prefix(10) {
+                    sub.addItem(activityMenuItem(s))
+                }
+                if ordered.count > 10 {
+                    sub.addItem(disabled("  +\(ordered.count - 10) more"))
+                }
             }
-            let remaining = ordered.count - shown.count
-            if remaining > 0 { menu.addItem(disabled("  +\(remaining) more")) }
         }
+
+        // —— Desktops ——
+        if !desktops.isEmpty {
+            if !liveTerms.isEmpty { sub.addItem(.separator()) }
+            sub.addItem(disabled("Active AI desktops  ·  click to open"))
+            for d in desktops {
+                let i = NSMenuItem(
+                    title: "\(d.letter)  \(d.name)  —  Live",
+                    action: #selector(openDesktopAI(_:)),
+                    keyEquivalent: "")
+                i.target = self
+                i.representedObject = d.bundleId.isEmpty ? d.name : d.bundleId
+                i.isEnabled = true
+                i.image = dotImage(levelColor(0))
+                i.toolTip = "Bring \(d.name) to the front"
+                sub.addItem(i)
+            }
+        }
+
+        root.submenu = sub
+        menu.addItem(root)
     }
 
     func activityMenuItem(_ s: ActivitySession) -> NSMenuItem {
-        let when = s.live ? "Live" : relative(s.lastActivity)
+        let working = (s.title?.isEmpty == false) ? s.title! : s.project
+        let shortWork = working.count > 48 ? String(working.prefix(46)) + "…" : working
         var path = s.branch.map { "\(s.project) · \($0)" } ?? s.project
         if let model = s.model, !model.isEmpty { path += "  ·  \(model)" }
-        var meta = "\(path)  ·  \(when)"
-        if let tin = s.tokensIn, let tout = s.tokensOut {
-            meta += "  ·  ↑\(abbreviateTokens(tin)) ↓\(abbreviateTokens(tout))"
-        }
-        let working = (s.title?.isEmpty == false) ? s.title! : s.project
-        // Keep short so the menu stays snappy; full detail in tooltip.
-        let shortWork = working.count > 42 ? String(working.prefix(40)) + "…" : working
-        let title = "\(s.providerLetter)  \(shortWork)  —  \(meta)"
+        let title = "\(s.providerLetter)  \(shortWork)  —  \(path)  ·  Live"
 
         let i = NSMenuItem(title: title, action: #selector(openActivity(_:)), keyEquivalent: "")
         i.target = self
         i.representedObject = ActivitySessionBox(s)
         i.isEnabled = true
-        i.image = dotImage(s.live ? levelColor(0) : NSColor.tertiaryLabelColor)
-        var tip = "Open terminal / app for this session"
+        i.image = dotImage(levelColor(0))
+        var tip = "Open terminal for this AI session"
         if let pid = s.pid { tip += "\npid \(pid)" }
         if let tty = s.tty, tty != "??" { tip += "  ·  \(tty)" }
         if let cwd = s.cwd { tip += "\n\(cwd)" }
@@ -3274,10 +4039,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let kind = providerConfigs.first(where: { $0.id == s.providerId })?.kind
             ?? ProviderKind(rawValue: s.providerId) ?? .claude
-        NSLog("UsageMonitor: openActivity kind=\(kind.rawValue) pid=\(s.pid.map(String.init) ?? "-") tty=\(s.tty ?? "-") cwd=\(s.cwd ?? "-")")
-        // Cancel menu tracking, then focus after a beat (see ProcessFocus.open delay).
+        NSLog("UsageMonitor: openActivity kind=\(kind.rawValue) pid=\(s.pid.map(String.init) ?? "-") tty=\(s.tty ?? "-")")
         DispatchQueue.global(qos: .userInitiated).async {
             ProcessFocus.open(pid: s.pid, tty: s.tty, cwd: s.cwd, providerKind: kind)
+        }
+    }
+
+    @objc func openDesktopAI(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            if key.contains(".") {
+                // Bundle id
+                if ProcessFocus.activateBundlePublic(key) { return }
+            }
+            // Fallback by name
+            for r in NSWorkspace.shared.runningApplications {
+                if (r.localizedName ?? "").localizedCaseInsensitiveContains(key)
+                    || (r.bundleIdentifier ?? "") == key {
+                    NSApp.activate(ignoringOtherApps: true)
+                    if #available(macOS 14.0, *) {
+                        r.activate(from: NSRunningApplication.current)
+                    } else {
+                        r.activate(options: [.activateAllWindows])
+                    }
+                    return
+                }
+            }
+            NSSound.beep()
         }
     }
 
@@ -3811,6 +4599,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             s.draw(at: NSPoint(x: body.maxX + capExt + gap, y: sy))
             return true
         }
+    }
+}
+
+// CLI self-test (no menu UI): prove Closed Lid Mode clamshell assertion + optional Wi‑Fi.
+//   UsageMonitor.app/Contents/MacOS/UsageMonitor --laptop-mode-self-test
+//   … --laptop-mode-self-test --hotspot "MyPhone"   # also try join
+//   … --laptop-mode-self-test --keep                 # leave mode active (default: clean up)
+if CommandLine.arguments.contains("--laptop-mode-self-test") {
+    let lm = LaptopModeController.shared
+    let keep = CommandLine.arguments.contains("--keep")
+    if let idx = CommandLine.arguments.firstIndex(of: "--hotspot"),
+       idx + 1 < CommandLine.arguments.count {
+        lm.favoriteHotspot = CommandLine.arguments[idx + 1]
+        lm.joinHotspotOnActivate = true
+    } else {
+        // Pure clamshell proof unless a favorite is already configured.
+        lm.joinHotspotOnActivate = !lm.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && CommandLine.arguments.contains("--join")
+    }
+    lm.clamshellOnActivate = true
+    // Unbuffered so logs stay in order under pipes.
+    setbuf(stdout, nil)
+    print("=== Closed Lid Mode self-test ===")
+    let result = lm.activate()
+    print(result.proof)
+    print("---")
+    Thread.sleep(forTimeInterval: 0.4)
+    let pm: String = {
+        let p = Process()
+        p.launchPath = "/usr/bin/pmset"
+        p.arguments = ["-g", "assertions"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        p.launch()
+        p.waitUntilExit()
+        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    }()
+    let listed = pm.contains("Usage Monitor Closed Lid Mode")
+    print(listed
+        ? "PASS: pmset lists PreventSystemSleep for Usage Monitor Closed Lid Mode"
+        : "FAIL: pmset does not list Usage Monitor Closed Lid Mode assertion")
+    if let line = pm.split(separator: "\n").first(where: { $0.contains("Usage Monitor Closed Lid Mode") }) {
+        print("  ", line)
+    }
+    if lm.clamshellEngaged {
+        print("PASS: in-process assertion held")
+    } else {
+        print("FAIL: in-process assertion not held")
+    }
+    if keep {
+        print("Keeping Closed Lid Mode active (--keep). Quit the app or Turn Off from the menu to release.")
+        // Stay alive holding the assertion.
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
+    } else {
+        lm.deactivate()
+        print("Cleaned up (assertion released). Use --keep to leave active.")
+        exit(listed && result.ok ? 0 : 1)
     }
 }
 

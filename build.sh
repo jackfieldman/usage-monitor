@@ -14,7 +14,8 @@ MACOS="$APP/Contents/MacOS"
 RES="$APP/Contents/Resources"
 mkdir -p "$MACOS" "$RES"
 
-swiftc -O UsageMonitor.swift -o "$MACOS/UsageMonitor" -framework AppKit
+swiftc -O UsageMonitor.swift -o "$MACOS/UsageMonitor" \
+    -framework AppKit -framework CoreWLAN -framework IOKit
 
 # App icon — used by Finder, the Dock, and macOS notifications.
 cp AppIcon.icns "$RES/AppIcon.icns"
@@ -29,12 +30,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>      <string>com.usagemonitor.app</string>
     <key>CFBundleExecutable</key>      <string>UsageMonitor</string>
     <key>CFBundleIconFile</key>        <string>AppIcon</string>
-    <key>CFBundleVersion</key>         <string>2.3.7</string>
-    <key>CFBundleShortVersionString</key> <string>2.3.7</string>
+    <key>CFBundleVersion</key>         <string>2.4.1</string>
+    <key>CFBundleShortVersionString</key> <string>2.4.1</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>NSPrincipalClass</key>        <string>NSApplication</string>
     <key>LSUIElement</key>             <true/>
     <key>LSMinimumSystemVersion</key>  <string>13.0</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Usage Monitor uses Wi‑Fi access for Laptop Mode (join your favorite hotspot). Location permission is required by macOS to read and join networks.</string>
+    <key>NSLocationUsageDescription</key>
+    <string>Usage Monitor uses Wi‑Fi access for Laptop Mode (join your favorite hotspot). Location permission is required by macOS to read and join networks.</string>
 </dict>
 </plist>
 PLIST

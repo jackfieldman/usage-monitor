@@ -8,6 +8,15 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.4.1
+
+- **Closed Lid Mode** (was Laptop Mode): parent row shows warm amber **Active**
+  or grey **Inactive**. Favorite hotspot from known networks first (no admin);
+  nearby Wi‑Fi scan only after an explicit Location consent alert.
+- **Active AI** menu: **Active AI terminals** (live only) + **Active AI
+  desktops** (Claude, ChatGPT, Codex, Cursor when running).
+- **Horizontal bars** greyed with “(needs 1 cluster)” when multi-provider.
+
 ## 2.3.7
 
 - **Click terminal session works reliably.** Prefer Terminal tab by TTY (not
