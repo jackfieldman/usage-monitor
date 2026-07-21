@@ -1085,7 +1085,7 @@ enum ProcessFocus {
     }
 
     static func cwdOf(pid: Int) -> String? {
-        // macOS: lsof -a -p PID -d cwd -Fn
+        // macOS: lsof -a -p PID -d cwd -Fn  (slow if called per-pid — prefer indexCLI)
         let (status, text) = runTool("/usr/sbin/lsof", ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"])
         guard status == 0 else { return nil }
         for line in text.split(separator: "\n") where line.hasPrefix("n") {
@@ -1095,19 +1095,37 @@ enum ProcessFocus {
     }
 
     /// Index of live CLI processes: name → [(pid, tty, cwd)].
+    /// Uses one `ps` + one `lsof` per command name (never per-PID lsof storms).
     static func indexCLI(names: [String]) -> [(name: String, pid: Int, tty: String, cwd: String)] {
         let (status, text) = runTool("/bin/ps", ["-axo", "pid=,tty=,comm="])
         guard status == 0 else { return [] }
-        var out: [(String, Int, String, String)] = []
+        var byPid: [Int: (name: String, tty: String)] = [:]
         for line in text.split(separator: "\n") {
             let parts = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
             guard parts.count >= 3, let pid = Int(parts[0]) else { continue }
             let comm = (parts[2] as NSString).lastPathComponent
             guard names.contains(comm) else { continue }
-            let cwd = cwdOf(pid: pid) ?? ""
-            out.append((comm, pid, parts[1], cwd))
+            byPid[pid] = (comm, parts[1])
         }
-        return out
+        guard !byPid.isEmpty else { return [] }
+
+        // Batch cwd lookup: one lsof invocation per command name.
+        var cwdByPid: [Int: String] = [:]
+        for name in names {
+            let (st, out) = runTool("/usr/sbin/lsof", ["-a", "-c", name, "-d", "cwd", "-Fn"])
+            guard st == 0 else { continue }
+            var curPid: Int?
+            for line in out.split(separator: "\n") {
+                if line.hasPrefix("p"), let p = Int(line.dropFirst()) { curPid = p }
+                else if line.hasPrefix("n"), let p = curPid {
+                    cwdByPid[p] = String(line.dropFirst())
+                }
+            }
+        }
+
+        return byPid.map { pid, meta in
+            (meta.name, pid, meta.tty, cwdByPid[pid] ?? "")
+        }
     }
 }
 
@@ -1746,11 +1764,12 @@ final class GrokActivityMonitor {
                     ?? (summary["generated_title"] as? String)
                 title = raw.map(ClaudeActivityMonitor.shorten)
             }
-            // Resolve TTY from the live PID so click can select the Terminal tab.
+            // TTY from a single cheap `ps -p` (not a full process table walk).
             var tty: String?
-            if let pid, live, let info = ProcessFocus.procInfo(pid) {
-                tty = info.tty == "??" ? nil : info.tty
+            if let pid, live, let info = ProcessFocus.procInfo(pid), info.tty != "??" {
+                tty = info.tty
             }
+            // Always keep live processes; recent idle only within the window.
             guard live || last > cutoff else { continue }
             out.append(ActivitySession(
                 id: id,
@@ -2258,7 +2277,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.poll()
         }
-        sessionTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+        // Activity cache — keep warm so the menu never blocks on scan.
+        sessionTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.pollSessions()
         }
         if !anyProviderSignedIn() { onboarding.present() }
@@ -2266,6 +2286,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openSetup() { onboarding.present() }
 
+    /// Background-only. Never call from menuNeedsUpdate (that freezes the menu
+    /// tracking loop and steals the keyboard until the scan finishes).
     func pollSessions() {
         let configs = providerConfigs
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -2275,8 +2297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Blocking activity scan (call off main when possible). Used by the timer
-    /// and again when the menu opens so rows are never stale/missing.
+    /// Blocking activity scan — **off the main thread only**.
     func scanActivity(configs: [ProviderConfig]? = nil) -> [ActivitySession] {
         let configs = configs ?? providerConfigs
         var rows: [ActivitySession] = []
@@ -2289,6 +2310,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         return rows.sorted { $0.lastActivity > $1.lastActivity }
+    }
+
+    /// Kick a background refresh when the menu is about to open — do not wait.
+    func menuWillOpen(_ menu: NSMenu) {
+        pollSessions()
     }
 
     @objc func poll() {
@@ -2822,18 +2848,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: menu
 
-    /// Rebuilt each time the menu opens — the checkmarks and dynamic text stay
-    /// current without render() reconstructing the menu on every poll.
+    /// Rebuilt each time the menu opens — uses **cached** activity only.
+    /// Heavy scans run in the background (pollSessions / menuWillOpen).
     func menuNeedsUpdate(_ menu: NSMenu) {
-        // Fresh activity every open so terminal links aren't empty/stale.
-        activity = scanActivity()
         menu.removeAllItems()
+
+        // —— Terminal / CLI sessions first (what you click to jump) ——
+        addActivitySection(to: menu)
+
+        // —— Usage gauges ——
         if providerGauges.isEmpty, let err = lastError {
+            menu.addItem(.separator())
             menu.addItem(disabled("⚠︎  \(err)"))
             if err.lowercased().contains("signed") {
                 menu.addItem(disabled("Sign in to a provider, then Refresh."))
             }
-        } else {
+        } else if !providerGauges.isEmpty {
+            menu.addItem(.separator())
             for (idx, group) in providerGauges.enumerated() {
                 if idx > 0 { menu.addItem(.separator()) }
                 let header = "\(group.config.letter):  \(group.config.displayName)"
@@ -2845,7 +2876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     menu.addItem(row)
                 }
             }
-            if let err = lastError, !providerGauges.isEmpty {
+            if let err = lastError {
                 menu.addItem(disabled("⚠︎  \(err) (showing last good data)"))
             }
         }
@@ -2858,29 +2889,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                                         : "⚠︎  \(err) (showing last good data)"))
             } else if monthSpend == nil {
                 menu.addItem(disabled("Loading…"))
-            }
-        }
-
-        // Activity — clickable rows open Terminal tab / host app.
-        menu.addItem(.separator())
-        if activity.isEmpty {
-            menu.addItem(disabled("Activity  ·  no live sessions"))
-        } else {
-            menu.addItem(disabled("Activity  ·  click a row to open its terminal"))
-            var seenProviders: [String] = []
-            for s in activity {
-                if !seenProviders.contains(s.providerId) { seenProviders.append(s.providerId) }
-            }
-            let byProvider = Dictionary(grouping: activity, by: \.providerId)
-            for pid in seenProviders {
-                guard let rows = byProvider[pid], let first = rows.first else { continue }
-                menu.addItem(disabled("\(first.providerLetter):  \(first.providerName)"))
-                let shown = rows.prefix(6)
-                for s in shown {
-                    menu.addItem(activityMenuItem(s))
-                }
-                let remaining = rows.count - shown.count
-                if remaining > 0 { menu.addItem(disabled("+\(remaining) more")) }
             }
         }
 
@@ -2975,36 +2983,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(quit)
     }
 
-    // MARK: activity rows (clickable, two-tone)
+    // MARK: activity rows (clickable → terminal / app)
 
-    /// Dark title (currently working on) + light subline (project · branch · time · tokens).
-    /// Clickable — jumps to that session’s Terminal tab / host app.
+    func addActivitySection(to menu: NSMenu) {
+        let liveCount = activity.filter(\.live).count
+        if activity.isEmpty {
+            menu.addItem(disabled("Terminal sessions  ·  scanning…"))
+            menu.addItem(disabled("  (opens in a few seconds after launch)"))
+            return
+        }
+        let head = liveCount > 0
+            ? "Terminal sessions  ·  \(liveCount) live  ·  click to open"
+            : "Terminal sessions  ·  click to open"
+        menu.addItem(disabled(head))
+
+        var seenProviders: [String] = []
+        for s in activity {
+            if !seenProviders.contains(s.providerId) { seenProviders.append(s.providerId) }
+        }
+        let byProvider = Dictionary(grouping: activity, by: \.providerId)
+        for pid in seenProviders {
+            guard let rows = byProvider[pid], let first = rows.first else { continue }
+            menu.addItem(disabled("  \(first.providerLetter):  \(first.providerName)"))
+            // Live first, then recent — cap so the menu stays usable.
+            let ordered = rows.sorted {
+                if $0.live != $1.live { return $0.live && !$1.live }
+                return $0.lastActivity > $1.lastActivity
+            }
+            let shown = ordered.prefix(8)
+            for s in shown {
+                menu.addItem(activityMenuItem(s))
+            }
+            let remaining = ordered.count - shown.count
+            if remaining > 0 { menu.addItem(disabled("  +\(remaining) more")) }
+        }
+    }
+
     func activityMenuItem(_ s: ActivitySession) -> NSMenuItem {
         let when = s.live ? "Live" : relative(s.lastActivity)
         var path = s.branch.map { "\(s.project) · \($0)" } ?? s.project
         if let model = s.model, !model.isEmpty { path += "  ·  \(model)" }
-        var meta = "\(path)  —  \(when)"
+        var meta = "\(path)  ·  \(when)"
         if let tin = s.tokensIn, let tout = s.tokensOut {
-            meta += "  ·  sent \(abbreviateTokens(tin)) · recv \(abbreviateTokens(tout))"
+            meta += "  ·  ↑\(abbreviateTokens(tin)) ↓\(abbreviateTokens(tout))"
         }
-
-        // Single-line title stays reliably clickable in NSMenu (multi-line
-        // attributed titles often look disabled / hard to hit).
         let working = (s.title?.isEmpty == false) ? s.title! : s.project
-        let title = "\(s.providerLetter): \(working)  —  \(meta)"
+        // Keep short so the menu stays snappy; full detail in tooltip.
+        let shortWork = working.count > 42 ? String(working.prefix(40)) + "…" : working
+        let title = "\(s.providerLetter)  \(shortWork)  —  \(meta)"
 
         let i = NSMenuItem(title: title, action: #selector(openActivity(_:)), keyEquivalent: "")
         i.target = self
-        // Must be a class — struct as representedObject fails the cast on click.
         i.representedObject = ActivitySessionBox(s)
         i.isEnabled = true
         i.image = dotImage(s.live ? levelColor(0) : NSColor.tertiaryLabelColor)
-        var tip = s.live
-            ? "Click to open this session’s terminal / app"
-            : "Click to open host app or project folder"
-        if let pid = s.pid { tip += "  ·  pid \(pid)" }
+        var tip = "Open terminal / app for this session"
+        if let pid = s.pid { tip += "\npid \(pid)" }
         if let tty = s.tty, tty != "??" { tip += "  ·  \(tty)" }
         if let cwd = s.cwd { tip += "\n\(cwd)" }
+        if let t = s.title { tip += "\n\(t)" }
         i.toolTip = tip
         return i
     }
@@ -3020,11 +3057,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         let kind = providerConfigs.first(where: { $0.id == s.providerId })?.kind ?? .claude
-        NSLog("UsageMonitor: openActivity \(kind.rawValue) pid=\(s.pid.map(String.init) ?? "nil") tty=\(s.tty ?? "nil") cwd=\(s.cwd ?? "nil")")
-        // ps/lsof on a background queue; ProcessFocus hops to main for activate/AppleScript.
+        // Never block the menu-tracking thread.
         DispatchQueue.global(qos: .userInitiated).async {
             ProcessFocus.open(pid: s.pid, tty: s.tty, cwd: s.cwd, providerKind: kind)
         }
+    }
+
+    /// Keep activity actions enabled even when the app is inactive.
+    @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(openActivity(_:)) { return true }
+        return true
     }
 
     // MARK: providers menu

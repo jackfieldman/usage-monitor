@@ -3,13 +3,21 @@
 All notable changes to Usage Monitor are recorded here. Versions follow the
 `CFBundleShortVersionString` in `build.sh`.
 
+## 2.3.2
+
+- **Menu freeze / keyboard capture fixed.** Opening the menu no longer runs a
+  heavy activity scan on the main thread (that blocked menu tracking). Scans
+  stay in the background; the menu uses a warm cache.
+- **Terminal sessions at the top** of the menu again — “Terminal sessions ·
+  click to open” with live Grok/Claude rows first.
+
 ## 2.3.1
 
 - **Icon Shape works again** with multi-provider letter badges (bars / horizontal
   / rings / battery each draw next to `G:` / `C:`).
 - **Activity / terminal links fixed.** Grok session PIDs were lost to JSON
   `NSNumber` casting, so the activity section looked empty. Rows are back;
-  click opens the Terminal tab. Menu refreshes activity on every open.
+  click opens the Terminal tab.
 
 ## 2.3
 
