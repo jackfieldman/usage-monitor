@@ -1113,6 +1113,11 @@ final class ClaudeActivityMonitor {
     private let liveWindow: TimeInterval = 5 * 60
     private let root = URL(fileURLWithPath: NSHomeDirectory() + "/.claude/projects")
 
+    /// Max bytes to read on first sight of a huge transcript (metadata lives in recent lines).
+    private let bootstrapTail: UInt64 = 256 * 1024
+    /// Don't open more than this many recent files per scan (menu stays snappy).
+    private let maxFilesPerScan = 40
+
     /// Blocking; call off the main thread. `config` supplies letter/name for rows.
     func scan(config: ProviderConfig) -> [ActivitySession] {
         let fm = FileManager.default
@@ -1120,7 +1125,7 @@ final class ClaudeActivityMonitor {
             return []
         }
         let cutoff = Date().addingTimeInterval(-recentWindow)
-        var seen = Set<String>()
+        var candidates: [(url: URL, mtime: Date)] = []
 
         for dir in projectDirs {
             guard let files = try? fm.contentsOfDirectory(
@@ -1128,16 +1133,32 @@ final class ClaudeActivityMonitor {
             for file in files where file.pathExtension == "jsonl" {
                 guard let mtime = try? file.resourceValues(forKeys: [.contentModificationDateKey])
                     .contentModificationDate, mtime > cutoff else { continue }
-                seen.insert(file.path)
-                update(file)
+                candidates.append((file, mtime))
             }
         }
-        cache = cache.filter { seen.contains($0.key) }
+        // Newest first; hard cap so a cluttered ~/.claude never freezes the scanner.
+        candidates.sort { $0.mtime > $1.mtime }
+        if candidates.count > maxFilesPerScan {
+            candidates = Array(candidates.prefix(maxFilesPerScan))
+        }
+        var seen = Set<String>()
+        for item in candidates {
+            seen.insert(item.url.path)
+            update(item.url)
+        }
+        cache = cache.filter { seen.contains($0.key) || $0.value.lastActivity > cutoff }
 
-        // Match live `claude` processes by cwd so rows can open the right TTY.
+        // Match live `claude` processes by cwd (one batched lsof).
         let liveProcs = ProcessFocus.indexCLI(names: ["claude"])
 
-        return cache.map { path, c -> ActivitySession in
+        return cache.compactMap { path, c -> ActivitySession? in
+            guard c.lastActivity > cutoff || liveProcs.contains(where: { proc in
+                guard !c.cwd.isEmpty, !proc.cwd.isEmpty else { return false }
+                let a = (c.cwd as NSString).standardizingPath
+                let b = (proc.cwd as NSString).standardizingPath
+                return a == b || a.hasPrefix(b + "/") || b.hasPrefix(a + "/")
+            }) else { return nil }
+
             let id = (path as NSString).lastPathComponent.replacingOccurrences(of: ".jsonl", with: "")
             let match = liveProcs.first { proc in
                 guard !c.cwd.isEmpty, !proc.cwd.isEmpty else { return false }
@@ -1147,7 +1168,6 @@ final class ClaudeActivityMonitor {
             }
             let awaiting = c.awaitingReply && Date().timeIntervalSince(c.lastActivity) < liveWindow
             let live = awaiting || match != nil
-            let title = c.lastPrompt.map(Self.shorten)
             return ActivitySession(
                 id: id,
                 providerId: config.id,
@@ -1156,7 +1176,7 @@ final class ClaudeActivityMonitor {
                 project: Self.projectLabel(c.cwd),
                 cwd: c.cwd.isEmpty ? nil : c.cwd,
                 branch: c.branch,
-                title: title,
+                title: c.lastPrompt.map(Self.shorten),
                 tokensIn: c.tokensIn, tokensOut: c.tokensOut,
                 model: nil,
                 lastActivity: c.lastActivity,
@@ -1171,15 +1191,27 @@ final class ClaudeActivityMonitor {
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
         var c = cache[file.path] ?? Cache()
-        if size < c.offset { c = Cache() }
+        if size < c.offset { c = Cache() }   // truncated/rotated
         guard size > c.offset else { cache[file.path] = c; return }
-        try? handle.seek(toOffset: c.offset)
-        let data = handle.readDataToEndOfFile()
+
+        // First sight of a huge file: only tail — never re-read multi‑MB histories.
+        var start = c.offset
+        var skipPartialLine = false
+        if c.offset == 0, size > bootstrapTail {
+            start = size - bootstrapTail
+            skipPartialLine = true
+        }
+        try? handle.seek(toOffset: start)
+        var data = handle.readDataToEndOfFile()
+        if skipPartialLine, let nl = data.firstIndex(of: UInt8(ascii: "\n")) {
+            data = data.suffix(from: data.index(after: nl))
+        }
         c.offset = size
         for line in data.split(separator: UInt8(ascii: "\n")) {
             guard let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
             apply(obj, to: &c)
         }
+        // If we only tailed, token totals are lower-bound — fine for the menu.
         cache[file.path] = c
     }
 
@@ -2161,7 +2193,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var notifiedHigh = Set<String>()
     /// Unified activity across all providers that have showActivity on.
     var activity: [ActivitySession] = []
+    /// True after at least one background activity scan has finished (success or empty).
+    var activityScanCompleted = false
     var sessionTimer: Timer?
+    /// Serialize activity scans so a slow Claude pass can't stack up.
+    private let activityQueue = DispatchQueue(label: "com.usagemonitor.activity", qos: .utility)
 
     var allGauges: [Gauge] { providerGauges.flatMap(\.gauges) }
 
@@ -2248,28 +2284,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Background-only. Never call from menuNeedsUpdate (that freezes the menu
     /// tracking loop and steals the keyboard until the scan finishes).
+    ///
+    /// Fast providers (Grok registry, Cursor) publish first so the menu is never
+    /// stuck on “scanning…” while Claude digests large transcripts.
     func pollSessions() {
         let configs = providerConfigs
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        activityQueue.async { [weak self] in
             guard let self else { return }
-            let rows = self.scanActivity(configs: configs)
-            DispatchQueue.main.async { self.activity = rows }
-        }
-    }
 
-    /// Blocking activity scan — **off the main thread only**.
-    func scanActivity(configs: [ProviderConfig]? = nil) -> [ActivitySession] {
-        let configs = configs ?? providerConfigs
-        var rows: [ActivitySession] = []
-        for cfg in configs where cfg.enabled && cfg.showActivity {
-            switch cfg.kind {
-            case .claude: rows.append(contentsOf: activityMonitor.scan(config: cfg))
-            case .grok: rows.append(contentsOf: grokActivity.scan(config: cfg))
-            case .codex: rows.append(contentsOf: codexActivity.scan(config: cfg))
-            case .cursor: rows.append(contentsOf: cursorActivity.scan(config: cfg))
+            // 1) Fast path — Grok + Cursor (+ Codex index) in milliseconds.
+            var fast: [ActivitySession] = []
+            for cfg in configs where cfg.enabled && cfg.showActivity {
+                switch cfg.kind {
+                case .grok: fast.append(contentsOf: self.grokActivity.scan(config: cfg))
+                case .cursor: fast.append(contentsOf: self.cursorActivity.scan(config: cfg))
+                case .codex: fast.append(contentsOf: self.codexActivity.scan(config: cfg))
+                case .claude: break
+                }
+            }
+            fast.sort { $0.lastActivity > $1.lastActivity }
+            DispatchQueue.main.async {
+                // Publish immediately so the menu never sticks on “scanning…”.
+                self.activity = fast
+                self.activityScanCompleted = true
+            }
+
+            // 2) Slow path — Claude transcripts (capped + tail-only on large files).
+            var full = fast
+            for cfg in configs where cfg.enabled && cfg.showActivity && cfg.kind == .claude {
+                full.append(contentsOf: self.activityMonitor.scan(config: cfg))
+            }
+            full.sort { $0.lastActivity > $1.lastActivity }
+            DispatchQueue.main.async {
+                self.activity = full
             }
         }
-        return rows.sorted { $0.lastActivity > $1.lastActivity }
     }
 
     /// Kick a background refresh when the menu is about to open — do not wait.
@@ -2948,8 +2997,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func addActivitySection(to menu: NSMenu) {
         let liveCount = activity.filter(\.live).count
         if activity.isEmpty {
-            menu.addItem(disabled("Terminal sessions  ·  scanning…"))
-            menu.addItem(disabled("  (opens in a few seconds after launch)"))
+            if activityScanCompleted {
+                menu.addItem(disabled("Terminal sessions  ·  none right now"))
+                menu.addItem(disabled("  Run claude / grok in a terminal, then reopen"))
+            } else {
+                menu.addItem(disabled("Terminal sessions  ·  scanning…"))
+            }
             return
         }
         let head = liveCount > 0

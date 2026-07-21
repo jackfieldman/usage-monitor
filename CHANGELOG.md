@@ -8,6 +8,13 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.3.4
+
+- **Terminal sessions actually fill in.** Activity scan published Grok results
+  only after Claude finished reading large transcripts (could hang for a long
+  time → menu stuck on “scanning…”). Now: Grok first (fast), Claude second with
+  a 256 KB tail read + file cap.
+
 ## 2.3.3
 
 - **Public voice.** Removed maintainer-specific What’s New / changelog wording
