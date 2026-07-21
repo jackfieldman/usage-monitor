@@ -3,6 +3,14 @@
 All notable changes to Usage Monitor are recorded here. Versions follow the
 `CFBundleShortVersionString` in `build.sh`.
 
+## 2.3.1
+
+- **Icon Shape works again** with multi-provider letter badges (bars / horizontal
+  / rings / battery each draw next to `G:` / `C:`).
+- **Activity / terminal links fixed.** Grok session PIDs were lost to JSON
+  `NSNumber` casting, so the activity section looked empty. Rows are back;
+  click opens the Terminal tab. Menu refreshes activity on every open.
+
 ## 2.3
 
 - **Smarter provider defaults.** New installs seed only providers that are

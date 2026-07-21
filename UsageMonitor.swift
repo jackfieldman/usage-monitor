@@ -469,6 +469,23 @@ func levelColor(_ pct: Double) -> NSColor {
     }
 }
 
+/// JSONSerialization boxes numbers as NSNumber — plain `as? Int` often fails.
+func jsonInt(_ any: Any?) -> Int? {
+    if let i = any as? Int { return i }
+    if let n = any as? NSNumber { return n.intValue }
+    if let d = any as? Double { return Int(d) }
+    if let s = any as? String { return Int(s) }
+    return nil
+}
+
+func jsonDouble(_ any: Any?) -> Double? {
+    if let d = any as? Double { return d }
+    if let n = any as? NSNumber { return n.doubleValue }
+    if let i = any as? Int { return Double(i) }
+    if let s = any as? String { return Double(s) }
+    return nil
+}
+
 /// Runs a command-line tool synchronously, capturing stdout+stderr.
 /// MUST be called off the main thread for anything slow.
 @discardableResult
@@ -1198,10 +1215,10 @@ final class ClaudeActivityMonitor {
         if type == "user" { c.awaitingReply = true }
         if type == "system", (obj["subtype"] as? String) == "turn_duration" { c.awaitingReply = false }
         if let message = obj["message"] as? [String: Any], let u = message["usage"] as? [String: Any] {
-            c.tokensIn += (u["input_tokens"] as? Int ?? 0)
-                + (u["cache_creation_input_tokens"] as? Int ?? 0)
-                + (u["cache_read_input_tokens"] as? Int ?? 0)
-            c.tokensOut += (u["output_tokens"] as? Int ?? 0)
+            c.tokensIn += (jsonInt(u["input_tokens"]) ?? 0)
+                + (jsonInt(u["cache_creation_input_tokens"]) ?? 0)
+                + (jsonInt(u["cache_read_input_tokens"]) ?? 0)
+            c.tokensOut += (jsonInt(u["output_tokens"]) ?? 0)
         }
     }
 
@@ -1709,7 +1726,8 @@ final class GrokActivityMonitor {
         for row in rows {
             guard let id = row["session_id"] as? String else { continue }
             let cwd = row["cwd"] as? String ?? ""
-            let pid = row["pid"] as? Int
+            // pid arrives as NSNumber from JSONSerialization — never use bare `as? Int`.
+            let pid = jsonInt(row["pid"])
             let live = pid.map(ProcessFocus.processAlive) ?? false
             let opened = parseDate(row["opened_at"] as? String) ?? Date.distantPast
 
@@ -2252,18 +2270,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let configs = providerConfigs
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            var rows: [ActivitySession] = []
-            for cfg in configs where cfg.enabled && cfg.showActivity {
-                switch cfg.kind {
-                case .claude: rows.append(contentsOf: self.activityMonitor.scan(config: cfg))
-                case .grok: rows.append(contentsOf: self.grokActivity.scan(config: cfg))
-                case .codex: rows.append(contentsOf: self.codexActivity.scan(config: cfg))
-                case .cursor: rows.append(contentsOf: self.cursorActivity.scan(config: cfg))
-                }
-            }
-            rows.sort { $0.lastActivity > $1.lastActivity }
+            let rows = self.scanActivity(configs: configs)
             DispatchQueue.main.async { self.activity = rows }
         }
+    }
+
+    /// Blocking activity scan (call off main when possible). Used by the timer
+    /// and again when the menu opens so rows are never stale/missing.
+    func scanActivity(configs: [ProviderConfig]? = nil) -> [ActivitySession] {
+        let configs = configs ?? providerConfigs
+        var rows: [ActivitySession] = []
+        for cfg in configs where cfg.enabled && cfg.showActivity {
+            switch cfg.kind {
+            case .claude: rows.append(contentsOf: activityMonitor.scan(config: cfg))
+            case .grok: rows.append(contentsOf: grokActivity.scan(config: cfg))
+            case .codex: rows.append(contentsOf: codexActivity.scan(config: cfg))
+            case .cursor: rows.append(contentsOf: cursorActivity.scan(config: cfg))
+            }
+        }
+        return rows.sorted { $0.lastActivity > $1.lastActivity }
     }
 
     @objc func poll() {
@@ -2453,39 +2478,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.imagePosition = .imageOnly
     }
 
-    /// Draws letter-badged clusters: `C:▮ 21%  G:▮ 9%` (layout-dependent gauges).
-    /// Letters use full label contrast (not secondary) so they stay readable in the
-    /// menu bar — secondaryLabelColor washes out against wallpapers / dark bars.
+    /// Draws letter-badged clusters, respecting **Icon Shape** for the glyph
+    /// next to each letter (`G:▮ 11%` / battery / rings / horizontal).
     func clusterImage(_ clusters: [IconCluster]) -> NSImage {
-        // Single-provider + allGauges with one cluster can reuse classic shapes.
-        if clusters.count == 1, clusters[0].gauges.count > 1, ProviderStore.layout == .allGauges {
+        // Classic multi-gauge shapes when one provider shows all its gauges.
+        if clusters.count == 1, clusters[0].gauges.count > 1 {
             let gauges = clusters[0].gauges
+            let body: NSImage
             switch iconShape {
-            case .battery: return consolidated ? consolidatedImage(gauges) : gaugeImage(gauges)
-            case .bars: return barsImage(gauges)
-            case .hbars: return hbarsImage(gauges)
-            case .rings: return ringsImage(gauges)
+            case .battery: body = consolidated ? consolidatedImage(gauges) : gaugeImage(gauges)
+            case .bars: body = barsImage(gauges)
+            case .hbars: body = hbarsImage(gauges)
+            case .rings: body = ringsImage(gauges)
             }
+            // Prefix the letter badge so multi-gauge still shows C:/G:.
+            return letterPrefixed(clusters[0].letter, body: body)
         }
 
         let h: CGFloat = 22
-        // Bold monospaced letter + colon — same weight as the percent so C:/G: read clearly.
         let letterFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
         let numFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         let gap: CGFloat = 7, pad: CGFloat = 2
-        let barW: CGFloat = density == .comfortable ? 5.5 : 4
-        let barH: CGFloat = 14
         let letterGap: CGFloat = 3, pctGap: CGFloat = 3
+        let ink = NSColor.labelColor
 
-        // Measure each cluster: "C:" + mini bar + "NN%"
+        // Per-cluster glyph size depends on Icon Shape.
+        let glyphW: CGFloat = {
+            switch iconShape {
+            case .bars: return density == .comfortable ? 6.5 : 5
+            case .hbars: return density == .comfortable ? 18 : 14
+            case .rings: return 16
+            case .battery: return density == .comfortable ? 22 : 18
+            }
+        }()
+        let glyphH: CGFloat = 14
+
         struct Laid {
             let letter: NSAttributedString
             let pct: NSAttributedString
             let percent: Double
             let width: CGFloat
         }
-        // Full labelColor for both letter and % — equal contrast in the bar.
-        let ink = NSColor.labelColor
         let laid: [Laid] = clusters.map { c in
             let pctVal = c.gauges.map(\.percent).max() ?? 0
             let badge = c.letter.count == 1 ? "\(c.letter):" : c.letter
@@ -2493,11 +2526,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 attributes: [.font: letterFont, .foregroundColor: ink])
             let pct = NSAttributedString(string: "\(Int(pctVal))%",
                 attributes: [.font: numFont, .foregroundColor: ink])
-            let w = ceil(letter.size().width) + letterGap + barW + pctGap + ceil(pct.size().width)
+            let w = ceil(letter.size().width) + letterGap + glyphW + pctGap + ceil(pct.size().width)
             return Laid(letter: letter, pct: pct, percent: pctVal, width: w)
         }
         let total = pad * 2 + laid.reduce(0) { $0 + $1.width } + gap * CGFloat(max(0, laid.count - 1))
 
+        let shape = iconShape
         let img = NSImage(size: NSSize(width: total, height: h), flipped: false) { [weak self] _ in
             guard let self else { return false }
             var x = pad
@@ -2506,18 +2540,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 item.letter.draw(at: NSPoint(x: x, y: ly))
                 x += ceil(item.letter.size().width) + letterGap
 
-                let by = ((h - barH) / 2).rounded()
-                NSColor.labelColor.withAlphaComponent(0.18).setFill()
-                NSBezierPath(roundedRect: NSRect(x: x, y: by, width: barW, height: barH),
-                             xRadius: barW / 2, yRadius: barW / 2).fill()
-                let p = max(0, min(100, item.percent)) / 100
-                if p > 0 {
-                    let bh = max(barW, barH * p)
-                    self.fillColor(item.percent).setFill()
-                    NSBezierPath(roundedRect: NSRect(x: x, y: by, width: barW, height: bh),
-                                 xRadius: barW / 2, yRadius: barW / 2).fill()
-                }
-                x += barW + pctGap
+                let gy = ((h - glyphH) / 2).rounded()
+                let gRect = NSRect(x: x, y: gy, width: glyphW, height: glyphH)
+                self.drawShapeGlyph(shape, percent: item.percent, in: gRect)
+                x += glyphW + pctGap
 
                 let py = ((h - item.pct.size().height) / 2).rounded()
                 item.pct.draw(at: NSPoint(x: x, y: py))
@@ -2525,7 +2551,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return true
         }
-        // Never template-tint the multi-color glyph — that would wash letters out.
+        img.isTemplate = false
+        return img
+    }
+
+    /// Mini gauge for one percent, matching the selected Icon Shape.
+    private func drawShapeGlyph(_ shape: IconShape, percent: Double, in rect: NSRect) {
+        let p = max(0, min(100, percent)) / 100
+        switch shape {
+        case .bars:
+            NSColor.labelColor.withAlphaComponent(0.18).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: rect.width / 2, yRadius: rect.width / 2).fill()
+            if p > 0 {
+                let bh = max(rect.width, rect.height * p)
+                fillColor(percent).setFill()
+                NSBezierPath(roundedRect: NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: bh),
+                             xRadius: rect.width / 2, yRadius: rect.width / 2).fill()
+            }
+        case .hbars:
+            NSColor.labelColor.withAlphaComponent(0.18).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2).fill()
+            if p > 0 {
+                let bw = max(rect.height, rect.width * p)
+                fillColor(percent).setFill()
+                NSBezierPath(roundedRect: NSRect(x: rect.minX, y: rect.minY, width: bw, height: rect.height),
+                             xRadius: rect.height / 2, yRadius: rect.height / 2).fill()
+            }
+        case .rings:
+            let c = NSPoint(x: rect.midX, y: rect.midY)
+            let r = min(rect.width, rect.height) / 2 - 1.2
+            let track = NSBezierPath()
+            track.appendArc(withCenter: c, radius: r, startAngle: 0, endAngle: 360)
+            track.lineWidth = 2.2
+            NSColor.labelColor.withAlphaComponent(0.18).setStroke()
+            track.stroke()
+            if p > 0.01 {
+                let arc = NSBezierPath()
+                arc.lineWidth = 2.2
+                arc.lineCapStyle = .round
+                arc.appendArc(withCenter: c, radius: r,
+                              startAngle: 90, endAngle: 90 - p * 360, clockwise: true)
+                fillColor(percent).setStroke()
+                arc.stroke()
+            }
+        case .battery:
+            // Tiny battery shell + fill.
+            let body = rect.insetBy(dx: 0, dy: 1)
+            let tint = NSColor.labelColor.withAlphaComponent(0.5)
+            let outline = NSBezierPath(roundedRect: body.insetBy(dx: 0.5, dy: 0.5),
+                                       xRadius: 2, yRadius: 2)
+            outline.lineWidth = 1
+            tint.setStroke()
+            outline.stroke()
+            let cap = NSRect(x: body.maxX + 0.5, y: body.midY - 2, width: 1.5, height: 4)
+            tint.setFill()
+            NSBezierPath(roundedRect: cap, xRadius: 0.5, yRadius: 0.5).fill()
+            if p > 0 {
+                let inner = body.insetBy(dx: 2, dy: 2)
+                let w = max(1, inner.width * p)
+                fillColor(percent).setFill()
+                NSBezierPath(roundedRect: NSRect(x: inner.minX, y: inner.minY, width: w, height: inner.height),
+                             xRadius: 1, yRadius: 1).fill()
+            }
+        }
+    }
+
+    /// Prepends a bold letter badge to a classic multi-gauge image.
+    private func letterPrefixed(_ letter: String, body: NSImage) -> NSImage {
+        let badge = letter.count == 1 ? "\(letter):" : letter
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
+        let s = NSAttributedString(string: badge,
+            attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+        let gap: CGFloat = 3, pad: CGFloat = 2
+        let h = max(22, body.size.height)
+        let w = pad + ceil(s.size().width) + gap + body.size.width + pad
+        let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { _ in
+            let ly = ((h - s.size().height) / 2).rounded()
+            s.draw(at: NSPoint(x: pad, y: ly))
+            let bx = pad + ceil(s.size().width) + gap
+            let by = ((h - body.size.height) / 2).rounded()
+            body.draw(in: NSRect(x: bx, y: by, width: body.size.width, height: body.size.height))
+            return true
+        }
         img.isTemplate = false
         return img
     }
@@ -2718,6 +2825,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Rebuilt each time the menu opens — the checkmarks and dynamic text stay
     /// current without render() reconstructing the menu on every poll.
     func menuNeedsUpdate(_ menu: NSMenu) {
+        // Fresh activity every open so terminal links aren't empty/stale.
+        activity = scanActivity()
         menu.removeAllItems()
         if providerGauges.isEmpty, let err = lastError {
             menu.addItem(disabled("⚠︎  \(err)"))
@@ -2752,25 +2861,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        // Activity — clickable, two-line (dark title + light path line).
-        if !activity.isEmpty {
-            menu.addItem(.separator())
-            // Group by provider name for section headers.
+        // Activity — clickable rows open Terminal tab / host app.
+        menu.addItem(.separator())
+        if activity.isEmpty {
+            menu.addItem(disabled("Activity  ·  no live sessions"))
+        } else {
+            menu.addItem(disabled("Activity  ·  click a row to open its terminal"))
             var seenProviders: [String] = []
             for s in activity {
                 if !seenProviders.contains(s.providerId) { seenProviders.append(s.providerId) }
             }
             let byProvider = Dictionary(grouping: activity, by: \.providerId)
-            for (pidx, pid) in seenProviders.enumerated() {
+            for pid in seenProviders {
                 guard let rows = byProvider[pid], let first = rows.first else { continue }
-                if pidx > 0 { /* keep one flat list with headers */ }
-                menu.addItem(disabled("\(first.providerLetter):  \(first.providerName) activity"))
-                let shown = rows.prefix(5)
+                menu.addItem(disabled("\(first.providerLetter):  \(first.providerName)"))
+                let shown = rows.prefix(6)
                 for s in shown {
                     menu.addItem(activityMenuItem(s))
                 }
                 let remaining = rows.count - shown.count
-                if remaining > 0 { menu.addItem(disabled("+\(remaining) more idle")) }
+                if remaining > 0 { menu.addItem(disabled("+\(remaining) more")) }
             }
         }
 
@@ -2878,26 +2988,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             meta += "  ·  sent \(abbreviateTokens(tin)) · recv \(abbreviateTokens(tout))"
         }
 
-        let header: String
-        if let title = s.title, !title.isEmpty {
-            header = "\(s.providerLetter): \(title)"
-        } else {
-            header = "\(s.providerLetter): \(s.project)"
-        }
+        // Single-line title stays reliably clickable in NSMenu (multi-line
+        // attributed titles often look disabled / hard to hit).
+        let working = (s.title?.isEmpty == false) ? s.title! : s.project
+        let title = "\(s.providerLetter): \(working)  —  \(meta)"
 
-        let dark: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
-            .foregroundColor: NSColor.labelColor,
-        ]
-        let light: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]
-        let attr = NSMutableAttributedString(string: header + "\n", attributes: dark)
-        attr.append(NSAttributedString(string: meta, attributes: light))
-
-        let i = NSMenuItem(title: header, action: #selector(openActivity(_:)), keyEquivalent: "")
-        i.attributedTitle = attr
+        let i = NSMenuItem(title: title, action: #selector(openActivity(_:)), keyEquivalent: "")
         i.target = self
         // Must be a class — struct as representedObject fails the cast on click.
         i.representedObject = ActivitySessionBox(s)
@@ -2908,6 +3004,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             : "Click to open host app or project folder"
         if let pid = s.pid { tip += "  ·  pid \(pid)" }
         if let tty = s.tty, tty != "??" { tip += "  ·  \(tty)" }
+        if let cwd = s.cwd { tip += "\n\(cwd)" }
         i.toolTip = tip
         return i
     }
