@@ -8,6 +8,12 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.6.1
+
+- **Active AI terminals open the real session.** Clicking a live terminal row
+  selects the existing Terminal/iTerm tab by TTY and never launches a new
+  Terminal window for a process that is already running.
+
 ## 2.6.0
 
 - **Update checks ~4× per day** (every 6 hours) instead of once daily.

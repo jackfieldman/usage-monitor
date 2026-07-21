@@ -44,7 +44,7 @@ The menu has **Active AI** collapsed under a disclosure arrow (so the main menu
 stays short):
 
 - **Active AI terminals** — live CLI sessions (what each is working on). Click
-  to jump to that Terminal / iTerm / Warp / Ghostty / Orbit tab.
+  to focus the **existing** Terminal / iTerm tab (by TTY) — not a new window.
 - **Active AI desktops** — Claude, ChatGPT, Cursor when the real app is running
   (not Dock helpers). Click to bring it forward.
 
