@@ -8,6 +8,12 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.3.7
+
+- **Click terminal session works reliably.** Prefer Terminal tab by TTY (not
+  Orbit) for Grok/CLI rows; activate after the menu dismisses; stronger
+  frontmost activation on modern macOS.
+
 ## 2.3.6
 
 - **Battery Fill** submenu: **Fill Shows Used** or **Fill Shows Remaining**

@@ -925,7 +925,7 @@ enum ProcessFocus {
     ]
 
     /// Best-effort: focus the tab/window for `pid`, else activate a sensible app.
-    /// Safe from a background queue — UI hops to the main thread.
+    /// Safe from a background queue — UI work hops to the main thread.
     static func open(pid: Int?, tty: String?, cwd: String?, providerKind: ProviderKind) {
         // Resolve process matching off the main thread (ps/lsof).
         var usePid = pid
@@ -936,15 +936,30 @@ enum ProcessFocus {
                 useTTY = found.tty
             }
         }
+        // Fresh TTY from ps when we have a live pid (menu cache can be slightly stale).
+        if let pid = usePid, processAlive(pid), let info = procInfo(pid), info.tty != "??", !info.tty.isEmpty {
+            useTTY = info.tty
+        }
         let resolvedPid = usePid
         let resolvedTTY = useTTY
         let resolvedCwd = cwd
         let kind = providerKind
-        DispatchQueue.main.async {
+        // Wait for the status menu to finish dismissing — activating another app
+        // mid-menu-tracking is a no-op / flaky on recent macOS.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            // 1) Prefer Terminal/iTerm tab when we know the TTY (CLI sessions).
+            if let tty = resolvedTTY, !tty.isEmpty, tty != "??" {
+                if selectTerminalTab(tty: tty) { return }
+                if selectITermSession(tty: tty) { return }
+            }
+            // 2) Walk the process tree for a host app.
             if let pid = resolvedPid, pid > 0, processAlive(pid) {
                 if focus(pid: pid, tty: resolvedTTY) { return }
             }
-            if kind == .claude, activateBundle("com.anthropic.claudefordesktop") { return }
+            // 3) Provider-specific fallbacks (never jump to Orbit before Terminal).
+            if kind == .claude {
+                if activateBundle("com.anthropic.claudefordesktop") { return }
+            }
             if kind == .cursor {
                 for bid in ["com.todesktop.230313mzl4w4u92", "com.cursor.Cursor", "com.anysphere.cursor"] {
                     if activateBundle(bid) { return }
@@ -954,31 +969,31 @@ enum ProcessFocus {
                     return
                 }
             }
-            // Grok / Codex often live in Terminal or Orbit.
+            // 4) Terminal is the default host for CLI agents.
+            if activateBundle("com.apple.Terminal") { return }
             if kind == .grok || kind == .codex {
                 if activateBundle("com.ofx.orbit") { return }
                 if activateBundle("com.ofx.orbit.dev") { return }
             }
             if let resolvedCwd, !resolvedCwd.isEmpty {
                 NSWorkspace.shared.open(URL(fileURLWithPath: resolvedCwd))
-                return
             }
-            _ = activateBundle("com.apple.Terminal")
         }
     }
 
     private static func activateApp(_ app: NSRunningApplication) {
+        // Bring our process out of accessory limbo, then force the target front.
+        NSApp.activate(ignoringOtherApps: true)
         if #available(macOS 14.0, *) {
-            app.activate()
+            app.activate(from: NSRunningApplication.current)
         } else {
-            app.activate(options: [.activateAllWindows])
+            app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
         }
     }
 
     @discardableResult
     private static func focus(pid: Int, tty: String?) -> Bool {
         let chain = processChain(from: pid)
-        // Prefer an explicit tty, else any non-?? tty in the parent chain (CLI often has it).
         let resolvedTTY: String? = {
             if let tty, !tty.isEmpty, tty != "??" { return tty }
             return chain.map(\.tty).first { $0 != "??" && !$0.isEmpty }
@@ -992,34 +1007,31 @@ enum ProcessFocus {
                hostBundles.contains(where: { $0.bundle == bid }) {
                 activateApp(app)
                 if bid == "com.apple.Terminal", let resolvedTTY {
-                    selectTerminalTab(tty: resolvedTTY)
+                    _ = selectTerminalTab(tty: resolvedTTY)
                 } else if bid == "com.googlecode.iterm2", let resolvedTTY {
-                    selectITermSession(tty: resolvedTTY)
+                    _ = selectITermSession(tty: resolvedTTY)
                 }
                 return true
             }
-            // Match by command name when bundle id is absent (CLI helpers / login shells).
             let comm = (step.comm as NSString).lastPathComponent
-            for host in hostBundles where host.names.contains(where: { comm.localizedCaseInsensitiveContains($0) }) {
+            for host in hostBundles where host.names.contains(where: {
+                comm.localizedCaseInsensitiveContains($0) || step.comm.localizedCaseInsensitiveContains($0)
+            }) {
                 if activateBundle(host.bundle) {
                     if host.bundle == "com.apple.Terminal", let resolvedTTY {
-                        selectTerminalTab(tty: resolvedTTY)
+                        _ = selectTerminalTab(tty: resolvedTTY)
                     } else if host.bundle == "com.googlecode.iterm2", let resolvedTTY {
-                        selectITermSession(tty: resolvedTTY)
+                        _ = selectITermSession(tty: resolvedTTY)
                     }
                     return true
                 }
             }
         }
 
-        // No GUI host found in the chain — if we have a TTY, still try Terminal (most common).
         if let resolvedTTY {
-            if activateBundle("com.apple.Terminal") {
-                selectTerminalTab(tty: resolvedTTY)
-                return true
-            }
+            if selectTerminalTab(tty: resolvedTTY) { return true }
+            if selectITermSession(tty: resolvedTTY) { return true }
         }
-        // Activate the leaf process's app if any.
         if let app = NSRunningApplication(processIdentifier: pid_t(pid)) {
             activateApp(app)
             return true
@@ -1027,24 +1039,30 @@ enum ProcessFocus {
         return false
     }
 
-    private static func selectTerminalTab(tty: String) {
-        // Accept "ttys030", "/dev/ttys030", or "030".
+    /// Returns true if a matching Terminal tab was selected (and Terminal activated).
+    @discardableResult
+    private static func selectTerminalTab(tty: String) -> Bool {
         var needle = tty.replacingOccurrences(of: "/dev/", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if needle.isEmpty { return false }
         if !needle.hasPrefix("tty") { needle = "tty" + needle }
+
+        // Ensure Terminal is running, then pick the tab by TTY.
+        _ = activateBundle("com.apple.Terminal")
+
         let script = """
         tell application "Terminal"
           activate
+          set needle to "\(needle)"
           repeat with w in windows
-            set tabIndex to 0
             repeat with t in tabs of w
-              set tabIndex to tabIndex + 1
               try
                 set ttyName to (tty of t as text)
-                if ttyName contains "\(needle)" then
+                if ttyName contains needle then
                   set selected of t to true
-                  set index of w to 1
                   set frontmost of w to true
-                  return "ok"
+                  set index of w to 1
+                  return "ok:" & ttyName
                 end if
               end try
             end repeat
@@ -1053,39 +1071,50 @@ enum ProcessFocus {
         end tell
         """
         var err: NSDictionary?
-        if let apple = NSAppleScript(source: script) {
-            let result = apple.executeAndReturnError(&err)
-            if let err {
-                NSLog("UsageMonitor: Terminal tab select error: \(err)")
-            } else {
-                NSLog("UsageMonitor: Terminal tab select → \(result.stringValue ?? "?") for \(needle)")
-            }
+        guard let apple = NSAppleScript(source: script) else { return false }
+        let result = apple.executeAndReturnError(&err)
+        if let err {
+            NSLog("UsageMonitor: Terminal tab select error: \(err)")
+            // Common first-run: macOS Automation permission not granted yet.
+            // Opening Terminal at least gets the user close.
+            return false
         }
+        let val = result.stringValue ?? ""
+        NSLog("UsageMonitor: Terminal tab select → \(val) for \(needle)")
+        return val.hasPrefix("ok")
     }
 
-    private static func selectITermSession(tty: String) {
-        let needle = tty.replacingOccurrences(of: "/dev/", with: "")
+    @discardableResult
+    private static func selectITermSession(tty: String) -> Bool {
+        var needle = tty.replacingOccurrences(of: "/dev/", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if needle.isEmpty { return false }
+        if !needle.hasPrefix("tty") { needle = "tty" + needle }
+        guard activateBundle("com.googlecode.iterm2") else { return false }
         let script = """
         tell application "iTerm"
           activate
+          set needle to "\(needle)"
           repeat with w in windows
             repeat with t in tabs of w
               repeat with s in sessions of t
                 try
-                  if (tty of s as text) contains "\(needle)" then
+                  if (tty of s as text) contains needle then
                     select t
-                    return
+                    return "ok"
                   end if
                 end try
               end repeat
             end repeat
           end repeat
+          return "miss"
         end tell
         """
         var err: NSDictionary?
-        if let apple = NSAppleScript(source: script) {
-            apple.executeAndReturnError(&err)
-        }
+        guard let apple = NSAppleScript(source: script) else { return false }
+        let result = apple.executeAndReturnError(&err)
+        if err != nil { return false }
+        return (result.stringValue ?? "").hasPrefix("ok")
     }
 
     @discardableResult
@@ -3240,10 +3269,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             s = direct
         } else {
             NSLog("UsageMonitor: openActivity — no session on menu item")
+            NSSound.beep()
             return
         }
-        let kind = providerConfigs.first(where: { $0.id == s.providerId })?.kind ?? .claude
-        // Never block the menu-tracking thread.
+        let kind = providerConfigs.first(where: { $0.id == s.providerId })?.kind
+            ?? ProviderKind(rawValue: s.providerId) ?? .claude
+        NSLog("UsageMonitor: openActivity kind=\(kind.rawValue) pid=\(s.pid.map(String.init) ?? "-") tty=\(s.tty ?? "-") cwd=\(s.cwd ?? "-")")
+        // Cancel menu tracking, then focus after a beat (see ProcessFocus.open delay).
         DispatchQueue.global(qos: .userInitiated).async {
             ProcessFocus.open(pid: s.pid, tty: s.tty, cwd: s.cwd, providerKind: kind)
         }

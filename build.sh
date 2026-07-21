@@ -29,8 +29,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>      <string>com.usagemonitor.app</string>
     <key>CFBundleExecutable</key>      <string>UsageMonitor</string>
     <key>CFBundleIconFile</key>        <string>AppIcon</string>
-    <key>CFBundleVersion</key>         <string>2.3.6</string>
-    <key>CFBundleShortVersionString</key> <string>2.3.6</string>
+    <key>CFBundleVersion</key>         <string>2.3.7</string>
+    <key>CFBundleShortVersionString</key> <string>2.3.7</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>NSPrincipalClass</key>        <string>NSApplication</string>
     <key>LSUIElement</key>             <true/>
