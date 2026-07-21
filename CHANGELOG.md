@@ -8,6 +8,13 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.3.5
+
+- **Feature NEW chips.** Light blue **NEW** badges appear next to menu items
+  that didn’t exist on the user’s previous app version (Terminal sessions,
+  Providers, Menu Bar Layout, Bar % Shows, What’s New). Clearing What’s New
+  dismisses them.
+
 ## 2.3.4
 
 - **Terminal sessions actually fill in.** Activity scan published Grok results

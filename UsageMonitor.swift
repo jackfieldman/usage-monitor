@@ -131,19 +131,46 @@ final class ActivitySessionBox: NSObject {
     init(_ session: ActivitySession) { self.session = session }
 }
 
-// MARK: - What's New (in-app release notes + blue “NEW” chip)
+// MARK: - What's New (in-app release notes + blue “NEW” chips)
 
 enum WhatsNew {
     static var appVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
     }
 
+    /// Menu / product features with the version they first shipped.
+    /// Chips appear when the user’s baseline is older than `introduced`.
+    enum Feature: String, CaseIterable {
+        case terminalSessions
+        case multiProvider
+        case barPercent
+        case menuBarLayout
+        case codexCursor
+        case whatsNewPanel
+
+        /// First app version that included this surface.
+        var introduced: String {
+            switch self {
+            case .terminalSessions: return "2.0"   // clickable activity / sessions
+            case .multiProvider: return "2.0"
+            case .barPercent: return "2.0"
+            case .menuBarLayout: return "2.0"
+            case .codexCursor: return "2.1"
+            case .whatsNewPanel: return "2.2"
+            }
+        }
+    }
+
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.3.4", "Terminal sessions reliability", [
+            "Sessions appear immediately (Grok first; Claude loads without blocking)",
+            "Menu no longer freezes while scanning transcripts",
+        ]),
         ("2.3.3", "Public polish", [
             "Neutral product copy in What’s New and release notes",
-            "Same smart defaults for every user (no special-case machines)",
+            "Same smart defaults for every user",
         ]),
         ("2.3", "Smarter defaults", [
             "Seeds providers from what you actually use (signed-in CLIs)",
@@ -163,7 +190,6 @@ enum WhatsNew {
             "Rename providers and letter badges (C: / G: / …)",
             "Menu bar layout: per-provider, all gauges, or highest",
             "Click an activity row to open its Terminal tab / app",
-            "Two-line activity: dark “working on” + light path line",
             "Bar % Shows — pick which limit each letter displays",
         ]),
         ("1.9", "Grok usage", [
@@ -174,32 +200,79 @@ enum WhatsNew {
     ]
 
     private static let seenKey = "whatsNewSeenVersion"
+    private static let lastLaunchKey = "lastLaunchedVersion"
+    private static let upgradeFromKey = "upgradeFromVersion"
 
     static var seenVersion: String {
         get { UserDefaults.standard.string(forKey: seenKey) ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: seenKey) }
     }
 
-    /// Show the blue chip until the user opens What’s New for this version.
-    static var hasUnseen: Bool { seenVersion != appVersion }
+    /// Call once at launch. Remembers the previous install version for “new since last time”.
+    static func recordLaunch() {
+        let current = appVersion
+        let prior = UserDefaults.standard.string(forKey: lastLaunchKey) ?? ""
+        if prior != current {
+            // Empty prior = first install; keep upgradeFrom empty so we don’t spam every chip.
+            UserDefaults.standard.set(prior, forKey: upgradeFromKey)
+        }
+        UserDefaults.standard.set(current, forKey: lastLaunchKey)
+    }
 
-    static func markSeen() { seenVersion = appVersion }
+    /// Version the user has already acknowledged via What’s New (or empty).
+    /// Falls back to the version they upgraded from so chips survive until they open What’s New.
+    static var baselineVersion: String {
+        if !seenVersion.isEmpty { return seenVersion }
+        return UserDefaults.standard.string(forKey: upgradeFromKey) ?? ""
+    }
 
-    /// Soft blue used for the NEW chip outline + fill.
+    /// True if this release (or feature intro version) is newer than the user’s baseline.
+    static func isNew(since introduced: String) -> Bool {
+        let base = baselineVersion
+        if base.isEmpty { return false }   // first install: only use What’s New entry, not every row
+        return isNewer(introduced, than: base)
+    }
+
+    static func isNew(_ feature: Feature) -> Bool { isNew(since: feature.introduced) }
+
+    /// Show the blue chip on What’s New until they open it for this version.
+    static var hasUnseen: Bool {
+        seenVersion != appVersion && (!baselineVersion.isEmpty || seenVersion.isEmpty)
+    }
+
+    static func markSeen() {
+        seenVersion = appVersion
+        UserDefaults.standard.set(appVersion, forKey: upgradeFromKey)
+    }
+
+    /// Numeric dotted-version compare: "2.3.4" > "2.3".
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        let av = a.split(separator: ".").map { Int($0) ?? 0 }
+        let bv = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(av.count, bv.count) {
+            let x = i < av.count ? av[i] : 0, y = i < bv.count ? bv[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+
     static var chipBlue: NSColor {
         NSColor(srgbRed: 0.20, green: 0.48, blue: 0.98, alpha: 1)
     }
     static var chipBlueSoft: NSColor {
         NSColor(srgbRed: 0.20, green: 0.48, blue: 0.98, alpha: 0.14)
     }
+    static var chipBlueLight: NSColor {
+        NSColor(srgbRed: 0.40, green: 0.65, blue: 1.0, alpha: 1)
+    }
 
-    /// Tiny pill badge: white “NEW” on blue, with a slightly darker blue ring.
-    static func newChipImage(height: CGFloat = 16) -> NSImage {
+    /// Tiny pill badge. `light: true` = softer fill for inline menu “feature lights”.
+    static func newChipImage(height: CGFloat = 16, light: Bool = false) -> NSImage {
         let text = "NEW"
         let font = NSFont.systemFont(ofSize: max(9, height * 0.58), weight: .bold)
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font,
-            .foregroundColor: NSColor.white,
+            .foregroundColor: light ? chipBlue : NSColor.white,
             .kern: 0.4,
         ]
         let s = NSAttributedString(string: text, attributes: attrs)
@@ -210,10 +283,15 @@ enum WhatsNew {
         let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { _ in
             let rect = NSRect(x: 0.5, y: 0.5, width: w - 1, height: h - 1)
             let path = NSBezierPath(roundedRect: rect, xRadius: (h - 1) / 2, yRadius: (h - 1) / 2)
-            WhatsNew.chipBlue.setFill()
-            path.fill()
-            // Brighter ring so the chip reads as “outlined blue” on any menu chrome.
-            NSColor(srgbRed: 0.45, green: 0.68, blue: 1.0, alpha: 0.95).setStroke()
+            if light {
+                chipBlueSoft.setFill()
+                path.fill()
+                chipBlue.setStroke()
+            } else {
+                chipBlue.setFill()
+                path.fill()
+                chipBlueLight.setStroke()
+            }
             path.lineWidth = 1
             path.stroke()
             let ty = ((h - textSize.height) / 2).rounded() - 0.5
@@ -222,6 +300,14 @@ enum WhatsNew {
         }
         img.isTemplate = false
         return img
+    }
+
+    /// Attach a light NEW chip when this feature is new since the user’s baseline.
+    static func applyFeatureChip(_ item: NSMenuItem, _ feature: Feature) {
+        guard isNew(feature) else { return }
+        item.image = newChipImage(height: 14, light: true)
+        let tip = item.toolTip ?? item.title
+        item.toolTip = tip + "\nNew since your previous version"
     }
 }
 
@@ -306,9 +392,11 @@ final class WhatsNewController: NSObject, NSWindowDelegate {
         rule.widthAnchor.constraint(equalToConstant: width - 44).isActive = true
         stack.addArrangedSubview(rule)
 
-        for (idx, rel) in WhatsNew.releases.enumerated() {
-            let isCurrent = rel.version == WhatsNew.appVersion || idx == 0
-            stack.addArrangedSubview(releaseBlock(rel.version, rel.title, rel.bullets, highlight: isCurrent && idx == 0))
+        for rel in WhatsNew.releases {
+            // Light up any release the user hasn't lived through yet.
+            let highlight = WhatsNew.isNew(since: rel.version)
+                || rel.version == WhatsNew.appVersion && WhatsNew.hasUnseen
+            stack.addArrangedSubview(releaseBlock(rel.version, rel.title, rel.bullets, highlight: highlight))
         }
 
         let gotIt = NSButton(title: "Got it", target: self, action: #selector(close))
@@ -2266,6 +2354,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.hasAdminKey = apiKeyConfigured()
             self.pollCost()
         }
+        WhatsNew.recordLaunch()
         render()
         poll()
         pollSessions()
@@ -2459,13 +2548,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openNewsletter() { NSWorkspace.shared.open(newsletterURL) }
     @objc func openCommunity() { NSWorkspace.shared.open(communityURL) }
 
-    /// Menu row: “What's New” with a blue NEW chip while this version is unread.
+    /// Menu row: “What's New” with a solid NEW chip while this version is unread.
     func whatsNewMenuItem() -> NSMenuItem {
         let i = NSMenuItem(title: "What's New", action: #selector(showWhatsNew), keyEquivalent: "")
         i.target = self
-        if WhatsNew.hasUnseen {
-            i.image = WhatsNew.newChipImage(height: 15)
-            i.toolTip = "New in \(WhatsNew.appVersion) — open to see what’s changed"
+        if WhatsNew.hasUnseen || WhatsNew.isNew(.whatsNewPanel) {
+            i.image = WhatsNew.newChipImage(height: 15, light: false)
+            i.toolTip = "New since your previous version — open to review"
         } else {
             i.toolTip = "Release notes for Usage Monitor"
         }
@@ -2922,6 +3011,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(providersMenuItem())
 
         let layoutItem = NSMenuItem(title: "Menu Bar Layout", action: nil, keyEquivalent: "")
+        WhatsNew.applyFeatureChip(layoutItem, .menuBarLayout)
         let layoutMenu = NSMenu()
         for layout in MenuBarLayout.allCases {
             let i = NSMenuItem(title: layout.title, action: #selector(pickLayout(_:)), keyEquivalent: "")
@@ -2998,17 +3088,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let liveCount = activity.filter(\.live).count
         if activity.isEmpty {
             if activityScanCompleted {
-                menu.addItem(disabled("Terminal sessions  ·  none right now"))
+                let none = disabled("Terminal sessions  ·  none right now")
+                WhatsNew.applyFeatureChip(none, .terminalSessions)
+                menu.addItem(none)
                 menu.addItem(disabled("  Run claude / grok in a terminal, then reopen"))
             } else {
-                menu.addItem(disabled("Terminal sessions  ·  scanning…"))
+                let scan = disabled("Terminal sessions  ·  scanning…")
+                WhatsNew.applyFeatureChip(scan, .terminalSessions)
+                menu.addItem(scan)
             }
             return
         }
         let head = liveCount > 0
             ? "Terminal sessions  ·  \(liveCount) live  ·  click to open"
             : "Terminal sessions  ·  click to open"
-        menu.addItem(disabled(head))
+        let headerItem = disabled(head)
+        WhatsNew.applyFeatureChip(headerItem, .terminalSessions)
+        menu.addItem(headerItem)
 
         var seenProviders: [String] = []
         for s in activity {
@@ -3086,6 +3182,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func providersMenuItem() -> NSMenuItem {
         let root = NSMenuItem(title: "Providers", action: nil, keyEquivalent: "")
+        WhatsNew.applyFeatureChip(root, .multiProvider)
+        if WhatsNew.isNew(.codexCursor) && !WhatsNew.isNew(.multiProvider) {
+            // Only Codex/Cursor is new for this user — still flag Providers.
+            root.image = WhatsNew.newChipImage(height: 14, light: true)
+            root.toolTip = (root.toolTip ?? "Providers") + "\nIncludes Codex / Cursor"
+        }
         let sub = NSMenu()
         for cfg in providerConfigs {
             let row = NSMenuItem(title: "\(cfg.letter):  \(cfg.displayName)", action: nil, keyEquivalent: "")
@@ -3278,6 +3380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             || ProviderStore.layout == .perProvider
         let title = multi ? "Bar % Shows" : "Number Shows"
         let root = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        WhatsNew.applyFeatureChip(root, .barPercent)
         let sub = NSMenu()
 
         let groups = providerGauges.filter { $0.config.enabled && !$0.gauges.isEmpty }
