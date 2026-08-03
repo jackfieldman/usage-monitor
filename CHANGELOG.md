@@ -8,6 +8,32 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.7.0
+
+- **Session Report (major).** Scan local Claude Code, Codex, and Grok session
+  stores on this Mac into an interactive board: sessions-per-day chart, project
+  ranking, cold / attention-waste heuristics, and Claude model volume when
+  `stats-cache` is present.
+- Menu: **Session Report → Scan Last 7 Days / Scan Last 35 Days / Open Last
+  Report**. Report opens in the browser when ready.
+- **Privacy-first:** nothing is uploaded; chat message bodies are not included;
+  project labels are last path segments only. Files live under Application
+  Support (`UsageMonitor/SessionRadar/`).
+
+## 2.6.3
+
+- **Grok usage gauges restored (and corrected).** xAI still returns two billing
+  shapes for unified accounts: weekly rate window + product rows
+  (`?format=credits`) and monthly budget (`monthlyLimit` / `used`, often
+  `{ "val": N }`). The app merges both: primary **Grok** = weekly rate (what
+  rate-limits first), product rows (Build / API / …), plus **Grok month** when
+  the monthly budget differs. Clearer error when neither shape yields gauges.
+
+## 2.6.2
+
+- **NEW chips clear after two menu opens.** Opening the menu bar dropdown twice
+  dismisses blue NEW badges for this version (same as opening What’s New).
+
 ## 2.6.1
 
 - **Active AI terminals open the real session.** Clicking a live terminal row
@@ -113,7 +139,8 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 
 ## 2.2
 
-- **What's New.** Menu item with a blue **NEW** chip until you’ve opened it;
+- **What's New.** Menu item with a blue **NEW** chip until you’ve opened it
+  (or opened the menu bar twice);
   in-app release notes for recent versions (activity click, multi-provider,
   Codex, Bar % Shows, …). Chip clears after you open the panel.
 

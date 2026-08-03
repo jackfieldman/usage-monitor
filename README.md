@@ -48,6 +48,14 @@ stays short):
 - **Active AI desktops** — Claude, ChatGPT, Cursor when the real app is running
   (not Dock helpers). Click to bring it forward.
 
+**Session Report** looks backward across your local CLI history (Claude Code,
+Codex, Grok Build when present). Choose **Scan Last 7 Days** or **Scan Last 35
+Days** — Usage Monitor builds an interactive board in the browser: activity by
+day, a continue ranking, cold projects, and (when available) Claude model
+volume from the local stats cache. **Nothing is uploaded.** Chat bodies are
+not included; project names are shortened to last path segments only. Reopen
+anytime with **Open Last Report**.
+
 **Caffeinate Mode** keeps the Mac awake (desktop or laptop). On a MacBook you
 can also **keep the laptop on with the lid shut**. While active, a glowing cup
 appears in the menu bar — click it for a short reminder (heat / battery notes).
@@ -136,14 +144,13 @@ so (keeping the last good data); it renews the next time you use Claude Code
 and the gauges pick it up on the following poll.
 
 **Grok gauges (credit / product usage).** The app reads the session token Grok
-CLI keeps in `~/.grok/auth.json` and calls the same billing endpoint Grok's
-`/usage` command uses
-(`GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`). It maps
-overall `creditUsagePercent` and any product rows with a usage percent
-(Build, API, Chat, Imagine) into gauges, and shows the billing-period reset
-time. Also **read-only**: Grok owns token refresh; an expired session shows
-in the menu and recovers the next time you use Grok. Polls on the same
-5-minute cadence as Claude.
+CLI keeps in `~/.grok/auth.json` and calls both of Grok’s billing shapes
+(`GET …/v1/billing?format=credits` for the weekly rate window + product rows,
+and default `…/v1/billing` for the monthly `monthlyLimit` / `used` budget).
+Primary **Grok** is the weekly rate (what rate-limits first); product rows
+(Build / API / …) and **Grok month** fill in when present. Also **read-only**:
+Grok owns token refresh; an expired session shows in the menu and recovers
+the next time you use Grok. Polls on the same 5-minute cadence as Claude.
 
 **Claude Code activity.** Every Claude Code CLI session writes its own
 transcript to `~/.claude/projects/<project>/<session>.jsonl`, including the

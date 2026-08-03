@@ -150,6 +150,7 @@ enum WhatsNew {
         case codexCursor
         case whatsNewPanel
         case laptopMode
+        case sessionRadar
 
         /// First app version that included this surface.
         var introduced: String {
@@ -161,6 +162,7 @@ enum WhatsNew {
             case .codexCursor: return "2.1"
             case .whatsNewPanel: return "2.2"
             case .laptopMode: return "2.5"
+            case .sessionRadar: return "2.7"
             }
         }
     }
@@ -168,6 +170,20 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.7", "Session Report (major)", [
+            "Scan Claude, Codex, and Grok local sessions into an interactive board",
+            "See attention by project, cold projects, and a continue ranking — all on this Mac",
+            "Privacy-first: no chat content; project names only (last path segments)",
+            "Menu: Session Report → Scan 7 / 35 days, or open the last report",
+        ]),
+        ("2.6.3", "Grok usage gauges restored", [
+            "Weekly rate window + Build/API rows again (what rate-limits first)",
+            "Monthly budget shown as Grok month when it differs",
+            "Clearer message when a usage API returns no parseable data",
+        ]),
+        ("2.6.2", "NEW chips fade after two menu opens", [
+            "Blue NEW badges clear after you open the menu bar twice (or open What’s New)",
+        ]),
         ("2.6.1", "Open the real terminal session", [
             "Clicking Active AI terminals selects the existing Terminal/iTerm tab by TTY",
             "Never launches a new Terminal window for a process that is already running",
@@ -207,7 +223,7 @@ enum WhatsNew {
             "Stable order: Claude, Grok, Codex, Cursor — only kinds present on this Mac",
         ]),
         ("2.2", "What's New polish", [
-            "Blue NEW chip on What’s New until you’ve opened it",
+            "Blue NEW chip on What’s New until you’ve opened it (or opened the menu twice)",
             "In-app release notes window (this panel)",
         ]),
         ("2.1", "Codex, Cursor & Add Provider", [
@@ -232,6 +248,11 @@ enum WhatsNew {
     private static let seenKey = "whatsNewSeenVersion"
     private static let lastLaunchKey = "lastLaunchedVersion"
     private static let upgradeFromKey = "upgradeFromVersion"
+    /// How many times the status menu was opened while this version still had NEW chips.
+    private static let menuOpenCountKey = "whatsNewMenuOpenCount"
+    private static let menuOpenVersionKey = "whatsNewMenuOpenVersion"
+    /// Clear NEW chips after this many status-menu opens (without requiring What’s New).
+    static let menuOpensToClearNew = 2
 
     static var seenVersion: String {
         get { UserDefaults.standard.string(forKey: seenKey) ?? "" }
@@ -245,6 +266,9 @@ enum WhatsNew {
         if prior != current {
             // Empty prior = first install; keep upgradeFrom empty so we don’t spam every chip.
             UserDefaults.standard.set(prior, forKey: upgradeFromKey)
+            // New version → reset menu-open counter so chips can show again.
+            UserDefaults.standard.set(0, forKey: menuOpenCountKey)
+            UserDefaults.standard.set(current, forKey: menuOpenVersionKey)
         }
         UserDefaults.standard.set(current, forKey: lastLaunchKey)
     }
@@ -265,14 +289,32 @@ enum WhatsNew {
 
     static func isNew(_ feature: Feature) -> Bool { isNew(since: feature.introduced) }
 
-    /// Show the blue chip on What’s New until they open it for this version.
+    /// Show the blue chip on What’s New until they open it, or open the menu twice for this version.
     static var hasUnseen: Bool {
         seenVersion != appVersion && (!baselineVersion.isEmpty || seenVersion.isEmpty)
+    }
+
+    /// Call after the status menu is built for display. Counts opens while chips are visible;
+    /// after `menuOpensToClearNew` opens, marks this version seen so NEW chips stop.
+    static func noteStatusMenuOpen() {
+        guard hasUnseen else { return }
+        let ver = appVersion
+        if UserDefaults.standard.string(forKey: menuOpenVersionKey) != ver {
+            UserDefaults.standard.set(ver, forKey: menuOpenVersionKey)
+            UserDefaults.standard.set(0, forKey: menuOpenCountKey)
+        }
+        let n = UserDefaults.standard.integer(forKey: menuOpenCountKey) + 1
+        UserDefaults.standard.set(n, forKey: menuOpenCountKey)
+        if n >= menuOpensToClearNew {
+            markSeen()
+        }
     }
 
     static func markSeen() {
         seenVersion = appVersion
         UserDefaults.standard.set(appVersion, forKey: upgradeFromKey)
+        UserDefaults.standard.set(menuOpensToClearNew, forKey: menuOpenCountKey)
+        UserDefaults.standard.set(appVersion, forKey: menuOpenVersionKey)
     }
 
     /// Numeric dotted-version compare: "2.3.4" > "2.3".
@@ -585,6 +627,8 @@ enum UsageError: LocalizedError {
     case noCredential, tokenExpired, http(Int), keychain(OSStatus)
     case noGrokCredential, grokTokenExpired
     case noCodexCredential, codexTokenExpired
+    /// HTTP 200 but no recognisable usage fields (API shape drift).
+    case emptyResponse
     var errorDescription: String? {
         switch self {
         case .noCredential: return "Not signed in to Claude Code"
@@ -594,6 +638,7 @@ enum UsageError: LocalizedError {
         case .noCodexCredential: return "Not signed in to Codex"
         case .codexTokenExpired: return "Codex login expired — run codex login"
         case .http(let c): return "Usage API returned HTTP \(c)"
+        case .emptyResponse: return "Usage API returned no usage data"
         case .keychain(let s): return "Keychain error \(s)"
         }
     }
@@ -1800,47 +1845,168 @@ enum GrokAuth {
     }
 }
 
-/// Fetches Grok credit/usage gauges via the same billing endpoint the Grok
-/// CLI `/usage` command uses (`GET …/v1/billing?format=credits`).
+/// Fetches Grok credit/usage gauges via the CLI billing endpoint
+/// (`GET …/v1/billing`). Merges two live shapes xAI still returns:
+/// - `?format=credits` → weekly rate window + per-product rows (Build, API, …)
+/// - default → monthly budget `monthlyLimit` / `used` (often `{ "val": N }`)
+/// Prefer the weekly overall for the primary **Grok** gauge (that’s what rate-
+/// limits first); keep product rows; add **Grok month** when monthly differs.
 final class GrokUsageClient {
-    let billingURL = URL(string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits")!
+    /// Default billing — unified accounts expose monthlyLimit/used here.
+    let billingURL = URL(string: "https://cli-chat-proxy.grok.com/v1/billing")!
+    /// Credits view — weekly percent + productUsage rows.
+    let creditsURL = URL(string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits")!
+
+    // JSON keys as stored properties so -O cannot fold/drop the literals
+    // (dictionary subscripts alone have been observed missing from the binary).
+    private let kConfig = "config"
+    private let kCreditUsagePercent = "creditUsagePercent"
+    private let kProductUsage = "productUsage"
+    private let kProduct = "product"
+    private let kUsagePercent = "usagePercent"
+    private let kMonthlyLimit = "monthlyLimit"
+    private let kUsed = "used"
+    private let kVal = "val"
+    private let kValue = "value"
+    private let kBillingPeriodEnd = "billingPeriodEnd"
+    private let kCurrentPeriod = "currentPeriod"
+    private let kEnd = "end"
+    private let kPeriodEnd = "period_end"
+    private let kUsagePercentage = "usage_percentage"
 
     /// Blocking; call off the main thread. Returns gauges: overall "Grok"
     /// plus any product rows that report a usage percent (Build, API, …).
     func fetchUsage() throws -> [Gauge] {
         let token = try GrokAuth.readAccessToken()
-        var req = URLRequest(url: billingURL)
+        // Fetch both shapes. Auth failure on either is fatal (same token).
+        // Non-auth HTTP failures on one still allow the other to supply gauges.
+        var httpError: Error?
+        var creditsBody: Data?
+        var monthlyBody: Data?
+
+        do { creditsBody = try fetchBody(url: creditsURL, token: token) }
+        catch let e as UsageError {
+            if case .grokTokenExpired = e { throw e }
+            httpError = e
+        } catch { httpError = error }
+
+        do { monthlyBody = try fetchBody(url: billingURL, token: token) }
+        catch let e as UsageError {
+            if case .grokTokenExpired = e { throw e }
+            if httpError == nil { httpError = e }
+        } catch {
+            if httpError == nil { httpError = error }
+        }
+
+        let credits = creditsBody.map { parseCredits($0) } ?? ParsedBilling()
+        let monthly = monthlyBody.map { parseMonthly($0) } ?? ParsedBilling()
+
+        var gauges: [Gauge] = []
+
+        // Primary overall: weekly credit window when present (matches Grok CLI
+        // rate limits). Else monthly budget. Else any bare usage_percentage.
+        if let pct = credits.overallPercent {
+            gauges.append(Gauge(label: "Grok", percent: pct, sub: credits.resetSub))
+        } else if let pct = monthly.overallPercent {
+            gauges.append(Gauge(label: "Grok", percent: pct, sub: monthly.resetSub))
+        }
+
+        // Product rows (Build / API / …) from the credits view.
+        gauges.append(contentsOf: credits.products)
+
+        // Monthly budget as a second gauge when we already showed weekly, so
+        // the menu bar primary stays the rate window but spend is still visible.
+        if credits.overallPercent != nil, let pct = monthly.overallPercent {
+            // Skip a duplicate row when the two windows report the same %.
+            if gauges.first(where: { $0.label == "Grok" })?.percent != pct {
+                gauges.append(Gauge(label: "Grok month", percent: pct, sub: monthly.resetSub))
+            }
+        }
+
+        if gauges.isEmpty {
+            if let httpError { throw httpError }
+            throw UsageError.emptyResponse
+        }
+        return gauges
+    }
+
+    private func fetchBody(url: URL, token: String) throws -> Data {
+        var req = URLRequest(url: url)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("cli", forHTTPHeaderField: "x-grok-client-mode")
         let (data, code) = try httpSync(req)
         if code == 401 || code == 403 { throw UsageError.grokTokenExpired }
         guard code == 200 else { throw UsageError.http(code) }
+        return data
+    }
 
-        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        let config = obj["config"] as? [String: Any] ?? obj
-        let reset = resetSub(
-            (config["billingPeriodEnd"] as? String)
-                ?? ((config["currentPeriod"] as? [String: Any])?["end"] as? String))
+    private struct ParsedBilling {
+        var overallPercent: Double? = nil
+        var resetSub: String = ""
+        var products: [Gauge] = []
+    }
 
-        var gauges: [Gauge] = []
-        if let pct = number(config["creditUsagePercent"]) {
-            gauges.append(Gauge(label: "Grok", percent: pct.rounded(), sub: reset))
+    /// Weekly credits shape: creditUsagePercent + productUsage[].
+    private func parseCredits(_ data: Data) -> ParsedBilling {
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        let config = obj[kConfig] as? [String: Any] ?? obj
+        var out = ParsedBilling()
+        out.resetSub = resetSub(
+            (config[kBillingPeriodEnd] as? String)
+                ?? ((config[kCurrentPeriod] as? [String: Any])?[kEnd] as? String)
+                ?? (obj[kPeriodEnd] as? String))
+
+        if let pct = number(config[kCreditUsagePercent])
+            ?? number(config[kUsagePercentage])
+            ?? number(obj[kUsagePercentage])
+            ?? number(config[kUsagePercent]) {
+            out.overallPercent = pct.rounded()
         }
-        for product in config["productUsage"] as? [[String: Any]] ?? [] {
-            guard let name = product["product"] as? String,
-                  let pct = number(product["usagePercent"]) else { continue }
-            gauges.append(Gauge(label: Self.productLabel(name),
-                                percent: pct.rounded(), sub: reset))
+        for product in config[kProductUsage] as? [[String: Any]] ?? [] {
+            guard let name = product[kProduct] as? String,
+                  let pct = number(product[kUsagePercent]) else { continue }
+            out.products.append(Gauge(label: Self.productLabel(name),
+                                      percent: pct.rounded(), sub: out.resetSub))
         }
-        // If the API shape drifts and we got nothing, surface a clear error.
-        if gauges.isEmpty { throw UsageError.http(200) }
-        return gauges
+        return out
+    }
+
+    /// Unified monthly budget: monthlyLimit / used (bare or { "val": N }).
+    private func parseMonthly(_ data: Data) -> ParsedBilling {
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        let config = obj[kConfig] as? [String: Any] ?? obj
+        var out = ParsedBilling()
+        out.resetSub = resetSub(
+            (config[kBillingPeriodEnd] as? String)
+                ?? ((config[kCurrentPeriod] as? [String: Any])?[kEnd] as? String)
+                ?? (obj[kPeriodEnd] as? String))
+
+        if let limit = numberVal(config[kMonthlyLimit]),
+           let used = numberVal(config[kUsed]),
+           limit > 0 {
+            out.overallPercent = min(100, max(0, (used / limit) * 100)).rounded()
+        } else if let pct = number(config[kUsagePercentage])
+            ?? number(obj[kUsagePercentage])
+            ?? number(config[kUsagePercent]) {
+            out.overallPercent = pct.rounded()
+        }
+        return out
     }
 
     private func number(_ any: Any?) -> Double? {
         if let n = any as? NSNumber { return n.doubleValue }
         if let s = any as? String { return Double(s) }
+        if let i = any as? Int { return Double(i) }
+        return nil
+    }
+
+    /// Numbers may be bare (`150000`) or wrapped (`{ "val": 150000 }`).
+    private func numberVal(_ any: Any?) -> Double? {
+        if let n = number(any) { return n }
+        if let d = any as? [String: Any] {
+            return number(d[kVal]) ?? number(d[kValue])
+        }
         return nil
     }
 
@@ -1937,7 +2103,7 @@ final class CodexUsageClient {
             // Balance is remaining credits (not a percent) — skip if we can't normalize.
             _ = bal
         }
-        if gauges.isEmpty { throw UsageError.http(200) }
+        if gauges.isEmpty { throw UsageError.emptyResponse }
         return gauges
     }
 
@@ -3239,6 +3405,502 @@ final class CaffeinateNoticeController: NSObject, NSWindowDelegate {
     }
 }
 
+
+// MARK: - Session Report (local multi-CLI retrospective)
+
+/// Privacy-first scan of Claude Code / Codex / Grok session stores on this Mac.
+/// Builds an interactive HTML board (charts + tiles). Never uploads; never reads
+/// full chat bodies for the report (metadata + titles only where tools store them).
+enum SessionRadar {
+    static let windowDaysDefault = 35
+    static let coldDays = 7
+
+    static var supportDir: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = base.appendingPathComponent("UsageMonitor/SessionRadar", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    static var reportHTML: URL { supportDir.appendingPathComponent("report.html") }
+    static var reportJSON: URL { supportDir.appendingPathComponent("report.json") }
+
+    struct DayBucket: Codable {
+        var date: String
+        var claude: Int
+        var grok: Int
+        var codex: Int
+    }
+
+    struct ProjectRow: Codable {
+        var id: String
+        var label: String
+        var sources: [String]
+        var sessions: Int
+        var messages: Int
+        var lastISO: String
+        var daysSince: Int
+        var status: String   // active | cold | waste
+        var score: Int
+        var continueHint: String
+        var why: String
+    }
+
+    struct ModelRow: Codable {
+        var model: String
+        var total: Int
+    }
+
+    struct Report: Codable {
+        var generatedAt: String
+        var windowDays: Int
+        var days: [DayBucket]
+        var projects: [ProjectRow]
+        var models: [ModelRow]
+        var totals: [String: Int]
+        var privacyNote: String
+        var claudeStatsAsOf: String?
+    }
+
+    // MARK: public labels (scrub paths)
+
+    /// Turn a home path or tool-encoded folder into a short public project label.
+    static func publicLabel(from raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "unknown" }
+        s = s.removingPercentEncoding ?? s
+        s = s.replacingOccurrences(of: "%2F", with: "/")
+        if s.hasPrefix("file://") {
+            s = String(s.dropFirst("file://".count))
+        }
+        // Claude project folders: -Users-name-dev-foo
+        if s.hasPrefix("-") && !s.contains("/") {
+            s = String(s.dropFirst()).replacingOccurrences(of: "-", with: "/")
+        }
+        var parts = s.split(separator: "/").map(String.init).filter { !$0.isEmpty }
+        if parts.first == "Users", parts.count >= 3 {
+            parts = Array(parts.dropFirst(2))
+        }
+        if parts.first == "home", parts.count >= 3 {
+            parts = Array(parts.dropFirst(2))
+        }
+        // Drop private/tmp noise
+        if parts.first == "private", parts.count > 1 { parts = Array(parts.dropFirst()) }
+        if parts.first == "tmp", parts.count > 1 {
+            return "tmp/" + (parts.last ?? "scratch")
+        }
+        if parts.count >= 2 {
+            let a = parts[parts.count - 2]
+            let b = parts[parts.count - 1]
+            // Collapse long worktree suffixes
+            let bClean = b.components(separatedBy: "--claude-worktrees").first ?? b
+            return "\(a)/\(bClean)"
+        }
+        return parts.last ?? "project"
+    }
+
+    private static let isoDay: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private static let isoOut: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    // MARK: scan
+
+    /// Blocking file I/O — call off the main thread.
+    static func scan(days windowDays: Int) -> Report {
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-Double(windowDays) * 24 * 3600)
+        var dayMap: [String: (c: Int, g: Int, x: Int)] = [:]
+        // seed all days
+        for i in 0..<windowDays {
+            if let d = Calendar.current.date(byAdding: .day, value: -(windowDays - 1 - i), to: now) {
+                dayMap[isoDay.string(from: d)] = (0, 0, 0)
+            }
+        }
+
+        struct Acc {
+            var sources = Set<String>()
+            var sessions = 0
+            var messages = 0
+            var last = Date.distantPast
+        }
+        var projects: [String: Acc] = [:]
+
+        func bumpDay(_ date: Date, source: String) {
+            let key = isoDay.string(from: date)
+            guard var b = dayMap[key] else { return }
+            switch source {
+            case "claude": b.c += 1
+            case "grok": b.g += 1
+            case "codex": b.x += 1
+            default: break
+            }
+            dayMap[key] = b
+        }
+
+        func bumpProject(label: String, source: String, date: Date, messages: Int = 0) {
+            let id = label.lowercased()
+            var a = projects[id] ?? Acc()
+            a.sources.insert(source)
+            a.sessions += 1
+            a.messages += messages
+            if date > a.last { a.last = date }
+            projects[id] = a
+            bumpDay(date, source: source)
+        }
+
+        scanClaude(cutoff: cutoff, bump: bumpProject)
+        scanGrok(cutoff: cutoff, bump: bumpProject)
+        scanCodex(cutoff: cutoff, bump: bumpProject)
+
+        let dayBuckets: [DayBucket] = dayMap.keys.sorted().map { k in
+            let v = dayMap[k]!
+            return DayBucket(date: k, claude: v.c, grok: v.g, codex: v.x)
+        }
+
+        let rows: [ProjectRow] = projects.map { id, a in
+            let daysSince = max(0, Int(now.timeIntervalSince(a.last) / 86400))
+            let status: String
+            let score: Int
+            let hint: String
+            let why: String
+            // Heuristics — no LLM
+            if daysSince <= coldDays {
+                status = "active"
+                score = min(98, 55 + min(30, a.sessions) + max(0, 10 - daysSince))
+                hint = "Continue"
+                why = "Recent session activity on this Mac."
+            } else if a.sessions >= 8 && a.messages >= 500 {
+                status = "waste"
+                score = max(12, 35 - min(20, daysSince / 2))
+                hint = "Review or stop"
+                why = "High historical volume, then cold — possible attention waste."
+            } else if a.sessions >= 3 {
+                status = "cold"
+                score = max(18, 45 - daysSince)
+                hint = "Park or revive"
+                why = "Several sessions, then quiet for \(daysSince)d."
+            } else {
+                status = "cold"
+                score = max(10, 30 - daysSince)
+                hint = "Optional"
+                why = "Light history; not a priority by volume."
+            }
+            // Prefer short label as stored key id's display from first source path-ish
+            let label = id.contains("/") ? id : id
+            return ProjectRow(
+                id: id,
+                label: label,
+                sources: a.sources.sorted(),
+                sessions: a.sessions,
+                messages: a.messages,
+                lastISO: isoOut.string(from: a.last),
+                daysSince: daysSince,
+                status: status,
+                score: score,
+                continueHint: hint,
+                why: why)
+        }.sorted { $0.score > $1.score }
+
+        let models = readClaudeModels()
+        let totals = [
+            "claudeSessions": dayBuckets.map(\.claude).reduce(0, +),
+            "grokSessions": dayBuckets.map(\.grok).reduce(0, +),
+            "codexSessions": dayBuckets.map(\.codex).reduce(0, +),
+            "projects": rows.count,
+        ]
+
+        return Report(
+            generatedAt: isoOut.string(from: now),
+            windowDays: windowDays,
+            days: dayBuckets,
+            projects: rows,
+            models: models,
+            totals: totals,
+            privacyNote: "Local only. Project labels are last path segments. Chat message bodies are not included.",
+            claudeStatsAsOf: models.isEmpty ? nil : readClaudeStatsAsOf())
+    }
+
+    private static func scanClaude(cutoff: Date, bump: (String, String, Date, Int) -> Void) {
+        let root = URL(fileURLWithPath: NSHomeDirectory() + "/.claude/projects")
+        let fm = FileManager.default
+        guard let dirs = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
+        for dir in dirs {
+            guard let files = try? fm.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) else { continue }
+            for file in files where file.pathExtension == "jsonl" {
+                // skip subagent trees
+                if file.path.contains("/subagents/") { continue }
+                guard let rv = try? file.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+                      let mtime = rv.contentModificationDate, mtime >= cutoff else { continue }
+                if (rv.fileSize ?? 0) < 4000 { continue } // skip tiny pings
+                let label = publicLabel(from: dir.lastPathComponent)
+                bump(label, "claude", mtime, 0)
+            }
+        }
+    }
+
+    private static func scanGrok(cutoff: Date, bump: (String, String, Date, Int) -> Void) {
+        let root = URL(fileURLWithPath: NSHomeDirectory() + "/.grok/sessions")
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) else { return }
+        for case let url as URL in enumerator {
+            guard url.lastPathComponent == "summary.json" else { continue }
+            guard let mtime = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                  mtime >= cutoff else { continue }
+            // project is parent of session uuid folder
+            let projectEnc = url.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent
+            let label = publicLabel(from: projectEnc)
+            var msgs = 0
+            if let data = try? Data(contentsOf: url),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                msgs = (obj["num_chat_messages"] as? Int)
+                    ?? (obj["num_messages"] as? Int)
+                    ?? 0
+            }
+            bump(label, "grok", mtime, msgs)
+        }
+    }
+
+    private static func scanCodex(cutoff: Date, bump: (String, String, Date, Int) -> Void) {
+        let root = URL(fileURLWithPath: NSHomeDirectory() + "/.codex/sessions")
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) else { return }
+        for case let url as URL in enumerator {
+            let name = url.lastPathComponent
+            guard name.hasPrefix("rollout-"), name.hasSuffix(".jsonl") else { continue }
+            guard let mtime = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                  mtime >= cutoff else { continue }
+            var label = "codex"
+            // Read first few lines for cwd
+            if let handle = try? FileHandle(forReadingFrom: url) {
+                defer { try? handle.close() }
+                let chunk = handle.readData(ofLength: 12_000)
+                if let text = String(data: chunk, encoding: .utf8) {
+                    for line in text.split(separator: "\n").prefix(8) {
+                        guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                              (obj["type"] as? String) == "session_meta",
+                              let payload = obj["payload"] as? [String: Any],
+                              let cwd = payload["cwd"] as? String, !cwd.isEmpty else { continue }
+                        label = publicLabel(from: cwd)
+                        break
+                    }
+                }
+            }
+            bump(label, "codex", mtime, 0)
+        }
+    }
+
+    private static func readClaudeStatsAsOf() -> String? {
+        let p = NSHomeDirectory() + "/.claude/stats-cache.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: p)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return obj["lastComputedDate"] as? String
+    }
+
+    private static func readClaudeModels() -> [ModelRow] {
+        let p = NSHomeDirectory() + "/.claude/stats-cache.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: p)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let usage = obj["modelUsage"] as? [String: Any] else { return [] }
+        var rows: [ModelRow] = []
+        for (model, raw) in usage {
+            guard let u = raw as? [String: Any] else { continue }
+            let inp = intish(u["inputTokens"])
+            let out = intish(u["outputTokens"])
+            let cr = intish(u["cacheReadInputTokens"])
+            let cc = intish(u["cacheCreationInputTokens"])
+            let total = inp + out + cr + cc
+            guard total > 0 else { continue }
+            let short = model.replacingOccurrences(of: "claude-", with: "")
+            rows.append(ModelRow(model: short, total: total))
+        }
+        return Array(rows.sorted { $0.total > $1.total }.prefix(8))
+    }
+
+    private static func intish(_ v: Any?) -> Int {
+        if let i = v as? Int { return i }
+        if let n = v as? NSNumber { return n.intValue }
+        if let d = v as? Double { return Int(d) }
+        return 0
+    }
+
+    // MARK: write + open
+
+    @discardableResult
+    static func write(report: Report) throws -> URL {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try enc.encode(report)
+        try data.write(to: reportJSON, options: .atomic)
+        let jsonStr = String(data: data, encoding: .utf8) ?? "{}"
+        let html = htmlTemplate(embeddedJSON: jsonStr)
+        try html.write(to: reportHTML, atomically: true, encoding: .utf8)
+        return reportHTML
+    }
+
+    static func openLastReport() -> Bool {
+        let url = reportHTML
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        NSWorkspace.shared.open(url)
+        return true
+    }
+
+    /// Minimal offline board (no CDN). Injects REPORT_JSON.
+    static func htmlTemplate(embeddedJSON: String) -> String {
+        // Escape </script> in JSON
+        let safe = embeddedJSON.replacingOccurrences(of: "<", with: "\\u003c")
+        return """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Session Report · Usage Monitor</title>
+        <style>
+        :root{--bg:#0c0c0d;--elev:#141416;--hover:#1a1a1d;--line:#2a2a2e;--soft:#1e1e22;--text:#e8e8ea;--muted:#8b8b93;--dim:#5c5c64;--ok:#6ee7a8;--warn:#e8b86d;--hot:#f0a0a0;--info:#9bb4d0;--font:system-ui,-apple-system,sans-serif;--mono:ui-monospace,Menlo,monospace}
+        *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font)}
+        header{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:flex-end}
+        h1{margin:0;font-size:15px;font-weight:600}header p{margin:4px 0 0;font-size:12px;color:var(--muted);max-width:52ch;line-height:1.4}
+        .kpis{display:flex;gap:8px;flex-wrap:wrap}.kpi{background:var(--elev);border:1px solid var(--line);border-radius:8px;padding:8px 12px;min-width:84px}
+        .kpi b{display:block;font-size:16px;font-variant-numeric:tabular-nums}.kpi span{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+        main{padding:16px 20px 40px;display:grid;gap:20px;max-width:1100px;margin:0 auto}
+        h2{margin:0 0 10px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+        .card{background:var(--elev);border:1px solid var(--line);border-radius:10px;padding:14px}
+        .sub{font-size:11px;color:var(--dim);margin:0 0 12px;line-height:1.35}
+        .bars{display:flex;flex-direction:column;gap:7px}
+        .row{display:grid;grid-template-columns:120px 1fr 48px;gap:8px;align-items:center;font-size:11px}
+        .lab{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .track{height:8px;background:var(--soft);border-radius:4px;overflow:hidden}
+        .fill{height:100%;background:linear-gradient(90deg,#3a3a44,#9a9aa8);border-radius:4px}
+        .fill.ok{background:linear-gradient(90deg,#1e3a2c,#6ee7a8)}
+        .fill.hot{background:linear-gradient(90deg,#3a2222,#f0a0a0)}
+        .fill.warn{background:linear-gradient(90deg,#3a3020,#e8b86d)}
+        .fill.info{background:linear-gradient(90deg,#243040,#9bb4d0)}
+        .n{font-family:var(--mono);color:var(--dim);text-align:right;font-variant-numeric:tabular-nums}
+        .daychart{display:flex;align-items:flex-end;gap:2px;height:120px;padding-top:8px}
+        .day{flex:1;display:flex;flex-direction:column;justify-content:flex-end;gap:1px;min-width:0}
+        .seg{width:100%;border-radius:1px 1px 0 0}.seg.c{background:#9bb4d0}.seg.g{background:#6ee7a8}.seg.x{background:#e8b86d}
+        .legend{display:flex;gap:12px;font-size:11px;color:var(--dim);margin-top:8px}
+        table{width:100%;border-collapse:collapse;font-size:12px}
+        th{text-align:left;font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;padding:6px 8px;border-bottom:1px solid var(--line)}
+        td{padding:8px;border-bottom:1px solid var(--soft);vertical-align:top}
+        tr:hover td{background:var(--hover)}
+        .badge{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;padding:2px 6px;border-radius:4px;border:1px solid var(--line);color:var(--muted)}
+        .badge.active{color:var(--ok);border-color:#2a4034}.badge.cold{color:var(--warn);border-color:#4a3c28}.badge.waste{color:var(--hot);border-color:#4a3030}
+        .sc{font-family:var(--mono);font-weight:600;font-variant-numeric:tabular-nums}
+        .why{color:var(--muted);font-size:11px;line-height:1.35}
+        .note{font-size:11px;color:var(--dim);line-height:1.4;margin-top:8px}
+        .grid2{display:grid;grid-template-columns:1.2fr 1fr;gap:12px}
+        @media(max-width:800px){.grid2{grid-template-columns:1fr}}
+        </style>
+        </head>
+        <body>
+        <header>
+          <div>
+            <h1>Session Report</h1>
+            <p id="blurb">Local multi-CLI retrospective from Usage Monitor. Nothing left this Mac.</p>
+          </div>
+          <div class="kpis" id="kpis"></div>
+        </header>
+        <main>
+          <section class="grid2">
+            <div class="card">
+              <h2>Sessions per day</h2>
+              <p class="sub">Claude · Grok · Codex session files by modification day (this window).</p>
+              <div class="daychart" id="daychart"></div>
+              <div class="legend"><span style="color:#9bb4d0">● Claude</span><span style="color:#6ee7a8">● Grok</span><span style="color:#e8b86d">● Codex</span></div>
+            </div>
+            <div class="card">
+              <h2>Claude model volume</h2>
+              <p class="sub" id="modelSub">From local stats-cache when present (cache-heavy totals).</p>
+              <div class="bars" id="models"></div>
+            </div>
+          </section>
+          <section class="card">
+            <h2>Continue ranking</h2>
+            <p class="sub">Heuristic score from recency + volume. Not cloud AI — rules only. Click a row for details in the table.</p>
+            <table>
+              <thead><tr><th>#</th><th>Score</th><th>Project</th><th>Status</th><th>Sessions</th><th>Last</th><th>Verdict</th><th>Why</th></tr></thead>
+              <tbody id="rank"></tbody>
+            </table>
+          </section>
+          <section class="card">
+            <h2>Attention by project (Grok messages when known)</h2>
+            <div class="bars" id="msgs"></div>
+          </section>
+          <p class="note" id="privacy"></p>
+        </main>
+        <script>
+        const REPORT = \(safe);
+        function fmt(n){if(n>=1e9)return(n/1e9).toFixed(2)+'B';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return String(n)}
+        function bars(el, rows, tone){
+          const max=Math.max(...rows.map(r=>r[1]),1);
+          el.replaceChildren(...rows.map(([lab,n])=>{
+            const d=document.createElement('div'); d.className='row';
+            d.innerHTML=`<div class="lab" title="${lab}">${lab}</div><div class="track"><div class="fill ${tone}" style="width:${Math.round(100*n/max)}%"></div></div><div class="n">${fmt(n)}</div>`;
+            return d;
+          }));
+        }
+        const t=REPORT.totals||{};
+        document.getElementById('kpis').innerHTML=[
+          ['Claude', t.claudeSessions||0],['Grok', t.grokSessions||0],['Codex', t.codexSessions||0],['Projects', t.projects||0]
+        ].map(([l,v])=>`<div class="kpi"><b>${fmt(v)}</b><span>${l}</span></div>`).join('');
+        document.getElementById('blurb').textContent=`Last ${REPORT.windowDays} days · generated ${REPORT.generatedAt||''}`;
+        document.getElementById('privacy').textContent=REPORT.privacyNote||'';
+        const days=REPORT.days||[];
+        const maxD=Math.max(...days.map(d=>d.claude+d.grok+d.codex),1);
+        const dc=document.getElementById('daychart');
+        dc.replaceChildren(...days.map(d=>{
+          const total=d.claude+d.grok+d.codex;
+          const h=Math.max(2, Math.round(110*total/maxD));
+          const wrap=document.createElement('div'); wrap.className='day'; wrap.title=d.date+' · '+total;
+          const parts=[['c',d.claude],['g',d.grok],['x',d.codex]].filter(x=>x[1]>0);
+          const sum=parts.reduce((a,b)=>a+b[1],0)||1;
+          parts.forEach(([cls,n])=>{
+            const s=document.createElement('div'); s.className='seg '+cls;
+            s.style.height=Math.max(1, Math.round(h*n/sum))+'px';
+            wrap.appendChild(s);
+          });
+          if(!parts.length){const s=document.createElement('div'); s.style.height='2px'; s.style.background='#1e1e22'; wrap.appendChild(s)}
+          return wrap;
+        }));
+        const models=(REPORT.models||[]).map(m=>[m.model,m.total]);
+        if(models.length){bars(document.getElementById('models'), models, 'info');
+          document.getElementById('modelSub').textContent='stats-cache as of '+(REPORT.claudeStatsAsOf||'unknown')+' · totals include cache reads';
+        } else {
+          document.getElementById('models').innerHTML='<div class="sub">No Claude stats-cache found on this Mac.</div>';
+        }
+        const projs=REPORT.projects||[];
+        document.getElementById('rank').innerHTML=projs.map((p,i)=>`<tr>
+          <td>${i+1}</td><td class="sc">${p.score}</td>
+          <td><strong>${p.label}</strong><div class="why">${(p.sources||[]).join(' · ')}</div></td>
+          <td><span class="badge ${p.status}">${p.status}</span></td>
+          <td class="n">${p.sessions}${p.messages?(' / '+fmt(p.messages)+' msg'):''}</td>
+          <td class="why">${p.daysSince}d ago</td>
+          <td>${p.continueHint}</td>
+          <td class="why">${p.why}</td>
+        </tr>`).join('');
+        const msgRows=projs.filter(p=>p.messages>0).sort((a,b)=>b.messages-a.messages).slice(0,12).map(p=>[p.label,p.messages]);
+        if(msgRows.length) bars(document.getElementById('msgs'), msgRows, 'ok');
+        else document.getElementById('msgs').innerHTML='<div class="sub">No per-project message counts (Grok summaries provide these when present).</div>';
+        </script>
+        </body>
+        </html>
+        """
+    }
+}
+
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let statusMenu = NSMenu()    // built once; rebuilt on open via NSMenuDelegate
@@ -4447,6 +5109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(whatsNewMenuItem())
         menu.addItem(updatesMenuItem())
         menu.addItem(item("Refresh now", #selector(poll), "r"))
+        menu.addItem(sessionReportMenuItem())
 
         // Caffeinate Mode — keep awake + optional lid-shut + hotspot.
         menu.addItem(laptopModeMenuItem())
@@ -4553,6 +5216,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         menu.addItem(quit)
+
+        // After the menu is built: count this open; clear NEW chips after 2 opens.
+        WhatsNew.noteStatusMenuOpen()
+    }
+
+    // MARK: Session Report menu
+
+    private var sessionRadarBusy = false
+
+    func sessionReportMenuItem() -> NSMenuItem {
+        let root = NSMenuItem(title: "Session Report", action: nil, keyEquivalent: "")
+        WhatsNew.applyFeatureChip(root, .sessionRadar)
+        root.toolTip = """
+        Scan local Claude, Codex, and Grok session files on this Mac.
+        Builds an interactive board: activity by day, project ranking, cold projects.
+        Privacy-first: no chat bodies; project names are last path segments only.
+        Nothing is uploaded.
+        """
+        let sub = NSMenu()
+        let s7 = NSMenuItem(title: "Scan Last 7 Days", action: #selector(runSessionRadar7), keyEquivalent: "")
+        s7.target = self
+        s7.isEnabled = !sessionRadarBusy
+        sub.addItem(s7)
+        let s35 = NSMenuItem(title: "Scan Last 35 Days", action: #selector(runSessionRadar35), keyEquivalent: "")
+        s35.target = self
+        s35.isEnabled = !sessionRadarBusy
+        sub.addItem(s35)
+        sub.addItem(.separator())
+        let open = NSMenuItem(title: "Open Last Report", action: #selector(openLastSessionReport), keyEquivalent: "")
+        open.target = self
+        open.isEnabled = FileManager.default.fileExists(atPath: SessionRadar.reportHTML.path)
+        sub.addItem(open)
+        sub.addItem(.separator())
+        let note = NSMenuItem(title: "Local only · no chat content", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        sub.addItem(note)
+        root.submenu = sub
+        return root
+    }
+
+    @objc func runSessionRadar7() { runSessionRadar(days: 7) }
+    @objc func runSessionRadar35() { runSessionRadar(days: 35) }
+
+    func runSessionRadar(days: Int) {
+        guard !sessionRadarBusy else { return }
+        sessionRadarBusy = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            defer {
+                DispatchQueue.main.async { self?.sessionRadarBusy = false }
+            }
+            do {
+                let report = SessionRadar.scan(days: days)
+                let url = try SessionRadar.write(report: report)
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.open(url)
+                    let content = UNMutableNotificationContent()
+                    content.title = "Session Report ready"
+                    content.body = "Last \(days) days · \(report.totals["projects"] ?? 0) projects · local only"
+                    let req = UNNotificationRequest(
+                        identifier: "session-radar-\(days)",
+                        content: content,
+                        trigger: nil)
+                    UNUserNotificationCenter.current().add(req)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    let alert = NSAlert()
+                    alert.messageText = "Session Report failed"
+                    alert.informativeText = error.localizedDescription
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    @objc func openLastSessionReport() {
+        if !SessionRadar.openLastReport() {
+            let alert = NSAlert()
+            alert.messageText = "No report yet"
+            alert.informativeText = "Choose Scan Last 7 Days or Scan Last 35 Days first."
+            alert.alertStyle = .informational
+            alert.runModal()
+        }
     }
 
     // MARK: Caffeinate Mode menu
@@ -5686,6 +6433,44 @@ if CommandLine.arguments.contains("--laptop-mode-self-test") {
         lm.deactivate()
         print("Cleaned up. Use --keep to leave active.")
         exit(idleOK && lidOK && result.ok ? 0 : 1)
+    }
+}
+
+// Headless Session Report (smoke / automation):
+//   UsageMonitor.app/Contents/MacOS/UsageMonitor --session-report [--days 7|35]
+if CommandLine.arguments.contains("--session-report") {
+    var days = 35
+    if let idx = CommandLine.arguments.firstIndex(of: "--days"),
+       idx + 1 < CommandLine.arguments.count,
+       let n = Int(CommandLine.arguments[idx + 1]), n > 0, n <= 365 {
+        days = n
+    }
+    do {
+        let report = SessionRadar.scan(days: days)
+        let url = try SessionRadar.write(report: report)
+        print("OK: Session Report written")
+        print("  windowDays=\(report.windowDays)")
+        print("  projects=\(report.totals["projects"] ?? 0)")
+        print("  claude=\(report.totals["claudeSessions"] ?? 0)")
+        print("  grok=\(report.totals["grokSessions"] ?? 0)")
+        print("  codex=\(report.totals["codexSessions"] ?? 0)")
+        print("  html=\(url.path)")
+        // Privacy guard: report must not contain this Mac's home directory path.
+        let home = NSHomeDirectory()
+        if let html = try? String(contentsOf: url, encoding: .utf8), html.contains(home) {
+            print("FAIL: report HTML contains home path (privacy scrub broken)")
+            exit(1)
+        }
+        if let data = try? Data(contentsOf: SessionRadar.reportJSON),
+           let text = String(data: data, encoding: .utf8), text.contains(home) {
+            print("FAIL: report JSON contains home path (privacy scrub broken)")
+            exit(1)
+        }
+        print("PASS: no home path in report")
+        exit(0)
+    } catch {
+        fputs("FAIL: \(error.localizedDescription)\n", stderr)
+        exit(1)
     }
 }
 
