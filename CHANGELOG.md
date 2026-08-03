@@ -8,6 +8,18 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.8.0
+
+- **Session Report board parity.** Full interactive board matching the dense
+  command-board UX: TradingView Lightweight Charts (CSS fallback offline),
+  platform cards, clickable tiles, filters/search, detail drawer, tabs
+  (Overview · Waiting · Ranking · Projects · Cold/waste).
+- **Smarter scores** so not every active project lands at 95; waiting heuristics
+  for waste/cold/high-volume loops.
+- **Include Session Titles** menu toggle (off by default) — short metadata only.
+- Path labels cleaned (worktrees collapsed, no home username). Template ships
+  as `session-radar-report.html` in the app bundle.
+
 ## 2.7.0
 
 - **Session Report (major).** Scan local Claude Code, Codex, and Grok session

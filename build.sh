@@ -19,6 +19,8 @@ swiftc -O UsageMonitor.swift -o "$MACOS/UsageMonitor" \
 
 # App icon — used by Finder, the Dock, and macOS notifications.
 cp AppIcon.icns "$RES/AppIcon.icns"
+# Session Report HTML board template
+cp assets/session-radar-report.html "$RES/session-radar-report.html"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -30,8 +32,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>      <string>com.usagemonitor.app</string>
     <key>CFBundleExecutable</key>      <string>UsageMonitor</string>
     <key>CFBundleIconFile</key>        <string>AppIcon</string>
-    <key>CFBundleVersion</key>         <string>2.7.0</string>
-    <key>CFBundleShortVersionString</key> <string>2.7.0</string>
+    <key>CFBundleVersion</key>         <string>2.8.0</string>
+    <key>CFBundleShortVersionString</key> <string>2.8.0</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>NSPrincipalClass</key>        <string>NSApplication</string>
     <key>LSUIElement</key>             <true/>

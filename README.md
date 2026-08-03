@@ -50,11 +50,13 @@ stays short):
 
 **Session Report** looks backward across your local CLI history (Claude Code,
 Codex, Grok Build when present). Choose **Scan Last 7 Days** or **Scan Last 35
-Days** — Usage Monitor builds an interactive board in the browser: activity by
-day, a continue ranking, cold projects, and (when available) Claude model
-volume from the local stats cache. **Nothing is uploaded.** Chat bodies are
-not included; project names are shortened to last path segments only. Reopen
-anytime with **Open Last Report**.
+Days** — Usage Monitor builds a full interactive board in the browser: multi-series
+sessions-per-day charts, platform cards, project tiles, filters, a detail drawer,
+continue ranking, waiting heuristics, and Claude model volume when the local
+stats cache is present. Optional **Include Session Titles** (off by default)
+adds short metadata titles only. **Nothing is uploaded.** Chat bodies are never
+included; project names are path tails only. Reopen anytime with **Open Last
+Report**.
 
 **Caffeinate Mode** keeps the Mac awake (desktop or laptop). On a MacBook you
 can also **keep the laptop on with the lid shut**. While active, a glowing cup
