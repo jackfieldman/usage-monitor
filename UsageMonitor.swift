@@ -199,6 +199,11 @@ enum WhatsNew {
             "When an update is waiting: “Update available” scrolls across the menu bar once an hour",
             "Updates menu: install now, auto-update, skip this version, skip all, pause for days/weeks",
         ]),
+        ("2.8.1", "Caffeinate Off really allows sleep", [
+            "Turn Off force-releases IOPM assertions and kills the caffeinate helper",
+            "Orphan helpers from a previous launch are cleaned so screensaver can run",
+            "Off overrides every keep-awake path this app owns (idle + lid-shut + display)",
+        ]),
         ("2.5.2", "Caffeinate Mode & polish", [
             "Caffeinate Mode: keep desktops and laptops awake; laptop lid-shut option",
             "Glowing menu-bar cup while active — click for a reminder",
@@ -2711,6 +2716,8 @@ final class LaptopModeController {
     private let joinKey = "laptopMode.joinHotspot"
     private let clamshellKey = "laptopMode.clamshell"   // lid-shut option
     private let activeKey = "laptopMode.wasActive"
+    /// Last helper PID — survives relaunch so we can kill orphans that still block sleep.
+    private let helperPidKey = "laptopMode.caffeinateHelperPid"
     private let keychainService = "com.usagemonitor.app.hotspot"
 
     private var idleAssertionID: IOPMAssertionID = 0
@@ -2718,6 +2725,7 @@ final class LaptopModeController {
     private var lidAssertionID: IOPMAssertionID = 0
     private var lidAssertionHeld = false
     private var caffeinate: Process?
+    private var caffeinatePID: pid_t = 0
     private(set) var lastProof: String = ""
     private(set) var lastError: String?
 
@@ -2799,6 +2807,9 @@ final class LaptopModeController {
         var lines: [String] = []
         var ok = true
 
+        // Start from a clean slate so a prior half-dead helper cannot stack.
+        forceReleaseAllKeepAwake(reason: "pre-activate clean")
+
         // 1) Always hold idle keep-awake when Caffeinate Mode is on.
         let idle = engageIdleKeepAwake()
         lines.append(idle.line)
@@ -2810,7 +2821,7 @@ final class LaptopModeController {
             lines.append(lid.line)
             if !lid.ok { ok = false; lastError = lid.line }
         } else {
-            releaseLidShut()
+            releaseLidShut(restartHelper: false)
             if Self.isPortableMac {
                 lines.append("Lid shut: off (option disabled)")
             } else {
@@ -2844,21 +2855,42 @@ final class LaptopModeController {
         return (ok, lastProof)
     }
 
+    /// Turn Caffeinate Mode off and **force** sleep/screensaver to be allowed again
+    /// by this app. Overrides every keep-awake path we own (IOPM + caffeinate helper
+    /// + orphaned helpers from a previous launch). Does not touch other apps.
     func deactivate() {
-        releaseLidShut()
-        releaseIdleKeepAwake()
+        // Flip preference first so a concurrent restore/launch cannot re-arm.
         isActive = false
-        lastProof = (["Caffeinate Mode turned off.", "Sleep assertions released."]
-            + statusSnapshot()).joined(separator: "\n")
+        let killed = forceReleaseAllKeepAwake(reason: "user turned off")
+        var lines = [
+            "Caffeinate Mode turned off.",
+            "Sleep + screensaver allowed again (this app’s keep-awake fully released).",
+        ]
+        lines.append(contentsOf: killed)
+        lines.append(contentsOf: statusSnapshot())
+        // Prove our names / helper are gone.
+        lines.append(contentsOf: verifySleepAllowed())
+        lastProof = lines.joined(separator: "\n")
         NSLog("UsageMonitor Caffeinate Mode deactivate:\n\(lastProof)")
     }
 
     /// Re-assert after relaunch if the user left Caffeinate Mode on.
     func restoreIfNeeded() {
+        // Always reap any orphaned helper from a previous process first.
+        // Otherwise an old `caffeinate -d` can block screensaver forever.
+        let orphans = killAllOwnedCaffeinateHelpers()
+        if !orphans.isEmpty {
+            NSLog("UsageMonitor Caffeinate: cleaned orphans on launch: \(orphans.joined(separator: "; "))")
+        }
         guard isActive else { return }
         _ = engageIdleKeepAwake()
         if Self.isPortableMac && lidShutOnActivate { _ = engageLidShut() }
         // Do not force a Wi‑Fi rejoin on every launch — only re-hold sleep.
+    }
+
+    /// True when this process is currently holding any keep-awake path.
+    var isEngaged: Bool {
+        idleAssertionHeld || lidAssertionHeld || (caffeinatePID > 0 && isProcessAlive(caffeinatePID))
     }
 
     // MARK: Wi‑Fi
@@ -2991,11 +3023,7 @@ final class LaptopModeController {
 
     private func releaseIdleKeepAwake() {
         stopCaffeinateHelper()
-        if idleAssertionHeld {
-            IOPMAssertionRelease(idleAssertionID)
-            idleAssertionHeld = false
-            idleAssertionID = 0
-        }
+        releaseAssertionID(&idleAssertionID, held: &idleAssertionHeld)
     }
 
     /// Stronger: prevent system sleep so a laptop can stay on with the lid shut.
@@ -3019,17 +3047,50 @@ final class LaptopModeController {
         return (true, "Lid shut: PreventSystemSleep held (#\(id)) — lid may stay closed")
     }
 
-    private func releaseLidShut() {
-        if lidAssertionHeld {
-            IOPMAssertionRelease(lidAssertionID)
-            lidAssertionHeld = false
-            lidAssertionID = 0
-        }
+    private func releaseLidShut(restartHelper: Bool = true) {
+        releaseAssertionID(&lidAssertionID, held: &lidAssertionHeld)
         // Downgrade caffeinate helper flags if idle is still held.
-        if idleAssertionHeld { startCaffeinateHelper(lidShut: false) }
+        if restartHelper && idleAssertionHeld { startCaffeinateHelper(lidShut: false) }
+    }
+
+    private func releaseAssertionID(_ id: inout IOPMAssertionID, held: inout Bool) {
+        if held || id != 0 {
+            let result = IOPMAssertionRelease(id)
+            if result != kIOReturnSuccess && result != kIOReturnNotFound {
+                NSLog("UsageMonitor IOPMAssertionRelease(#\(id)) → IOReturn \(result)")
+            }
+        }
+        held = false
+        id = 0
+    }
+
+    /// Drop every keep-awake path owned by this app. Returns human-readable lines.
+    @discardableResult
+    private func forceReleaseAllKeepAwake(reason: String) -> [String] {
+        var lines: [String] = ["force-release (\(reason)):"]
+        // Order: stop helpers first (they hold display sleep via -d), then IOPM.
+        let killed = killAllOwnedCaffeinateHelpers()
+        if killed.isEmpty {
+            lines.append("  caffeinate helper: none running")
+        } else {
+            lines.append(contentsOf: killed.map { "  \($0)" })
+        }
+        if lidAssertionHeld || lidAssertionID != 0 {
+            lines.append("  releasing lid-shut assertion #\(lidAssertionID)")
+        }
+        releaseAssertionID(&lidAssertionID, held: &lidAssertionHeld)
+        if idleAssertionHeld || idleAssertionID != 0 {
+            lines.append("  releasing idle assertion #\(idleAssertionID)")
+        }
+        releaseAssertionID(&idleAssertionID, held: &idleAssertionHeld)
+        caffeinate = nil
+        caffeinatePID = 0
+        UserDefaults.standard.removeObject(forKey: helperPidKey)
+        return lines
     }
 
     /// `caffeinate` helper mirrors assertions (belt-and-braces).
+    /// `-d` blocks display sleep / screensaver while mode is on; OFF must kill this.
     private func startCaffeinateHelper(lidShut: Bool) {
         stopCaffeinateHelper()
         let p = Process()
@@ -3038,21 +3099,142 @@ final class LaptopModeController {
         p.arguments = lidShut ? ["-s", "-i", "-d", "-m"] : ["-i", "-d", "-m"]
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
+        // Detach so we can kill by PID even if the Process object is lost.
+        p.qualityOfService = .userInitiated
         do {
             try p.run()
             caffeinate = p
+            caffeinatePID = p.processIdentifier
+            UserDefaults.standard.set(Int(caffeinatePID), forKey: helperPidKey)
+            NSLog("UsageMonitor caffeinate helper started pid=\(caffeinatePID) lidShut=\(lidShut)")
         } catch {
             NSLog("UsageMonitor caffeinate start failed: \(error)")
             caffeinate = nil
+            caffeinatePID = 0
+            UserDefaults.standard.removeObject(forKey: helperPidKey)
         }
     }
 
     private func stopCaffeinateHelper() {
-        if let p = caffeinate, p.isRunning {
-            p.terminate()
-            p.waitUntilExit()
+        let pids = ownedCaffeinatePIDs()
+        for pid in pids {
+            forceKillPID(pid, label: "caffeinate helper")
         }
         caffeinate = nil
+        caffeinatePID = 0
+        UserDefaults.standard.removeObject(forKey: helperPidKey)
+    }
+
+    /// Every caffeinate PID we own: tracked Process, persisted PID, and direct children.
+    private func ownedCaffeinatePIDs() -> [pid_t] {
+        var set = Set<pid_t>()
+        if let p = caffeinate, p.isRunning {
+            set.insert(p.processIdentifier)
+        }
+        if caffeinatePID > 0 { set.insert(caffeinatePID) }
+        let stored = UserDefaults.standard.integer(forKey: helperPidKey)
+        if stored > 0 { set.insert(pid_t(stored)) }
+        for child in childCaffeinatePIDs() {
+            set.insert(child)
+        }
+        return set.filter { $0 > 1 && isProcessAlive($0) && isCaffeinateProcess($0) }
+    }
+
+    @discardableResult
+    private func killAllOwnedCaffeinateHelpers() -> [String] {
+        let pids = ownedCaffeinatePIDs()
+        guard !pids.isEmpty else { return [] }
+        var lines: [String] = []
+        for pid in pids {
+            let ok = forceKillPID(pid, label: "caffeinate")
+            lines.append(ok
+                ? "killed caffeinate pid \(pid)"
+                : "tried to kill caffeinate pid \(pid) (may already be gone)")
+        }
+        caffeinate = nil
+        caffeinatePID = 0
+        UserDefaults.standard.removeObject(forKey: helperPidKey)
+        return lines
+    }
+
+    private func childCaffeinatePIDs() -> [pid_t] {
+        let selfPid = ProcessInfo.processInfo.processIdentifier
+        // pgrep -P <ppid> -x caffeinate  (exact name)
+        let out = shell("/usr/bin/pgrep -P \(selfPid) -x caffeinate || true")
+        return out
+            .split(whereSeparator: { $0.isNewline || $0.isWhitespace })
+            .compactMap { Int32($0) }
+    }
+
+    private func isProcessAlive(_ pid: pid_t) -> Bool {
+        guard pid > 1 else { return false }
+        return kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    private func isCaffeinateProcess(_ pid: pid_t) -> Bool {
+        // Read argv0 via `ps` — only kill if it really is caffeinate (never a random PID reuse).
+        let out = shell("/bin/ps -p \(pid) -o comm= 2>/dev/null").trimmingCharacters(in: .whitespacesAndNewlines)
+        if out == "caffeinate" || out.hasSuffix("/caffeinate") { return true }
+        let args = shell("/bin/ps -p \(pid) -o args= 2>/dev/null")
+        return args.contains("/usr/bin/caffeinate") || args.hasPrefix("caffeinate")
+    }
+
+    @discardableResult
+    private func forceKillPID(_ pid: pid_t, label: String) -> Bool {
+        guard pid > 1 else { return false }
+        guard isProcessAlive(pid) else { return true }
+        // SIGTERM first so caffeinate can drop its IOPM assertions cleanly.
+        kill(pid, SIGTERM)
+        let deadline = Date().addingTimeInterval(0.8)
+        while Date() < deadline {
+            if !isProcessAlive(pid) { return true }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if isProcessAlive(pid) {
+            NSLog("UsageMonitor \(label) pid \(pid) ignored SIGTERM — SIGKILL")
+            kill(pid, SIGKILL)
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        // Also drop the Process object if it matches.
+        if let p = caffeinate, p.processIdentifier == pid {
+            caffeinate = nil
+        }
+        return !isProcessAlive(pid)
+    }
+
+    /// Post-off proof: **this process** must not hold keep-awake. Other apps (or a
+    /// second Usage Monitor) may still appear in pmset — we do not kill those.
+    private func verifySleepAllowed() -> [String] {
+        Thread.sleep(forTimeInterval: 0.25)
+        var lines: [String] = []
+        let helperStill = !ownedCaffeinatePIDs().isEmpty
+            || (caffeinatePID > 0 && isProcessAlive(caffeinatePID))
+        let flagsStill = idleAssertionHeld || lidAssertionHeld
+            || idleAssertionID != 0 || lidAssertionID != 0
+        let selfPid = ProcessInfo.processInfo.processIdentifier
+        let pm = shell("/usr/bin/pmset -g assertions")
+        // Only count pmset rows owned by *this* PID.
+        let oursInPmset = pm.split(separator: "\n").contains { line in
+            let s = String(line)
+            return s.contains("pid \(selfPid)(")
+                && (s.contains(Self.idleAssertionName) || s.contains(Self.lidAssertionName))
+        }
+        if !helperStill && !flagsStill && !oursInPmset {
+            lines.append("verify: OK — this process holds no keep-awake; helper gone")
+            lines.append("verify: sleep + screensaver allowed from Usage Monitor’s side")
+            if pm.contains(Self.idleAssertionName) || pm.contains(Self.lidAssertionName) {
+                lines.append("verify: note — another process still lists Usage Monitor assertion names (not us)")
+            }
+        } else {
+            if flagsStill { lines.append("verify: WARN — in-process assertion flags still set") }
+            if helperStill { lines.append("verify: WARN — caffeinate helper still alive") }
+            if oursInPmset { lines.append("verify: WARN — pmset still lists our pid \(selfPid) keep-awake") }
+            // One more hard pass.
+            _ = killAllOwnedCaffeinateHelpers()
+            releaseAssertionID(&idleAssertionID, held: &idleAssertionHeld)
+            releaseAssertionID(&lidAssertionID, held: &lidAssertionHeld)
+        }
+        return lines
     }
 
     // MARK: proof / status
@@ -3073,8 +3255,12 @@ final class LaptopModeController {
         }
         lines.append("Idle keep-awake: \(idleAssertionHeld ? "yes #\(idleAssertionID)" : "no")")
         lines.append("Lid-shut assertion: \(lidAssertionHeld ? "yes #\(lidAssertionID)" : "no")")
-        if let pid = caffeinate?.processIdentifier {
-            lines.append("caffeinate helper: pid \(pid)")
+        let helperPid = caffeinatePID > 0 ? caffeinatePID : (caffeinate?.processIdentifier ?? 0)
+        if helperPid > 0 {
+            let alive = isProcessAlive(helperPid)
+            lines.append("caffeinate helper: pid \(helperPid)\(alive ? "" : " (dead)")")
+        } else {
+            lines.append("caffeinate helper: none")
         }
         Thread.sleep(forTimeInterval: 0.35)
         let pm = shell("/usr/bin/pmset -g assertions")
@@ -3089,7 +3275,20 @@ final class LaptopModeController {
             lines.append("pmset: lid assertion held in-process (#\(lidAssertionID))")
         }
         if !idleAssertionHeld && !lidAssertionHeld {
-            lines.append("pmset: no Caffeinate Mode assertions")
+            let selfPid = ProcessInfo.processInfo.processIdentifier
+            let ours = pm.split(separator: "\n").contains { line in
+                let s = String(line)
+                return s.contains("pid \(selfPid)(")
+                    && (s.contains(Self.idleAssertionName) || s.contains(Self.lidAssertionName))
+            }
+            lines.append(ours
+                ? "pmset: WARN this pid still listed (unexpected)"
+                : "pmset: this process holds no Caffeinate Mode assertions")
+        }
+        // Detect orphan helpers that would still block screensaver after a bad OFF.
+        let orphans = ownedCaffeinatePIDs()
+        if !isActive && !orphans.isEmpty {
+            lines.append("pmset: WARN leftover caffeinate pid(s) \(orphans.map(String.init).joined(separator: ", "))")
         }
         let batt = shell("/usr/bin/pmset -g batt")
         if batt.lowercased().contains("ac power") {
@@ -3171,8 +3370,15 @@ final class LaptopModeController {
     }
 
     deinit {
-        releaseLidShut()
-        releaseIdleKeepAwake()
+        // Light cleanup only — no sleeps/shell. Preference `isActive` is left alone
+        // so restoreIfNeeded can re-arm after relaunch if the user left mode on.
+        if let p = caffeinate, p.isRunning { p.terminate() }
+        if caffeinatePID > 1 { kill(caffeinatePID, SIGTERM); kill(caffeinatePID, SIGKILL) }
+        let stored = UserDefaults.standard.integer(forKey: helperPidKey)
+        if stored > 1 { kill(pid_t(stored), SIGTERM); kill(pid_t(stored), SIGKILL) }
+        if idleAssertionHeld || idleAssertionID != 0 { IOPMAssertionRelease(idleAssertionID) }
+        if lidAssertionHeld || lidAssertionID != 0 { IOPMAssertionRelease(lidAssertionID) }
+        UserDefaults.standard.removeObject(forKey: helperPidKey)
     }
 }
 
@@ -4699,7 +4905,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 tip.append("")
                 tip.append("Update \(up.version) available — open Updates in the menu")
             }
-            if laptopMode.isActive {
+            if laptopMode.isActive || laptopMode.isEngaged {
                 tip.append("")
                 tip.append("Caffeinate Mode is on — glowing cup keeps the system awake.")
                 if laptopMode.lidShutEngaged {
@@ -4731,7 +4937,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Caffeinate glow (menu-bar cup)
 
     func updateCaffeinateGlow() {
-        if laptopMode.isActive {
+        if laptopMode.isActive || laptopMode.isEngaged {
             if caffeinateStatusItem == nil {
                 let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
                 item.button?.target = self
@@ -5461,7 +5667,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func laptopModeMenuItem() -> NSMenuItem {
-        let active = laptopMode.isActive
+        // Prefer live engagement so a stuck helper cannot show “Off” while still blocking sleep.
+        let active = laptopMode.isActive || laptopMode.isEngaged
         let root = NSMenuItem(title: "Caffeinate Mode", action: nil, keyEquivalent: "")
         WhatsNew.applyFeatureChip(root, .laptopMode)
         let status = active ? "Active" : "Off"
@@ -5477,6 +5684,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Keeps this Mac awake so it doesn’t sleep from idle — desktops and laptops.
         On a laptop you can also keep it running with the lid closed.
         A glowing cup appears in the menu bar while Active; click it for a reminder.
+        Turn Off fully releases keep-awake so sleep and screensaver can run again.
         """
 
         let sub = NSMenu()
@@ -5491,7 +5699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ? "Status: Active — system on + lid-shut keep-awake"
                 : "Status: Active — system stays awake"
         } else {
-            statusText = "Status: Off — Mac may sleep as usual"
+            statusText = "Status: Off — sleep & screensaver allowed"
         }
         let statusRow = disabled(statusText)
         if active {
@@ -5612,7 +5820,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         deactivateLaptopModeQuiet()
         let alert = NSAlert()
         alert.messageText = "Caffeinate Mode is off"
-        alert.informativeText = "Sleep will work normally again. The glowing cup has left the menu bar."
+        alert.informativeText = """
+        Sleep and screensaver are allowed again.
+
+        Usage Monitor released its keep-awake assertions and stopped its caffeinate helper (including any leftover helper from a previous run). Other apps can still keep the Mac awake on their own.
+        """
         alert.addButton(withTitle: "OK")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
@@ -5621,6 +5833,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Turn off without an extra alert (used by the modern notice panel).
     func deactivateLaptopModeQuiet() {
         laptopMode.deactivate()
+        // Glow + menu status must flip immediately off actual engagement.
+        updateCaffeinateGlow()
         render()
     }
 
@@ -6527,9 +6741,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 //   UsageMonitor.app/Contents/MacOS/UsageMonitor --laptop-mode-self-test
 //   … --laptop-mode-self-test --hotspot "MyPhone"   # also try join
 //   … --laptop-mode-self-test --keep                 # leave mode active
+//   … --laptop-mode-self-test --off-only             # only test force-off path
 if CommandLine.arguments.contains("--laptop-mode-self-test") {
     let lm = LaptopModeController.shared
     let keep = CommandLine.arguments.contains("--keep")
+    let offOnly = CommandLine.arguments.contains("--off-only")
     if let idx = CommandLine.arguments.firstIndex(of: "--hotspot"),
        idx + 1 < CommandLine.arguments.count {
         lm.favoriteHotspot = CommandLine.arguments[idx + 1]
@@ -6544,21 +6760,35 @@ if CommandLine.arguments.contains("--laptop-mode-self-test") {
     setbuf(stdout, nil)
     print("=== Caffeinate Mode self-test ===")
     print("portable:", LaptopModeController.isPortableMac)
-    let result = lm.activate()
-    print(result.proof)
-    print("---")
-    Thread.sleep(forTimeInterval: 0.4)
-    let pm: String = {
+
+    func pmsetText() -> String {
         let p = Process()
-        p.launchPath = "/usr/bin/pmset"
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
         p.arguments = ["-g", "assertions"]
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
-        p.launch()
+        try? p.run()
         p.waitUntilExit()
         return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    }()
+    }
+
+    if offOnly {
+        lm.deactivate()
+        Thread.sleep(forTimeInterval: 0.4)
+        let clean = !lm.isEngaged && !lm.isActive
+        print(lm.lastProof)
+        print(clean
+            ? "PASS: Off left this process with no keep-awake"
+            : "FAIL: Off still engaged in this process")
+        exit(clean ? 0 : 1)
+    }
+
+    let result = lm.activate()
+    print(result.proof)
+    print("---")
+    Thread.sleep(forTimeInterval: 0.4)
+    let pm = pmsetText()
     let idleOK = pm.contains(LaptopModeController.idleAssertionName) || lm.caffeinateEngaged
     let lidOK = !LaptopModeController.isPortableMac
         || !lm.lidShutOnActivate
@@ -6582,8 +6812,26 @@ if CommandLine.arguments.contains("--laptop-mode-self-test") {
         app.run()
     } else {
         lm.deactivate()
+        Thread.sleep(forTimeInterval: 0.4)
+        let pmAfter = pmsetText()
+        let selfPid = ProcessInfo.processInfo.processIdentifier
+        let oursStill = pmAfter.split(separator: "\n").contains { line in
+            let s = String(line)
+            return s.contains("pid \(selfPid)(")
+                && (s.contains(LaptopModeController.idleAssertionName)
+                    || s.contains(LaptopModeController.lidAssertionName))
+        }
+        let offOK = !oursStill && !lm.isEngaged && !lm.isActive
+        print("--- after Off ---")
+        print(lm.lastProof)
+        print(offOK
+            ? "PASS: Off cleared keep-awake (sleep/screensaver allowed by this app)"
+            : "FAIL: Off did not fully clear keep-awake")
+        if pmAfter.contains(LaptopModeController.idleAssertionName) && offOK {
+            print("NOTE: another process still holds similarly named assertions (ignored)")
+        }
         print("Cleaned up. Use --keep to leave active.")
-        exit(idleOK && lidOK && result.ok ? 0 : 1)
+        exit(idleOK && lidOK && result.ok && offOK ? 0 : 1)
     }
 }
 

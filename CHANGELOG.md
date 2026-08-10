@@ -8,6 +8,14 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.8.1
+
+- **Caffeinate Mode Off is definitive.** Turning Off force-releases every
+  keep-awake path this app owns: IOPM idle + lid-shut assertions, the
+  `caffeinate` helper (including `-d` display/screensaver block), and any
+  orphaned helper left from a previous launch. Sleep and screensaver can run
+  again without a leftover assertion. Other apps’ keep-awake is unchanged.
+
 ## 2.8.0
 
 - **Session Report board parity.** Full interactive board matching the dense
