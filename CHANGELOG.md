@@ -8,6 +8,14 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.8.2
+
+- **Caffeinate Off restores system sleep.** Turning Caffeinate Mode on sets
+  system `SleepDisabled` (`pmset -a disablesleep 1`). Turning it off reverses
+  that (`disablesleep 0`). A launch with Caffeinate already off also clears a
+  leftover `SleepDisabled`. macOS may ask for an admin password once; other
+  apps’ keep-awake assertions are unchanged.
+
 ## 2.8.1
 
 - **Caffeinate Mode Off is definitive.** Turning Off force-releases every
