@@ -42,4 +42,14 @@ rm -f "$ZIP"; /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
 echo "→ Gatekeeper assessment:"
 spctl -a -vvv --type exec "$APP" 2>&1 || true
 
+DMG="$DIST/UsageMonitor.dmg"
+STAGE="$(mktemp -d)"
+echo "→ Disk image"
+ditto "$APP" "$STAGE/UsageMonitor.app"
+ln -s /Applications "$STAGE/Applications"
+rm -f "$DMG"
+hdiutil create -volname "Usage Monitor" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+rm -rf "$STAGE"
+
 echo "✓ Notarized build ready: $ZIP"
+echo "✓ Disk image ready: $DMG"

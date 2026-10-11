@@ -9,6 +9,9 @@ and product usage, with room for more. Rename providers (“Claude Work”,
 menu bar, and **click any activity row** to jump to that session’s Terminal
 tab, Orbit window, or desktop app.
 
+**[Download for Mac](https://github.com/jackfieldman/usage-monitor/releases/latest/download/UsageMonitor.dmg)**
+— open the disk image and drag Usage Monitor onto Applications.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/icons-dark.png">
@@ -99,10 +102,14 @@ chooses how clusters pack: per-provider letter+%, all gauges, or highest only.
 
 ### Download (recommended)
 
-Grab the latest signed build from
-**[GitHub Releases](https://github.com/jackfieldman/usage-monitor/releases)**
-(`UsageMonitor.zip`). Unzip, move `UsageMonitor.app` to `/Applications` if you
-like, then open it. The app can update itself from later releases.
+**[Download for Mac](https://github.com/jackfieldman/usage-monitor/releases/latest/download/UsageMonitor.dmg)**
+
+Open the disk image and drag Usage Monitor onto Applications. That link always
+points at the latest signed build.
+
+Zip, if you prefer it:
+[UsageMonitor.zip](https://github.com/jackfieldman/usage-monitor/releases/latest/download/UsageMonitor.zip).
+The app can also install this into Applications from **Settings → Install Official App**.
 
 ### Build from source
 

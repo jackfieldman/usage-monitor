@@ -8,6 +8,12 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.9.4
+
+- **Install the official Mac app.** Settings and Updates can download the
+  latest signed app into Applications. Copy Download Link copies a disk-image
+  link a friend can open, then drag the app onto Applications.
+
 ## 2.9.3
 
 - **Quieter menu-bar colours, again.** The green, amber, and red on the

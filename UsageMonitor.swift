@@ -172,6 +172,10 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.9.4", "Install the official Mac app", [
+            "Install Official App downloads the signed app into Applications",
+            "Copy Download Link copies a link you can send to a friend",
+        ]),
         ("2.9.3", "Quieter menu-bar colours", [
             "Green, amber, and red on the percent are another step less bright",
         ]),
@@ -1699,6 +1703,18 @@ enum UpdatePrefs {
     }
 }
 
+// MARK: - Official download
+
+/// Stable links for the notarized Mac app. A link cannot write into
+/// Applications by itself. Friends open the disk image and drag the app there.
+/// The in-app install copies the zip into Applications after a signature check.
+enum OfficialDownload {
+    static let zipURL = URL(string: "https://github.com/jackfieldman/usage-monitor/releases/latest/download/UsageMonitor.zip")!
+    static let diskURL = URL(string: "https://github.com/jackfieldman/usage-monitor/releases/latest/download/UsageMonitor.dmg")!
+    static let teamID = "99JV5L763G"
+    static let installURL = URL(fileURLWithPath: "/Applications/UsageMonitor.app")
+}
+
 // MARK: - Update check (GitHub releases)
 
 /// Asks GitHub for the latest release (cadence owned by `UpdatePrefs`).
@@ -1754,13 +1770,66 @@ final class UpdateChecker {
         } catch { return false }
     }
 
+    /// Downloads the latest official zip and installs it at `/Applications`.
+    /// `replacedRunning` is true when that path is the app that is running now.
+    func installOfficialCopy() -> (ok: Bool, replacedRunning: Bool, message: String) {
+        let fm = FileManager.default
+        let dest = OfficialDownload.installURL
+        let replacedRunning = dest.path == Bundle.main.bundlePath
+        let tmp = fm.temporaryDirectory.appendingPathComponent("UsageMonitorOfficial-\(getpid())")
+        defer { try? fm.removeItem(at: tmp) }
+        do {
+            try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+            var req = URLRequest(url: OfficialDownload.zipURL)
+            req.timeoutInterval = 60
+            let (data, code) = try httpSync(req)
+            guard code == 200, !data.isEmpty else {
+                return (false, false, "The download did not complete.")
+            }
+            let zipPath = tmp.appendingPathComponent("UsageMonitor.zip")
+            try data.write(to: zipPath)
+            guard runTool("/usr/bin/ditto", ["-xk", zipPath.path, tmp.path]).status == 0 else {
+                return (false, false, "The download could not be opened.")
+            }
+            let newApp = tmp.appendingPathComponent("UsageMonitor.app")
+            guard fm.fileExists(atPath: newApp.path),
+                  signedByTeam(newApp, OfficialDownload.teamID) else {
+                return (false, false, "The download was not the official signed app.")
+            }
+            if replacedRunning {
+                let aside = tmp.appendingPathComponent("UsageMonitor-old.app")
+                try fm.moveItem(at: dest, to: aside)
+                do { try fm.moveItem(at: newApp, to: dest) }
+                catch {
+                    try? fm.moveItem(at: aside, to: dest)
+                    return (false, false, "Could not replace the running app.")
+                }
+                return (true, true, "Installed.")
+            }
+            let busy = NSRunningApplication.runningApplications(withBundleIdentifier: "com.usagemonitor.app")
+                .contains { $0.bundleURL?.path == dest.path }
+            if busy {
+                return (false, false, "Quit the Usage Monitor that is already open from Applications, then try again.")
+            }
+            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            try fm.copyItem(at: newApp, to: dest)
+            return (true, false, "Installed.")
+        } catch {
+            return (false, false, "Could not install into Applications.")
+        }
+    }
+
     /// True only if `app` passes strict codesign verification AND carries the
     /// same TeamIdentifier as the running app. Ad-hoc builds ("not set")
     /// never match, so development copies won't self-update.
     private func signedBySameTeam(_ app: URL) -> Bool {
+        guard let mine = teamID(Bundle.main.bundlePath) else { return false }
+        return signedByTeam(app, mine) && mine != "not set"
+    }
+
+    private func signedByTeam(_ app: URL, _ team: String) -> Bool {
         guard runTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path]).status == 0,
-              let new = teamID(app.path), new != "not set",
-              new == teamID(Bundle.main.bundlePath) else { return false }
+              let new = teamID(app.path), new == team else { return false }
         return true
     }
 
@@ -4563,6 +4632,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             UNNotificationRequest(identifier: "update-\(version)", content: c, trigger: nil))
     }
 
+    /// Downloads the latest signed app into `/Applications` and opens it.
+    @objc func installOfficialApp() {
+        guard !updating else { return }
+        let ask = NSAlert()
+        ask.messageText = "Install the official app"
+        ask.informativeText = "This downloads the latest signed Usage Monitor into Applications and opens it."
+        ask.addButton(withTitle: "Install")
+        ask.addButton(withTitle: "Cancel")
+        guard ask.runModal() == .alertFirstButtonReturn else { return }
+        updating = true
+        stopUpdateMarquee(restore: false)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.updates.installOfficialCopy()
+            DispatchQueue.main.async {
+                self.updating = false
+                guard result.ok else {
+                    let fail = NSAlert()
+                    fail.messageText = "Could not install"
+                    fail.informativeText = result.message
+                    fail.addButton(withTitle: "OK")
+                    fail.runModal()
+                    return
+                }
+                if result.replacedRunning {
+                    self.relaunch()
+                } else {
+                    NSWorkspace.shared.open(OfficialDownload.installURL)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                        NSApp.terminate(nil)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Copies the share link. Friends open the disk image and drag the app onto Applications.
+    @objc func copyOfficialLink() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(OfficialDownload.diskURL.absoluteString, forType: .string)
+        let note = NSAlert()
+        note.messageText = "Download link copied"
+        note.informativeText = OfficialDownload.diskURL.absoluteString
+        note.addButton(withTitle: "OK")
+        note.runModal()
+    }
+
     /// Installs in place and relaunches. Any failure falls back to opening
     /// the release page so the user can update by hand.
     @objc func installUpdate() {
@@ -4719,6 +4835,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             sub.addItem(.separator())
         }
+
+        let official = NSMenuItem(title: "Install Official App to Applications",
+                                  action: #selector(installOfficialApp), keyEquivalent: "")
+        official.target = self
+        official.toolTip = "Downloads the latest signed app into /Applications and opens it."
+        sub.addItem(official)
+        let copyLink = NSMenuItem(title: "Copy Download Link",
+                                  action: #selector(copyOfficialLink), keyEquivalent: "")
+        copyLink.target = self
+        copyLink.toolTip = "Copies a link a friend can open. They drag the app onto Applications."
+        sub.addItem(copyLink)
+        sub.addItem(.separator())
 
         let auto = NSMenuItem(title: "Install Updates Automatically",
                               action: #selector(toggleAutoUpdate), keyEquivalent: "")
@@ -6628,7 +6756,7 @@ final class SettingsController: NSObject {
 
     private func build() -> NSWindow {
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 640),
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 720),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false)
@@ -6692,6 +6820,8 @@ final class SettingsController: NSObject {
         stack.addArrangedSubview(button("Caffeinate options…", #selector(showCaffeinateMenu(_:))))
 
         stack.addArrangedSubview(section("Account"))
+        stack.addArrangedSubview(button("Install Official App to Applications", #selector(installOfficialClicked(_:))))
+        stack.addArrangedSubview(button("Copy Download Link", #selector(copyDownloadLink(_:))))
         stack.addArrangedSubview(button("Providers…", #selector(showProviders(_:))))
         stack.addArrangedSubview(button("Updates…", #selector(showUpdates(_:))))
         stack.addArrangedSubview(button("What's New", #selector(showWhatsNew(_:))))
@@ -6699,7 +6829,7 @@ final class SettingsController: NSObject {
         stack.addArrangedSubview(button("Subscribe to Updates…", #selector(showNewsletter(_:))))
         stack.addArrangedSubview(button("Join the Community…", #selector(showCommunity(_:))))
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 640))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 720))
         content.addSubview(stack)
         win.contentView = content
         NSLayoutConstraint.activate([
@@ -6806,6 +6936,8 @@ final class SettingsController: NSObject {
     @objc private func showCaffeinateMenu(_ sender: NSButton) { pop(app?.laptopModeMenuItem(), sender) }
     @objc private func showProviders(_ sender: NSButton) { pop(app?.providersMenuItem(), sender) }
     @objc private func showUpdates(_ sender: NSButton) { pop(app?.updatesMenuItem(), sender) }
+    @objc private func installOfficialClicked(_: NSButton) { app?.installOfficialApp() }
+    @objc private func copyDownloadLink(_: NSButton) { app?.copyOfficialLink() }
     @objc private func showBarPercent(_ sender: NSButton) { pop(app?.barPercentMenuItem(), sender) }
     @objc private func showWhatsNew(_: NSButton) { app?.showWhatsNew() }
     @objc private func showSetup(_: NSButton) { app?.openSetup() }
