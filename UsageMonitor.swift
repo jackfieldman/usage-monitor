@@ -172,6 +172,9 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.9.3", "Quieter menu-bar colours", [
+            "Green, amber, and red on the percent are another step less bright",
+        ]),
         ("2.9.2", "Quieter menu-bar colours", [
             "Green, amber, and red on the percent are a step less bright",
         ]),
@@ -685,11 +688,11 @@ enum Level {
 }
 
 func levelColor(_ pct: Double) -> NSColor {
-    // One step quieter than neon, still clear on a black menu bar.
+    // Two steps quieter than neon, still clear on a black menu bar.
     switch Level(pct) {
-    case .high: return NSColor(srgbRed: 0.86, green: 0.40, blue: 0.36, alpha: 1)
-    case .mid:  return NSColor(srgbRed: 0.86, green: 0.62, blue: 0.30, alpha: 1)
-    case .low:  return NSColor(srgbRed: 0.34, green: 0.68, blue: 0.44, alpha: 1)
+    case .high: return NSColor(srgbRed: 0.76, green: 0.46, blue: 0.42, alpha: 1)
+    case .mid:  return NSColor(srgbRed: 0.78, green: 0.60, blue: 0.38, alpha: 1)
+    case .low:  return NSColor(srgbRed: 0.40, green: 0.62, blue: 0.48, alpha: 1)
     }
 }
 

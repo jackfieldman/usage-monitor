@@ -8,6 +8,11 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.9.3
+
+- **Quieter menu-bar colours, again.** The green, amber, and red on the
+  percent numbers come down one more step.
+
 ## 2.9.2
 
 - **Quieter menu-bar colours.** The green, amber, and red on the percent
