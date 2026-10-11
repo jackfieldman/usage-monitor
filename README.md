@@ -195,7 +195,7 @@ files those CLIs already wrote. If you add an Admin API key, it lives only
 in your macOS Keychain, is never written to disk or logged, and is sent only
 to Anthropic over HTTPS to read your cost report.
 
-Once a day the app also asks GitHub for the latest release
+About four times a day the app also asks GitHub for the latest release
 (`api.github.com/repos/jackfieldman/usage-monitor/releases/latest`) so it can
 offer you updates. That's an anonymous HTTP request — nothing about you or
 your usage is sent.
