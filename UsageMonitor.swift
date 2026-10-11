@@ -172,6 +172,11 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.9.1", "Caffeinate only keeps this Mac awake", [
+            "On holds a keep-awake so work can continue, including with the lid shut",
+            "Off releases that keep-awake and does not change the Mac’s sleep settings",
+            "The display may sleep. Other apps’ keep-awake is left alone",
+        ]),
         ("2.9.0", "Pace, a short menu, and memory", [
             "Each provider shows a pace line: points per hour, and when 80% hits",
             "The menu lists limits, live sessions, and this app’s memory use",
@@ -2546,6 +2551,9 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 /// laptops. On a portable Mac, an extra option holds a stronger assertion so
 /// work can continue with the lid closed. Optional favorite-hotspot join.
 ///
+/// On holds that assertion. Off releases it. This app does not change system
+/// sleep settings (`pmset disablesleep`) on the switch or on launch.
+///
 /// Security: prefer known/preferred networks and Keychain passwords — never
 /// require an admin password. CoreWLAN scans may prompt for Location (system
 /// dialog); callers must warn the user first.
@@ -2562,7 +2570,7 @@ final class LaptopModeController {
     private let activeKey = "laptopMode.wasActive"
     /// Last helper PID — survives relaunch so we can kill orphans that still block sleep.
     private let helperPidKey = "laptopMode.caffeinateHelperPid"
-    /// True after this app set system SleepDisabled. Cleared when Caffeinate turns off.
+    /// True only if an older version set system SleepDisabled. Used once to undo that.
     private let ownsSleepDisabledKey = "laptopMode.ownsSleepDisabled"
     private let keychainService = "com.usagemonitor.app.hotspot"
 
@@ -2694,8 +2702,7 @@ final class LaptopModeController {
             lines.append("Caffeinate Mode could not engage keep-awake.")
             ok = false
         }
-        // System SleepDisabled follows the switch: on while Caffeinate is on.
-        lines.append(syncSystemSleepDisabled(enabled: isActive))
+        lines.append("System sleep settings: unchanged")
 
         lines.append(contentsOf: statusSnapshot())
         lastProof = lines.joined(separator: "\n")
@@ -2703,20 +2710,18 @@ final class LaptopModeController {
         return (ok, lastProof)
     }
 
-    /// Turn Caffeinate Mode off and **force** sleep/screensaver to be allowed again
-    /// by this app. Overrides every keep-awake path we own (IOPM + caffeinate helper
-    /// + orphaned helpers from a previous launch) and reverses system SleepDisabled.
-    /// Does not touch other apps’ assertions.
+    /// Turn Caffeinate Mode off. Release only the keep-awake this app holds
+    /// (IOPM assertions and the helper this app started). Does not change
+    /// system sleep settings and does not touch other apps’ assertions.
     func deactivate() {
         // Flip preference first so a concurrent restore/launch cannot re-arm.
         isActive = false
         let killed = forceReleaseAllKeepAwake(reason: "user turned off")
         var lines = [
             "Caffeinate Mode turned off.",
-            "Sleep + screensaver allowed again (this app’s keep-awake fully released).",
+            "This app’s keep-awake is released. System sleep settings were not changed.",
         ]
         lines.append(contentsOf: killed)
-        lines.append(syncSystemSleepDisabled(enabled: false))
         lines.append(contentsOf: statusSnapshot())
         // Prove our names / helper are gone.
         lines.append(contentsOf: verifySleepAllowed())
@@ -2726,28 +2731,22 @@ final class LaptopModeController {
 
     /// Re-assert after relaunch if the user left Caffeinate Mode on.
     func restoreIfNeeded() {
-        // Always reap any orphaned helper from a previous process first.
-        // Otherwise an old `caffeinate -d` can block screensaver forever.
+        // Reap only a helper this app started. An old helper must not keep running
+        // after the switch is off. Do not touch any other caffeinate process.
         let orphans = killAllOwnedCaffeinateHelpers()
         if !orphans.isEmpty {
-            NSLog("UsageMonitor Caffeinate: cleaned orphans on launch: \(orphans.joined(separator: "; "))")
+            NSLog("UsageMonitor Caffeinate: cleaned own helper on launch: \(orphans.joined(separator: "; "))")
         }
-        guard isActive else {
-            // Caffeinate is off. Reverse a leftover system SleepDisabled.
-            // Async so an admin prompt cannot block the menu bar from appearing.
-            DispatchQueue.global(qos: .userInitiated).async { [self] in
-                let line = syncSystemSleepDisabled(enabled: false)
-                NSLog("UsageMonitor Caffeinate off at launch: \(line)")
-            }
-            return
-        }
-        _ = engageIdleKeepAwake()
-        if Self.isPortableMac && lidShutOnActivate { _ = engageLidShut() }
-        DispatchQueue.global(qos: .userInitiated).async { [self] in
-            let line = syncSystemSleepDisabled(enabled: true)
-            NSLog("UsageMonitor Caffeinate on at launch: \(line)")
+        if isActive {
+            _ = engageIdleKeepAwake()
+            if Self.isPortableMac && lidShutOnActivate { _ = engageLidShut() }
         }
         // Do not force a Wi‑Fi rejoin on every launch — only re-hold sleep.
+        // Undo a SleepDisabled an older version set, once, and only if we own it.
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let line = releaseOwnedSleepDisabledOnce()
+            NSLog("UsageMonitor Caffeinate launch: \(line)")
+        }
     }
 
     /// True when this process is currently holding any keep-awake path.
@@ -2930,7 +2929,7 @@ final class LaptopModeController {
     @discardableResult
     private func forceReleaseAllKeepAwake(reason: String) -> [String] {
         var lines: [String] = ["force-release (\(reason)):"]
-        // Order: stop helpers first (they hold display sleep via -d), then IOPM.
+        // Order: stop our helper first (it holds the mirrored assertion), then IOPM.
         let killed = killAllOwnedCaffeinateHelpers()
         if killed.isEmpty {
             lines.append("  caffeinate helper: none running")
@@ -2951,14 +2950,14 @@ final class LaptopModeController {
         return lines
     }
 
-    /// `caffeinate` helper mirrors assertions (belt-and-braces).
-    /// `-d` blocks display sleep / screensaver while mode is on; OFF must kill this.
+    /// `caffeinate` helper mirrors the assertions. `-i` prevents idle sleep.
+    /// Lid-shut adds `-s` (system sleep on AC). No display or disk flags.
+    /// Off kills only this helper.
     private func startCaffeinateHelper(lidShut: Bool) {
         stopCaffeinateHelper()
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
-        // -i idle sleep, -d display, -m disk; -s system sleep (AC) when lid-shut
-        p.arguments = lidShut ? ["-s", "-i", "-d", "-m"] : ["-i", "-d", "-m"]
+        p.arguments = CaffeinatePolicy.helperArguments(lidShut: lidShut)
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         // Detach so we can kill by PID even if the Process object is lost.
@@ -3153,7 +3152,7 @@ final class LaptopModeController {
             lines.append("pmset: WARN leftover caffeinate pid(s) \(orphans.map(String.init).joined(separator: ", "))")
         }
         if let disabled = Self.parseSleepDisabled(shell("/usr/bin/pmset -g")) {
-            lines.append("SleepDisabled: \(disabled ? "1 (system sleep blocked)" : "0 (system sleep allowed)")")
+            lines.append("SleepDisabled: \(disabled ? "1" : "0") (read-only — this app does not change it)")
         }
         let batt = shell("/usr/bin/pmset -g batt")
         if batt.lowercased().contains("ac power") {
@@ -3211,52 +3210,35 @@ final class LaptopModeController {
 
     /// `pmset -g` system-wide `SleepDisabled` flag. `nil` if the line is absent.
     static func parseSleepDisabled(_ text: String) -> Bool? {
-        for raw in text.split(whereSeparator: \.isNewline) {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            guard line.hasPrefix("SleepDisabled") else { continue }
-            guard let last = line.split(whereSeparator: \.isWhitespace).last else { continue }
-            if last == "1" { return true }
-            if last == "0" { return false }
-        }
-        return nil
+        CaffeinatePolicy.parseSleepDisabled(text)
     }
 
-    /// Self-test must not raise an admin dialog.
+    /// Self-test must not change system sleep, and must not raise an admin dialog.
     private var skipSleepDisabledChange: Bool {
         CommandLine.arguments.contains("--laptop-mode-self-test")
     }
 
-    /// Match system `SleepDisabled` to Caffeinate. On = `disablesleep 1`.
-    /// Off reverses it to `disablesleep 0`. No-op when already correct.
-    /// Tries passwordless sudo, then one admin prompt.
+    /// Undo SleepDisabled only if an older version of this app set it and it is
+    /// still on. Passwordless only. No admin dialog. Never sets the flag on.
     @discardableResult
-    private func syncSystemSleepDisabled(enabled: Bool) -> String {
+    private func releaseOwnedSleepDisabledOnce() -> String {
+        let owns = UserDefaults.standard.bool(forKey: ownsSleepDisabledKey)
+        let on = sleepDisabledIsOn()
+        guard CaffeinatePolicy.shouldClearOwnedSleepDisabled(owns: owns, currentlyOn: on) else {
+            if owns {
+                UserDefaults.standard.set(false, forKey: ownsSleepDisabledKey)
+            }
+            return "SleepDisabled: left alone"
+        }
         if skipSleepDisabledChange {
             return "SleepDisabled: skipped (self-test)"
         }
-        if sleepDisabledIsOn() == enabled {
-            if !enabled {
-                UserDefaults.standard.set(false, forKey: ownsSleepDisabledKey)
-            }
-            return "SleepDisabled already \(enabled ? "1" : "0")"
+        _ = shell("/usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0")
+        if !sleepDisabledIsOn() {
+            UserDefaults.standard.set(false, forKey: ownsSleepDisabledKey)
+            return "SleepDisabled: cleared a leftover this app had set"
         }
-        let value = enabled ? "1" : "0"
-        let cmd = "/usr/bin/pmset -a disablesleep \(value)"
-        _ = shell("/usr/bin/sudo -n \(cmd)")
-        if sleepDisabledIsOn() == enabled {
-            UserDefaults.standard.set(enabled, forKey: ownsSleepDisabledKey)
-            return "SleepDisabled set to \(value)"
-        }
-        let script = "do shell script \"\(cmd)\" with administrator privileges"
-        let osa = shell("/usr/bin/osascript -e \(shellEscape(script))")
-        if sleepDisabledIsOn() == enabled {
-            UserDefaults.standard.set(enabled, forKey: ownsSleepDisabledKey)
-            return "SleepDisabled set to \(value)"
-        }
-        let detail = osa.trimmingCharacters(in: .whitespacesAndNewlines)
-        let still = sleepDisabledIsOn() ? "1" : "0"
-        return "SleepDisabled still \(still) — could not change it"
-            + (detail.isEmpty ? "" : " (\(detail))")
+        return "SleepDisabled: leftover still set (no passwordless change)"
     }
 
     private func sleepDisabledIsOn() -> Bool {
@@ -3383,7 +3365,7 @@ final class CaffeinateNoticeController: NSObject, NSWindowDelegate {
         stack.addArrangedSubview(noticeRow(
             symbol: "cup.and.saucer.fill",
             title: "Keeps the system on",
-            body: "Desktops and laptops stay awake through idle. System sleep is disabled while Caffeinate is on, and turned back on when you switch it off."))
+            body: "The Mac stays awake while Caffeinate is on. Turning it off releases only that keep-awake. The Mac’s sleep settings are not changed."))
         if isPortable {
             stack.addArrangedSubview(noticeRow(
                 symbol: lidShut ? "laptopcomputer" : "laptopcomputer.slash",
@@ -5570,7 +5552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Keeps this Mac awake so it doesn’t sleep from idle — desktops and laptops.
         On a laptop you can also keep it running with the lid closed.
         A glowing cup appears in the menu bar while Active; click it for a reminder.
-        Turn Off fully releases keep-awake so sleep and screensaver can run again.
+        Turn Off releases only this app’s keep-awake. It does not change the Mac’s sleep settings.
         """
 
         let sub = NSMenu()
@@ -5585,7 +5567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ? "Status: Active — system on + lid-shut keep-awake"
                 : "Status: Active — system stays awake"
         } else {
-            statusText = "Status: Off — sleep & screensaver allowed"
+            statusText = "Status: Off — not keeping this Mac awake"
         }
         let statusRow = disabled(statusText)
         if active {
@@ -5707,9 +5689,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = "Caffeinate Mode is off"
         alert.informativeText = """
-        Sleep and screensaver are allowed again.
+        This app released its keep-awake.
 
-        Usage Monitor released its keep-awake and cleared system SleepDisabled. macOS may ask for an admin password once to apply that. Other apps can still keep the Mac awake on their own.
+        The Mac’s sleep settings were not changed. Other apps can still keep the Mac awake on their own.
         """
         alert.addButton(withTitle: "OK")
         NSApp.activate(ignoringOtherApps: true)
@@ -6684,8 +6666,8 @@ final class SettingsController: NSObject {
         stack.addArrangedSubview(section("Caffeinate"))
         let active = app?.laptopMode.isActive == true || app?.laptopMode.isEngaged == true
         let status = NSTextField(labelWithString: active
-            ? "On. Sleep is blocked by this app until you turn it off."
-            : "Off. Sleep and screensaver are allowed.")
+            ? "On. This app is keeping the Mac awake until you turn it off."
+            : "Off. This app is not keeping the Mac awake.")
         status.font = .systemFont(ofSize: 12)
         status.textColor = .secondaryLabelColor
         stack.addArrangedSubview(status)

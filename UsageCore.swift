@@ -342,16 +342,32 @@ enum AppFootprint {
     }
 }
 
-// MARK: - Caffeinate Off restores system sleep
+// MARK: - Caffeinate holds and releases only this app's keep-awake
 
 enum CaffeinatePolicy {
-    /// `pmset -a disablesleep` value. Off is always 0 so system sleep is allowed again.
-    static func sleepDisabledValue(active: Bool) -> String {
-        active ? "1" : "0"
+    /// On and Off never write `pmset disablesleep`. Keep-awake is an assertion
+    /// that dies when it is released. System sleep settings stay as they are.
+    static func changesSystemSleepPolicy(active: Bool) -> Bool {
+        _ = active
+        return false
     }
 
-    static func offRestoresSystemSleep() -> Bool {
-        sleepDisabledValue(active: false) == "0"
+    /// Idle keep-awake is `-i` only. Lid-shut adds `-s` (system sleep on AC).
+    /// Never `-d` (display) or `-m` (disk). The screen may sleep.
+    static func helperArguments(lidShut: Bool) -> [String] {
+        lidShut ? ["-s", "-i"] : ["-i"]
+    }
+
+    static func helperBlocksDisplaySleep(lidShut: Bool) -> Bool {
+        let args = helperArguments(lidShut: lidShut)
+        return args.contains("-d") || args.contains("-u")
+    }
+
+    /// One-time undo of a SleepDisabled flag an older version of this app set.
+    /// Write only when we still own that flag and it is on. Never write when
+    /// we do not own it, and never set it on.
+    static func shouldClearOwnedSleepDisabled(owns: Bool, currentlyOn: Bool) -> Bool {
+        owns && currentlyOn
     }
 
     /// `pmset -g` system-wide SleepDisabled. nil when the line is absent.

@@ -122,8 +122,19 @@ check("memory line small", AppFootprint.menuLine(bytes: 4 * 1_048_576) == "This 
 check("memory line zero", AppFootprint.menuLine(bytes: 0) == "This app · memory unavailable")
 check("memory reads a number", AppFootprint.residentBytes() > 0)
 
-check("off restores sleep", CaffeinatePolicy.offRestoresSystemSleep())
-check("on sets sleep disabled", CaffeinatePolicy.sleepDisabledValue(active: true) == "1")
+check("off does not change system sleep", !CaffeinatePolicy.changesSystemSleepPolicy(active: false))
+check("on does not change system sleep", !CaffeinatePolicy.changesSystemSleepPolicy(active: true))
+check("helper idle is idle only", CaffeinatePolicy.helperArguments(lidShut: false) == ["-i"])
+check("helper lid adds system sleep", CaffeinatePolicy.helperArguments(lidShut: true) == ["-s", "-i"])
+check("helper does not block display",
+      !CaffeinatePolicy.helperBlocksDisplaySleep(lidShut: false)
+        && !CaffeinatePolicy.helperBlocksDisplaySleep(lidShut: true))
+check("clear owned sleep only when we set it",
+      CaffeinatePolicy.shouldClearOwnedSleepDisabled(owns: true, currentlyOn: true))
+check("do not clear sleep we do not own",
+      !CaffeinatePolicy.shouldClearOwnedSleepDisabled(owns: false, currentlyOn: true))
+check("do not write when sleep already allowed",
+      !CaffeinatePolicy.shouldClearOwnedSleepDisabled(owns: true, currentlyOn: false))
 check("parse sleep on", CaffeinatePolicy.parseSleepDisabled("System-wide power settings:\n SleepDisabled\t\t1\n") == true)
 check("parse sleep off", CaffeinatePolicy.parseSleepDisabled(" SleepDisabled 0\n") == false)
 check("parse sleep missing", CaffeinatePolicy.parseSleepDisabled("no flag here\n") == nil)

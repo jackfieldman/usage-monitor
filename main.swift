@@ -48,10 +48,13 @@ if CommandLine.arguments.contains("--laptop-mode-self-test") {
     let parseMiss = LaptopModeController.parseSleepDisabled("no flag here\n")
     let parseOK = parseOn == true && parseOff == false && parseMiss == nil
     print(parseOK ? "PASS: SleepDisabled parser" : "FAIL: SleepDisabled parser")
-    let policyOK = CaffeinatePolicy.offRestoresSystemSleep()
-        && CaffeinatePolicy.sleepDisabledValue(active: true) == "1"
-        && CaffeinatePolicy.parseSleepDisabled(" SleepDisabled 0\n") == false
-    print(policyOK ? "PASS: Off requests disablesleep 0" : "FAIL: Off does not restore system sleep")
+    let policyOK = !CaffeinatePolicy.changesSystemSleepPolicy(active: false)
+        && !CaffeinatePolicy.changesSystemSleepPolicy(active: true)
+        && CaffeinatePolicy.helperArguments(lidShut: false) == ["-i"]
+        && !CaffeinatePolicy.helperBlocksDisplaySleep(lidShut: true)
+    print(policyOK
+        ? "PASS: Off only releases this app's keep-awake"
+        : "FAIL: Off still changes system sleep")
 
     func pmsetText() -> String {
         let p = Process()

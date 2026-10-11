@@ -8,6 +8,14 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.9.1
+
+- **Caffeinate only holds its own keep-awake.** Turning it on keeps the Mac
+  from idle sleep, and on a laptop can keep work going with the lid shut.
+  Turning it off releases that keep-awake. The app no longer changes the
+  system sleep setting (`pmset disablesleep`) when you turn it on, turn it
+  off, or launch. The display may sleep. Other apps’ keep-awake is left alone.
+
 ## 2.9.0
 
 - **Pace.** Each provider’s main limit shows points per hour and the time it

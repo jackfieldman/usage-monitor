@@ -61,10 +61,12 @@ adds short metadata titles only. **Nothing is uploaded.** Chat bodies are never
 included; project names are path tails only. Reopen anytime with **Open Last
 Report**.
 
-**Caffeinate Mode** keeps the Mac awake (desktop or laptop). On a MacBook you
-can also **keep the laptop on with the lid shut**. While active, a glowing cup
-appears in the menu bar — click it for a short reminder (heat / battery notes).
-Optional: join a favorite hotspot when turning the mode on.
+**Caffeinate Mode** keeps the Mac awake (desktop or laptop) while it is on.
+On a MacBook you can also **keep the laptop on with the lid shut**. Turning it
+off releases only that keep-awake. It does not change the Mac’s sleep settings.
+The display may still sleep. While active, a glowing cup appears in the menu
+bar — click it for a short reminder (heat / battery notes). Optional: join a
+favorite hotspot when turning the mode on.
 
 Under **Providers** you can rename slots, set letter badges, toggle menu-bar
 and activity visibility, and add another provider slot. **Menu Bar Layout**
