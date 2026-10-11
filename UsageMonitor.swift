@@ -19,7 +19,7 @@ import UserNotifications
 
 // MARK: - Model
 
-struct Gauge { let label: String; let percent: Double; let sub: String }
+// Gauge, parsers, pace, memory, and Caffeinate policy live in UsageCore.swift.
 
 /// Built-in adapter kinds. New kinds plug in here; the UI is N-slot generic.
 enum ProviderKind: String, CaseIterable, Codable {
@@ -151,6 +151,7 @@ enum WhatsNew {
         case whatsNewPanel
         case laptopMode
         case sessionRadar
+        case pace
 
         /// First app version that included this surface.
         var introduced: String {
@@ -163,6 +164,7 @@ enum WhatsNew {
             case .whatsNewPanel: return "2.2"
             case .laptopMode: return "2.5"
             case .sessionRadar: return "2.7"  // board parity landed 2.8; chip from 2.7 first ship
+            case .pace: return "2.9"
             }
         }
     }
@@ -170,6 +172,13 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.9.0", "Pace, a short menu, and memory", [
+            "Each provider shows a pace line: points per hour, and when 80% hits",
+            "The menu lists limits, live sessions, and this app’s memory use",
+            "Icon, updates, Caffeinate, and account links live in Settings",
+            "Menu bar percent uses the limit colour (green, amber, red)",
+            "Session Report chart ships inside the app (no network fetch)",
+        ]),
         ("2.8.2", "Caffeinate Off restores system sleep", [
             "Turning Caffeinate off clears system SleepDisabled (pmset disablesleep)",
             "Launch with Caffeinate already off clears a leftover SleepDisabled",
@@ -1786,8 +1795,7 @@ final class UsageClient {
         if code == 401 || code == 403 { throw UsageError.tokenExpired }
         guard code == 200 else { throw UsageError.http(code) }
         let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        let limits = obj["limits"] as? [[String: Any]] ?? []
-        return limits.map(gauge(from:))
+        return UsageParsers.claudeGauges(from: obj)
     }
 
     private func get(_ token: String) throws -> (Data, Int) {
@@ -1798,34 +1806,6 @@ final class UsageClient {
         return try httpSync(req)
     }
 
-    // limits[] -> Gauge
-    private func gauge(from lim: [String: Any]) -> Gauge {
-        let kind = lim["kind"] as? String ?? ""
-        let label: String
-        switch kind {
-        case "session": label = "Session"
-        case "weekly_all": label = "All models"
-        default:
-            let scope = lim["scope"] as? [String: Any]
-            let model = (scope?["model"] as? [String: Any])?["display_name"] as? String
-            label = model ?? "Weekly"
-        }
-        let pct = (lim["percent"] as? NSNumber)?.doubleValue ?? 0
-        return Gauge(label: label, percent: pct.rounded(), sub: resetSub(lim["resets_at"] as? String))
-    }
-
-    private func resetSub(_ iso: String?) -> String {
-        guard let iso else { return "" }
-        let cleaned = iso.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
-        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]
-        guard let dt = f.date(from: cleaned) else { return "" }
-        let delta = dt.timeIntervalSinceNow
-        if delta <= 0 { return "resetting…" }
-        let df = DateFormatter()
-        if delta < 3600 { return "resets in \(Int(delta / 60)) min" }
-        df.dateFormat = delta < 12 * 3600 ? "h:mm a" : "EEE h:mm a"
-        return "resets " + df.string(from: dt)
-    }
 }
 
 // MARK: - Grok auth + billing (session token in ~/.grok/auth.json)
@@ -1873,23 +1853,6 @@ final class GrokUsageClient {
     /// Credits view — weekly percent + productUsage rows.
     let creditsURL = URL(string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits")!
 
-    // JSON keys as stored properties so -O cannot fold/drop the literals
-    // (dictionary subscripts alone have been observed missing from the binary).
-    private let kConfig = "config"
-    private let kCreditUsagePercent = "creditUsagePercent"
-    private let kProductUsage = "productUsage"
-    private let kProduct = "product"
-    private let kUsagePercent = "usagePercent"
-    private let kMonthlyLimit = "monthlyLimit"
-    private let kUsed = "used"
-    private let kVal = "val"
-    private let kValue = "value"
-    private let kBillingPeriodEnd = "billingPeriodEnd"
-    private let kCurrentPeriod = "currentPeriod"
-    private let kEnd = "end"
-    private let kPeriodEnd = "period_end"
-    private let kUsagePercentage = "usage_percentage"
-
     /// Blocking; call off the main thread. Returns gauges: overall "Grok"
     /// plus any product rows that report a usage percent (Build, API, …).
     func fetchUsage() throws -> [Gauge] {
@@ -1922,9 +1885,9 @@ final class GrokUsageClient {
         // Primary overall: weekly credit window when present (matches Grok CLI
         // rate limits). Else monthly budget. Else any bare usage_percentage.
         if let pct = credits.overallPercent {
-            gauges.append(Gauge(label: "Grok", percent: pct, sub: credits.resetSub))
+            gauges.append(Gauge(label: "Grok", percent: pct, sub: credits.resetSub, resetsAt: credits.resetsAt))
         } else if let pct = monthly.overallPercent {
-            gauges.append(Gauge(label: "Grok", percent: pct, sub: monthly.resetSub))
+            gauges.append(Gauge(label: "Grok", percent: pct, sub: monthly.resetSub, resetsAt: monthly.resetsAt))
         }
 
         // Product rows (Build / API / …) from the credits view.
@@ -1935,7 +1898,7 @@ final class GrokUsageClient {
         if credits.overallPercent != nil, let pct = monthly.overallPercent {
             // Skip a duplicate row when the two windows report the same %.
             if gauges.first(where: { $0.label == "Grok" })?.percent != pct {
-                gauges.append(Gauge(label: "Grok month", percent: pct, sub: monthly.resetSub))
+                gauges.append(Gauge(label: "Grok month", percent: pct, sub: monthly.resetSub, resetsAt: monthly.resetsAt))
             }
         }
 
@@ -1960,103 +1923,26 @@ final class GrokUsageClient {
     private struct ParsedBilling {
         var overallPercent: Double? = nil
         var resetSub: String = ""
+        var resetsAt: Date? = nil
         var products: [Gauge] = []
     }
 
     /// Weekly credits shape: creditUsagePercent + productUsage[].
     private func parseCredits(_ data: Data) -> ParsedBilling {
-        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-        let config = obj[kConfig] as? [String: Any] ?? obj
-        var out = ParsedBilling()
-        out.resetSub = resetSub(
-            (config[kBillingPeriodEnd] as? String)
-                ?? ((config[kCurrentPeriod] as? [String: Any])?[kEnd] as? String)
-                ?? (obj[kPeriodEnd] as? String))
-
-        if let pct = number(config[kCreditUsagePercent])
-            ?? number(config[kUsagePercentage])
-            ?? number(obj[kUsagePercentage])
-            ?? number(config[kUsagePercent]) {
-            out.overallPercent = pct.rounded()
-        }
-        for product in config[kProductUsage] as? [[String: Any]] ?? [] {
-            guard let name = product[kProduct] as? String,
-                  let pct = number(product[kUsagePercent]) else { continue }
-            out.products.append(Gauge(label: Self.productLabel(name),
-                                      percent: pct.rounded(), sub: out.resetSub))
-        }
-        return out
+        let parsed = UsageParsers.grokCredits(from: data)
+        return ParsedBilling(overallPercent: parsed.overallPercent,
+                             resetSub: parsed.resetSub,
+                             resetsAt: parsed.resetsAt,
+                             products: parsed.products)
     }
 
     /// Unified monthly budget: monthlyLimit / used (bare or { "val": N }).
     private func parseMonthly(_ data: Data) -> ParsedBilling {
-        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-        let config = obj[kConfig] as? [String: Any] ?? obj
-        var out = ParsedBilling()
-        out.resetSub = resetSub(
-            (config[kBillingPeriodEnd] as? String)
-                ?? ((config[kCurrentPeriod] as? [String: Any])?[kEnd] as? String)
-                ?? (obj[kPeriodEnd] as? String))
-
-        if let limit = numberVal(config[kMonthlyLimit]),
-           let used = numberVal(config[kUsed]),
-           limit > 0 {
-            out.overallPercent = min(100, max(0, (used / limit) * 100)).rounded()
-        } else if let pct = number(config[kUsagePercentage])
-            ?? number(obj[kUsagePercentage])
-            ?? number(config[kUsagePercent]) {
-            out.overallPercent = pct.rounded()
-        }
-        return out
-    }
-
-    private func number(_ any: Any?) -> Double? {
-        if let n = any as? NSNumber { return n.doubleValue }
-        if let s = any as? String { return Double(s) }
-        if let i = any as? Int { return Double(i) }
-        return nil
-    }
-
-    /// Numbers may be bare (`150000`) or wrapped (`{ "val": 150000 }`).
-    private func numberVal(_ any: Any?) -> Double? {
-        if let n = number(any) { return n }
-        if let d = any as? [String: Any] {
-            return number(d[kVal]) ?? number(d[kValue])
-        }
-        return nil
-    }
-
-    private static func productLabel(_ product: String) -> String {
-        switch product {
-        case "GrokBuild": return "Grok Build"
-        case "Api", "API": return "Grok API"
-        case "GrokChat": return "Grok Chat"
-        case "GrokImagine": return "Grok Imagine"
-        default:
-            return product.hasPrefix("Grok") ? product : "Grok \(product)"
-        }
-    }
-
-    private func resetSub(_ iso: String?) -> String {
-        guard let iso else { return "" }
-        let cleaned = iso.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: "+00:00", with: "Z")
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        var dt = f.date(from: cleaned)
-        if dt == nil {
-            // Fractional seconds / offset variants the ISO formatter sometimes misses.
-            let f2 = ISO8601DateFormatter()
-            f2.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            dt = f2.date(from: iso)
-        }
-        guard let dt else { return "" }
-        let delta = dt.timeIntervalSinceNow
-        if delta <= 0 { return "resetting…" }
-        let df = DateFormatter()
-        if delta < 3600 { return "resets in \(Int(delta / 60)) min" }
-        df.dateFormat = delta < 12 * 3600 ? "h:mm a" : "EEE h:mm a"
-        return "resets " + df.string(from: dt)
+        let parsed = UsageParsers.grokMonthly(from: data)
+        return ParsedBilling(overallPercent: parsed.overallPercent,
+                             resetSub: parsed.resetSub,
+                             resetsAt: parsed.resetsAt,
+                             products: parsed.products)
     }
 }
 
@@ -2098,56 +1984,9 @@ final class CodexUsageClient {
         guard code == 200 else { throw UsageError.http(code) }
 
         let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        var gauges: [Gauge] = []
-
-        if let rl = obj["rate_limit"] as? [String: Any] {
-            if let primary = rl["primary_window"] as? [String: Any],
-               let pct = number(primary["used_percent"]) {
-                gauges.append(Gauge(label: "Codex", percent: pct.rounded(),
-                                    sub: resetSub(primary)))
-            }
-            if let secondary = rl["secondary_window"] as? [String: Any],
-               let pct = number(secondary["used_percent"]) {
-                gauges.append(Gauge(label: "Codex 2", percent: pct.rounded(),
-                                    sub: resetSub(secondary)))
-            }
-        }
-        // Credits balance as a soft gauge only when the account has a credit pool.
-        if let credits = obj["credits"] as? [String: Any],
-           credits["has_credits"] as? Bool == true,
-           let bal = number(credits["balance"]) {
-            // Balance is remaining credits (not a percent) — skip if we can't normalize.
-            _ = bal
-        }
+        let gauges = UsageParsers.codexGauges(from: obj)
         if gauges.isEmpty { throw UsageError.emptyResponse }
         return gauges
-    }
-
-    private func number(_ any: Any?) -> Double? {
-        if let n = any as? NSNumber { return n.doubleValue }
-        if let s = any as? String { return Double(s) }
-        if let i = any as? Int { return Double(i) }
-        return nil
-    }
-
-    private func resetSub(_ window: [String: Any]) -> String {
-        if let resetAt = window["reset_at"] as? Int ?? (window["reset_at"] as? NSNumber)?.intValue {
-            let dt = Date(timeIntervalSince1970: TimeInterval(resetAt))
-            let delta = dt.timeIntervalSinceNow
-            if delta <= 0 { return "resetting…" }
-            if delta < 3600 { return "resets in \(Int(delta / 60)) min" }
-            let df = DateFormatter()
-            df.dateFormat = delta < 12 * 3600 ? "h:mm a" : "EEE h:mm a"
-            return "resets " + df.string(from: dt)
-        }
-        if let secs = window["reset_after_seconds"] as? Int
-            ?? (window["reset_after_seconds"] as? NSNumber)?.intValue {
-            if secs <= 0 { return "resetting…" }
-            if secs < 3600 { return "resets in \(secs / 60) min" }
-            if secs < 86400 { return "resets in \(secs / 3600)h" }
-            return "resets in \(secs / 86400)d"
-        }
-        return ""
     }
 }
 
@@ -4285,7 +4124,21 @@ enum SessionRadar {
         let template = loadTemplate()
         let html = template.replacingOccurrences(of: "__REPORT_JSON__", with: jsonStr)
         try html.write(to: reportHTML, atomically: true, encoding: .utf8)
+        installChartScript()
         return reportHTML
+    }
+
+    /// Copy the vendored chart script next to report.html so the page
+    /// does not fetch it from the network.
+    static func installChartScript() {
+        let dest = supportDir.appendingPathComponent("lightweight-charts.js")
+        let bundled = Bundle.main.url(forResource: "lightweight-charts", withExtension: "js")
+        let dev = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("assets/lightweight-charts.js")
+        let src = bundled ?? (FileManager.default.fileExists(atPath: dev.path) ? dev : nil)
+        guard let src else { return }
+        try? FileManager.default.removeItem(at: dest)
+        try? FileManager.default.copyItem(at: src, to: dest)
     }
 
     static func openLastReport() -> Bool {
@@ -4350,6 +4203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let whatsNew = WhatsNewController()
     let updates = UpdateChecker()
     let laptopMode = LaptopModeController.shared
+    let settingsController = SettingsController()
     let newsletterURL = URL(string: "https://buttondown.com/jaco")!
     let communityURL = URL(string: "https://github.com/jackfieldman/usage-monitor/discussions")!
     var timer: Timer?
@@ -4472,6 +4326,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openSetup() { onboarding.present() }
 
+    @objc func openSettings() {
+        settingsController.present(app: self)
+    }
+
+    func paceForecast(providerId: String, gauge: Gauge) -> PaceForecast {
+        PaceMath.forecast(percent: gauge.percent, resetsAt: gauge.resetsAt,
+                          samples: PaceStore.samples(for: "\(providerId)|\(gauge.label)"))
+    }
+
+    /// One notice per forecast hour when pace reaches 80% inside six hours.
+    func checkPaceNotifications(_ groups: [ProviderGauges]) {
+        guard notifyEnabled else { return }
+        let now = Date()
+        for group in groups {
+            guard let g = Self.primaryGauge(for: group) else { continue }
+            let key = "\(group.config.id)|\(g.label)"
+            let forecast = PaceMath.forecast(percent: g.percent, resetsAt: g.resetsAt,
+                                             samples: PaceStore.samples(for: key), now: now)
+            guard forecast.warn, let eta = forecast.eta else { continue }
+            let token = String(Int(eta.timeIntervalSince1970 / 3600))
+            if PaceStore.notifiedToken(key) == token { continue }
+            PaceStore.markNotified(key, token: token)
+            let c = UNMutableNotificationContent()
+            c.title = "Usage — \(group.config.displayName)"
+            c.body = "\(g.label) is at \(Int(g.percent))%. \(forecast.line)."
+            UNUserNotificationCenter.current().add(
+                UNNotificationRequest(identifier: "pace-\(key)", content: c, trigger: nil))
+        }
+    }
+
     /// Background-only. Never call from menuNeedsUpdate (that freezes the menu
     /// tracking loop and steals the keyboard until the scan finishes).
     ///
@@ -4567,7 +4451,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 let flat = groups.flatMap(\.gauges)
                 if !flat.isEmpty {
+                    for group in groups {
+                        PaceStore.record(providerId: group.config.id, gauges: group.gauges)
+                    }
                     self.checkNotifications(flat)
+                    self.checkPaceNotifications(groups)
                     self.providerGauges = groups
                     self.lastUpdated = Date()
                     self.lastError = errors.isEmpty ? nil : errors.joined(separator: " · ")
@@ -4970,6 +4858,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func render() {
         // Don't stomp the hourly “Update available” scroll mid-animation.
         if marqueeActive { return }
+        // Horizontal bars only fit one cluster. Fall back before drawing.
+        if iconShape == .hbars && iconClusters.count > 1 {
+            iconShape = .bars
+        }
         guard let button = statusItem.button else { return }
         let clusters = iconClusters
         if clusters.isEmpty {
@@ -4981,8 +4873,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             var tip: [String] = []
             for group in providerGauges {
                 tip.append("— \(group.config.displayName) —")
-                tip.append(contentsOf: group.gauges.map { "\($0.label): \(Int($0.percent))%" })
+                tip.append(contentsOf: group.gauges.map { g in
+                    let pace = self.paceForecast(providerId: group.config.id, gauge: g)
+                    return "\(g.label): \(Int(g.percent))% · \(pace.line)"
+                })
             }
+            tip.append("")
+            tip.append(AppFootprint.menuLine())
             if let up = updateAvailable, UpdatePrefs.shouldSurface(version: up.version) {
                 tip.append("")
                 tip.append("Update \(up.version) available — open Updates in the menu")
@@ -5152,7 +5049,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let letter = NSAttributedString(string: badge,
                 attributes: [.font: letterFont, .foregroundColor: ink])
             let pct = NSAttributedString(string: "\(Int(shown))%",
-                attributes: [.font: numFont, .foregroundColor: ink])
+                attributes: [.font: numFont, .foregroundColor: levelColor(used)])
             let w = ceil(letter.size().width) + letterGap + glyphW + pctGap + ceil(pct.size().width)
             return Laid(letter: letter, pct: pct, percent: used, width: w)
         }
@@ -5507,11 +5404,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if idx > 0 { menu.addItem(.separator()) }
                 let header = "\(group.config.letter):  \(group.config.displayName)"
                 menu.addItem(disabled(header))
+                let primaryLabel = Self.primaryGauge(for: group)?.label
                 for g in group.gauges {
                     let sub = g.sub.isEmpty ? "" : "   ·  \(g.sub)"
                     let row = disabled("\(g.label):  \(Int(g.percent))%\(sub)")
                     row.image = dotImage(levelColor(g.percent))
                     menu.addItem(row)
+                    if g.label == primaryLabel || g.percent >= 80 {
+                        let pace = paceForecast(providerId: group.config.id, gauge: g)
+                        let paceRow = disabled("    \(pace.line)")
+                        paceRow.toolTip = "Burn rate from usage samples stored on this Mac. A new sample lands about every 5 minutes."
+                        menu.addItem(paceRow)
+                    }
                 }
             }
             if let err = lastError {
@@ -5534,114 +5438,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
             menu.addItem(disabled("Updated \(relative(updated))"))
         }
+        menu.addItem(disabled(AppFootprint.menuLine()))
         menu.addItem(.separator())
-        menu.addItem(whatsNewMenuItem())
-        menu.addItem(updatesMenuItem())
         menu.addItem(item("Refresh now", #selector(poll), "r"))
         menu.addItem(sessionReportMenuItem())
-
-        // Caffeinate Mode — keep awake + optional lid-shut + hotspot.
-        menu.addItem(laptopModeMenuItem())
-
-        // Providers — names, letters, what goes in the bar.
-        menu.addItem(providersMenuItem())
-
-        let layoutItem = NSMenuItem(title: "Menu Bar Layout", action: nil, keyEquivalent: "")
-        WhatsNew.applyFeatureChip(layoutItem, .menuBarLayout)
-        let layoutMenu = NSMenu()
-        for layout in MenuBarLayout.allCases {
-            let i = NSMenuItem(title: layout.title, action: #selector(pickLayout(_:)), keyEquivalent: "")
-            i.target = self
-            i.representedObject = layout.rawValue
-            i.state = layout == ProviderStore.layout ? .on : .off
-            layoutMenu.addItem(i)
-        }
-        layoutItem.submenu = layoutMenu
-        menu.addItem(layoutItem)
-
-        let shapeItem = NSMenuItem(title: "Icon Shape", action: nil, keyEquivalent: "")
-        let shapeMenu = NSMenu()
-        shapeMenu.autoenablesItems = false   // honour isEnabled greying
-        let multiCluster = !horizontalBarsAvailable
-        for shape in IconShape.allCases {
-            let i = NSMenuItem(title: shape.title, action: #selector(pickShape(_:)), keyEquivalent: "")
-            i.target = self
-            i.representedObject = shape.rawValue
-            i.state = shape == iconShape ? .on : .off
-            if shape == .hbars && multiCluster {
-                i.isEnabled = false
-                i.state = .off
-                // Grey title (isEnabled alone is subtle in some themes).
-                let grey = NSColor.secondaryLabelColor.withAlphaComponent(0.55)
-                i.attributedTitle = NSAttributedString(
-                    string: "\(shape.title)  (limited to 1 provider)",
-                    attributes: [
-                        .font: NSFont.menuFont(ofSize: 0),
-                        .foregroundColor: grey,
-                    ])
-                i.toolTip = "Horizontal bars work with a single provider on the menu bar.\nTurn off extra providers under Providers → Show in Menu Bar, or use Menu Bar Layout → Highest Only."
-            }
-            shapeMenu.addItem(i)
-        }
-        if iconShape == .hbars && multiCluster {
-            iconShape = .bars
-            render()
-        }
-        shapeItem.submenu = shapeMenu
-        menu.addItem(shapeItem)
-        if iconShape == .battery {
-            let fillItem = NSMenuItem(title: "Battery Fill", action: nil, keyEquivalent: "")
-            let fillMenu = NSMenu()
-            for mode in BatteryFillMode.allCases {
-                let i = NSMenuItem(title: mode.title, action: #selector(pickBatteryFill(_:)), keyEquivalent: "")
-                i.target = self
-                i.representedObject = mode.rawValue
-                i.state = mode == batteryFill ? .on : .off
-                i.toolTip = mode.subtitle
-                fillMenu.addItem(i)
-            }
-            fillItem.submenu = fillMenu
-            menu.addItem(fillItem)
-
-            let combined = item("Consolidated Icon", #selector(toggleConsolidated), "")
-            combined.state = consolidated ? .on : .off
-            menu.addItem(combined)
-        }
-        let styleItem = NSMenuItem(title: "Icon Style", action: nil, keyEquivalent: "")
-        let styleMenu = NSMenu()
-        for style in IconStyle.allCases {
-            let i = NSMenuItem(title: style.title, action: #selector(pickStyle(_:)), keyEquivalent: "")
-            i.target = self
-            i.representedObject = style.rawValue
-            i.state = style == iconStyle ? .on : .off
-            styleMenu.addItem(i)
-        }
-        styleItem.submenu = styleMenu
-        menu.addItem(styleItem)
-        let densityItem = NSMenuItem(title: "Density", action: nil, keyEquivalent: "")
-        let densityMenu = NSMenu()
-        for d in Density.allCases {
-            let i = NSMenuItem(title: d.title, action: #selector(pickDensity(_:)), keyEquivalent: "")
-            i.target = self
-            i.representedObject = d.rawValue
-            i.state = d == density ? .on : .off
-            densityMenu.addItem(i)
-        }
-        densityItem.submenu = densityMenu
-        menu.addItem(densityItem)
-        // Per-provider “which % under C:/G:” — a flat Claude+Grok list is nonsense
-        // when both are on the bar.
-        menu.addItem(barPercentMenuItem())
-        let notify = item("Notify near a limit (80%)", #selector(toggleNotify), "")
-        notify.state = notifyEnabled ? .on : .off
-        menu.addItem(notify)
-        let login = item("Open at Login", #selector(toggleLogin), "")
-        login.state = loginEnabled ? .on : .off
-        menu.addItem(login)
-        menu.addItem(item("Set Up…", #selector(openSetup), ""))
+        let settings = item("Settings…", #selector(openSettings), ",")
+        WhatsNew.applyFeatureChip(settings, .pace)
+        menu.addItem(settings)
         menu.addItem(.separator())
-        menu.addItem(item("Subscribe to Updates…", #selector(openNewsletter), ""))
-        menu.addItem(item("Join the Community…", #selector(openCommunity), ""))
         let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         menu.addItem(quit)
@@ -6819,149 +6623,208 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-// CLI self-test: prove Caffeinate Mode keep-awake (+ optional lid-shut / Wi‑Fi).
-//   UsageMonitor.app/Contents/MacOS/UsageMonitor --laptop-mode-self-test
-//   … --laptop-mode-self-test --hotspot "MyPhone"   # also try join
-//   … --laptop-mode-self-test --keep                 # leave mode active
-//   … --laptop-mode-self-test --off-only             # only test force-off path
-if CommandLine.arguments.contains("--laptop-mode-self-test") {
-    let lm = LaptopModeController.shared
-    let keep = CommandLine.arguments.contains("--keep")
-    let offOnly = CommandLine.arguments.contains("--off-only")
-    if let idx = CommandLine.arguments.firstIndex(of: "--hotspot"),
-       idx + 1 < CommandLine.arguments.count {
-        lm.favoriteHotspot = CommandLine.arguments[idx + 1]
-        lm.joinHotspotOnActivate = true
-    } else {
-        lm.joinHotspotOnActivate = !lm.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && CommandLine.arguments.contains("--join")
-    }
-    if LaptopModeController.isPortableMac {
-        lm.lidShutOnActivate = true
-    }
-    setbuf(stdout, nil)
-    print("=== Caffeinate Mode self-test ===")
-    print("portable:", LaptopModeController.isPortableMac)
-    let parseOn = LaptopModeController.parseSleepDisabled("System-wide power settings:\n SleepDisabled\t\t1\n")
-    let parseOff = LaptopModeController.parseSleepDisabled(" SleepDisabled 0\n")
-    let parseMiss = LaptopModeController.parseSleepDisabled("no flag here\n")
-    let parseOK = parseOn == true && parseOff == false && parseMiss == nil
-    print(parseOK ? "PASS: SleepDisabled parser" : "FAIL: SleepDisabled parser")
+// MARK: - Settings (icon, updates, Caffeinate, links — out of the status menu)
 
-    func pmsetText() -> String {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        p.arguments = ["-g", "assertions"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        try? p.run()
-        p.waitUntilExit()
-        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+final class SettingsController: NSObject {
+    private var window: NSWindow?
+    private weak var app: AppDelegate?
+
+    func present(app: AppDelegate) {
+        self.app = app
+        let win = build()
+        window = win
+        NSApp.activate(ignoringOtherApps: true)
+        win.makeKeyAndOrderFront(nil)
     }
 
-    if offOnly {
-        lm.deactivate()
-        Thread.sleep(forTimeInterval: 0.4)
-        let clean = !lm.isEngaged && !lm.isActive
-        print(lm.lastProof)
-        print(clean
-            ? "PASS: Off left this process with no keep-awake"
-            : "FAIL: Off still engaged in this process")
-        exit(clean && parseOK ? 0 : 1)
-    }
+    private func build() -> NSWindow {
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 640),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false)
+        win.title = "Settings"
+        win.isReleasedWhenClosed = false
+        win.center()
 
-    let result = lm.activate()
-    print(result.proof)
-    print("---")
-    Thread.sleep(forTimeInterval: 0.4)
-    let pm = pmsetText()
-    let idleOK = pm.contains(LaptopModeController.idleAssertionName) || lm.caffeinateEngaged
-    let lidOK = !LaptopModeController.isPortableMac
-        || !lm.lidShutOnActivate
-        || pm.contains(LaptopModeController.lidAssertionName)
-        || lm.lidShutEngaged
-    print(idleOK
-        ? "PASS: caffeinate keep-awake engaged"
-        : "FAIL: caffeinate keep-awake missing")
-    if let line = pm.split(separator: "\n").first(where: {
-        $0.contains(LaptopModeController.idleAssertionName)
-            || $0.contains(LaptopModeController.lidAssertionName)
-    }) {
-        print("  ", line)
-    }
-    print(lidOK ? "PASS: lid-shut path OK" : "FAIL: lid-shut assertion missing")
-    if keep {
-        print("Keeping Caffeinate Mode active (--keep).")
-        let app = NSApplication.shared
-        let delegate = AppDelegate()
-        app.delegate = delegate
-        app.run()
-    } else {
-        lm.deactivate()
-        Thread.sleep(forTimeInterval: 0.4)
-        let pmAfter = pmsetText()
-        let selfPid = ProcessInfo.processInfo.processIdentifier
-        let oursStill = pmAfter.split(separator: "\n").contains { line in
-            let s = String(line)
-            return s.contains("pid \(selfPid)(")
-                && (s.contains(LaptopModeController.idleAssertionName)
-                    || s.contains(LaptopModeController.lidAssertionName))
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSTextField(labelWithString: "Settings")
+        title.font = .systemFont(ofSize: 18, weight: .semibold)
+        let blurb = NSTextField(wrappingLabelWithString: "The menu bar shows limits, pace, live sessions, and how much memory this app uses. Everything else is here.")
+        blurb.font = .systemFont(ofSize: 12)
+        blurb.textColor = .secondaryLabelColor
+        blurb.preferredMaxLayoutWidth = 412
+        stack.addArrangedSubview(title)
+        stack.addArrangedSubview(blurb)
+        stack.addArrangedSubview(section("Menu bar"))
+        if let app {
+            stack.addArrangedSubview(popup("Layout", MenuBarLayout.allCases.map { ($0.title, $0.rawValue) },
+                                           appIcon: ProviderStore.layout.rawValue, action: #selector(layoutPicked(_:))))
+            stack.addArrangedSubview(popup("Shape", IconShape.allCases.map { ($0.title, $0.rawValue) },
+                                           appIcon: app.iconShape.rawValue, action: #selector(shapePicked(_:))))
+            stack.addArrangedSubview(popup("Style", IconStyle.allCases.map { ($0.title, $0.rawValue) },
+                                           appIcon: app.iconStyle.rawValue, action: #selector(stylePicked(_:))))
+            stack.addArrangedSubview(popup("Density", Density.allCases.map { ($0.title, $0.rawValue) },
+                                           appIcon: app.density.rawValue, action: #selector(densityPicked(_:))))
+            if app.iconShape == .battery {
+                stack.addArrangedSubview(popup("Battery fill", BatteryFillMode.allCases.map { ($0.title, $0.rawValue) },
+                                               appIcon: app.batteryFill.rawValue, action: #selector(fillPicked(_:))))
+                stack.addArrangedSubview(check("Consolidated icon", app.consolidated, #selector(consolidatedClicked(_:))))
+            }
+            stack.addArrangedSubview(button("Which percent the bar shows…", #selector(showBarPercent(_:))))
+            stack.addArrangedSubview(check("Notify near a limit (80%) and on a fast pace", app.notifyEnabled, #selector(notifyClicked(_:))))
+            stack.addArrangedSubview(check("Open at Login", app.loginEnabled, #selector(loginClicked(_:))))
         }
-        let offOK = !oursStill && !lm.isEngaged && !lm.isActive
-        print("--- after Off ---")
-        print(lm.lastProof)
-        print(offOK
-            ? "PASS: Off cleared keep-awake (sleep/screensaver allowed by this app)"
-            : "FAIL: Off did not fully clear keep-awake")
-        if pmAfter.contains(LaptopModeController.idleAssertionName) && offOK {
-            print("NOTE: another process still holds similarly named assertions (ignored)")
+
+        stack.addArrangedSubview(section("Caffeinate"))
+        let active = app?.laptopMode.isActive == true || app?.laptopMode.isEngaged == true
+        let status = NSTextField(labelWithString: active
+            ? "On. Sleep is blocked by this app until you turn it off."
+            : "Off. Sleep and screensaver are allowed.")
+        status.font = .systemFont(ofSize: 12)
+        status.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(status)
+        stack.addArrangedSubview(button(active ? "Turn Off Caffeinate Mode" : "Turn On Caffeinate Mode",
+                                        #selector(caffeinateClicked(_:))))
+        if LaptopModeController.isPortableMac {
+            stack.addArrangedSubview(check("Keep laptop on with lid shut",
+                                           app?.laptopMode.lidShutOnActivate == true,
+                                           #selector(lidClicked(_:))))
         }
-        print("Cleaned up. Use --keep to leave active.")
-        exit(idleOK && lidOK && result.ok && offOK && parseOK ? 0 : 1)
+        stack.addArrangedSubview(check("Join favorite hotspot when turning on",
+                                       app?.laptopMode.joinHotspotOnActivate == true,
+                                       #selector(hotspotJoinClicked(_:))))
+        stack.addArrangedSubview(button("Choose Favorite Hotspot…", #selector(hotspotClicked(_:))))
+        stack.addArrangedSubview(button("Caffeinate options…", #selector(showCaffeinateMenu(_:))))
+
+        stack.addArrangedSubview(section("Account"))
+        stack.addArrangedSubview(button("Providers…", #selector(showProviders(_:))))
+        stack.addArrangedSubview(button("Updates…", #selector(showUpdates(_:))))
+        stack.addArrangedSubview(button("What's New", #selector(showWhatsNew(_:))))
+        stack.addArrangedSubview(button("Set Up…", #selector(showSetup(_:))))
+        stack.addArrangedSubview(button("Subscribe to Updates…", #selector(showNewsletter(_:))))
+        stack.addArrangedSubview(button("Join the Community…", #selector(showCommunity(_:))))
+
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 640))
+        content.addSubview(stack)
+        win.contentView = content
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -16),
+        ])
+        return win
+    }
+
+    private func section(_ text: String) -> NSView {
+        let l = NSTextField(labelWithString: text.uppercased())
+        l.font = .systemFont(ofSize: 11, weight: .semibold)
+        l.textColor = .secondaryLabelColor
+        return l
+    }
+
+    private func popup(_ title: String, _ values: [(String, String)], appIcon selected: String, action: Selector) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 8
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 13)
+        label.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        let pop = NSPopUpButton()
+        pop.target = self
+        pop.action = action
+        pop.translatesAutoresizingMaskIntoConstraints = false
+        pop.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+        for (name, raw) in values {
+            pop.addItem(withTitle: name)
+            pop.lastItem?.representedObject = raw
+        }
+        if let idx = values.firstIndex(where: { $0.1 == selected }) {
+            pop.selectItem(at: idx)
+        }
+        row.addArrangedSubview(label)
+        row.addArrangedSubview(pop)
+        return row
+    }
+
+    private func check(_ title: String, _ on: Bool, _ action: Selector) -> NSButton {
+        let b = NSButton(checkboxWithTitle: title, target: self, action: action)
+        b.state = on ? .on : .off
+        b.font = .systemFont(ofSize: 13)
+        return b
+    }
+
+    private func button(_ title: String, _ action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .rounded
+        b.font = .systemFont(ofSize: 13)
+        return b
+    }
+
+    private func choice(_ sender: NSPopUpButton) -> NSMenuItem {
+        let item = NSMenuItem()
+        item.representedObject = sender.selectedItem?.representedObject
+        return item
+    }
+
+    @objc private func layoutPicked(_ sender: NSPopUpButton) { app?.pickLayout(choice(sender)); presentAgain() }
+    @objc private func shapePicked(_ sender: NSPopUpButton) { app?.pickShape(choice(sender)); presentAgain() }
+    @objc private func stylePicked(_ sender: NSPopUpButton) { app?.pickStyle(choice(sender)); presentAgain() }
+    @objc private func densityPicked(_ sender: NSPopUpButton) { app?.pickDensity(choice(sender)); presentAgain() }
+    @objc private func fillPicked(_ sender: NSPopUpButton) { app?.pickBatteryFill(choice(sender)); presentAgain() }
+
+    private func presentAgain() {
+        guard let app else { return }
+        present(app: app)
+    }
+
+    @objc private func consolidatedClicked(_ sender: NSButton) {
+        guard let app else { return }
+        if (sender.state == .on) != app.consolidated { app.toggleConsolidated() }
+    }
+    @objc private func notifyClicked(_ sender: NSButton) {
+        guard let app else { return }
+        if (sender.state == .on) != app.notifyEnabled { app.toggleNotify() }
+    }
+    @objc private func loginClicked(_ sender: NSButton) {
+        guard let app else { return }
+        if (sender.state == .on) != app.loginEnabled { app.toggleLogin() }
+    }
+    @objc private func lidClicked(_ sender: NSButton) {
+        guard let app else { return }
+        if (sender.state == .on) != app.laptopMode.lidShutOnActivate { app.toggleLaptopClamshell() }
+    }
+    @objc private func hotspotJoinClicked(_ sender: NSButton) {
+        guard let app else { return }
+        if (sender.state == .on) != app.laptopMode.joinHotspotOnActivate { app.toggleLaptopJoinHotspot() }
+    }
+    @objc private func caffeinateClicked(_ sender: NSButton) {
+        guard let app else { return }
+        if app.laptopMode.isActive || app.laptopMode.isEngaged {
+            app.deactivateLaptopMode()
+        } else {
+            app.activateLaptopMode()
+        }
+        presentAgain()
+    }
+    @objc private func hotspotClicked(_: NSButton) { app?.setFavoriteHotspot() }
+    @objc private func showCaffeinateMenu(_ sender: NSButton) { pop(app?.laptopModeMenuItem(), sender) }
+    @objc private func showProviders(_ sender: NSButton) { pop(app?.providersMenuItem(), sender) }
+    @objc private func showUpdates(_ sender: NSButton) { pop(app?.updatesMenuItem(), sender) }
+    @objc private func showBarPercent(_ sender: NSButton) { pop(app?.barPercentMenuItem(), sender) }
+    @objc private func showWhatsNew(_: NSButton) { app?.showWhatsNew() }
+    @objc private func showSetup(_: NSButton) { app?.openSetup() }
+    @objc private func showNewsletter(_: NSButton) { app?.openNewsletter() }
+    @objc private func showCommunity(_: NSButton) { app?.openCommunity() }
+
+    private func pop(_ item: NSMenuItem?, _ sender: NSButton) {
+        guard let menu = item?.submenu else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
     }
 }
-
-// Headless Session Report (smoke / automation):
-//   UsageMonitor.app/Contents/MacOS/UsageMonitor --session-report [--days 7|35] [--titles]
-if CommandLine.arguments.contains("--session-report") {
-    var days = 35
-    if let idx = CommandLine.arguments.firstIndex(of: "--days"),
-       idx + 1 < CommandLine.arguments.count,
-       let n = Int(CommandLine.arguments[idx + 1]), n > 0, n <= 365 {
-        days = n
-    }
-    let titles = CommandLine.arguments.contains("--titles")
-    do {
-        let report = SessionRadar.scan(days: days, includeTitles: titles)
-        let url = try SessionRadar.write(report: report)
-        print("OK: Session Report written")
-        print("  windowDays=\(report.windowDays)")
-        print("  projects=\(report.totals["projects"] ?? 0)")
-        print("  claude=\(report.totals["claudeSessions"] ?? 0)")
-        print("  grok=\(report.totals["grokSessions"] ?? 0)")
-        print("  codex=\(report.totals["codexSessions"] ?? 0)")
-        print("  html=\(url.path)")
-        // Privacy guard: report must not contain this Mac's home directory path.
-        let home = NSHomeDirectory()
-        if let html = try? String(contentsOf: url, encoding: .utf8), html.contains(home) {
-            print("FAIL: report HTML contains home path (privacy scrub broken)")
-            exit(1)
-        }
-        if let data = try? Data(contentsOf: SessionRadar.reportJSON),
-           let text = String(data: data, encoding: .utf8), text.contains(home) {
-            print("FAIL: report JSON contains home path (privacy scrub broken)")
-            exit(1)
-        }
-        print("PASS: no home path in report")
-        exit(0)
-    } catch {
-        fputs("FAIL: \(error.localizedDescription)\n", stderr)
-        exit(1)
-    }
-}
-
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()

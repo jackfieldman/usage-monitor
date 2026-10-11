@@ -8,6 +8,22 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.9.0
+
+- **Pace.** Each provider’s main limit shows points per hour and the time it
+  reaches 80% at the current pace. Samples stay on this Mac. A fast pace can
+  notify before the limit is already in the red.
+- **Short menu.** The menu bar menu lists live sessions, limits, pace, and
+  this app’s memory use. Icon, updates, Caffeinate, providers, and links
+  moved to **Settings**.
+- **Memory.** The menu and the tooltip show this app’s memory footprint
+  (the same figure Activity Monitor calls Memory) so the size is visible.
+- **Menu bar percent** uses green / amber / red for the number.
+- **Session Report** loads its chart from a script inside the app. The page
+  no longer fetches the chart library from the network.
+- **Tests.** Claude, Grok, and Codex usage parsers, pace math, and the
+  Caffeinate Off sleep rule have fixture checks (`tests/check-usage-core.swift`).
+
 ## 2.8.2
 
 - **Caffeinate Off restores system sleep.** Turning Caffeinate Mode on sets

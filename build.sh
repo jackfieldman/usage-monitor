@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build UsageMonitor.app from UsageMonitor.swift.
+# Build UsageMonitor.app from UsageCore.swift + UsageMonitor.swift.
 #
 # Signing: uses a "Developer ID Application" certificate if one is installed
 # (or set SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"),
@@ -14,13 +14,14 @@ MACOS="$APP/Contents/MacOS"
 RES="$APP/Contents/Resources"
 mkdir -p "$MACOS" "$RES"
 
-swiftc -O UsageMonitor.swift -o "$MACOS/UsageMonitor" \
+swiftc -O UsageCore.swift UsageMonitor.swift main.swift -o "$MACOS/UsageMonitor" \
     -framework AppKit -framework CoreWLAN -framework IOKit
 
 # App icon — used by Finder, the Dock, and macOS notifications.
 cp AppIcon.icns "$RES/AppIcon.icns"
 # Session Report HTML board template
 cp assets/session-radar-report.html "$RES/session-radar-report.html"
+cp assets/lightweight-charts.js "$RES/lightweight-charts.js"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -32,8 +33,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>      <string>com.usagemonitor.app</string>
     <key>CFBundleExecutable</key>      <string>UsageMonitor</string>
     <key>CFBundleIconFile</key>        <string>AppIcon</string>
-    <key>CFBundleVersion</key>         <string>2.8.2</string>
-    <key>CFBundleShortVersionString</key> <string>2.8.2</string>
+    <key>CFBundleVersion</key>         <string>2.9.0</string>
+    <key>CFBundleShortVersionString</key> <string>2.9.0</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>NSPrincipalClass</key>        <string>NSApplication</string>
     <key>LSUIElement</key>             <true/>

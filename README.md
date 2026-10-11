@@ -16,8 +16,11 @@ tab, Orbit window, or desktop app.
   </picture>
 </p>
 
-Green under 50%, amber 50–79%, red at 80%+. Click the item for a labelled
-breakdown with reset times, a **Refresh now** button, and **Open at Login**.
+Green under 50%, amber 50–79%, red at 80%+. The percent next to each letter
+uses that same colour. Click the item for a labelled breakdown with reset
+times, a **pace** line (points per hour, and when 80% hits), this app’s
+**memory** use, and **Refresh now**. Icon options, updates, Caffeinate, and
+**Open at Login** live in **Settings**.
 
 The icon is configurable from that menu:
 
