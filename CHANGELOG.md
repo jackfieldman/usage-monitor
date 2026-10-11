@@ -8,6 +8,11 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.9.2
+
+- **Quieter menu-bar colours.** The green, amber, and red on the percent
+  numbers are a step less bright.
+
 ## 2.9.1
 
 - **Caffeinate only holds its own keep-awake.** Turning it on keeps the Mac
