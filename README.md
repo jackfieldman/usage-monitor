@@ -20,10 +20,10 @@ tab, Orbit window, or desktop app.
 </p>
 
 Green under 50%, amber 50–79%, red at 80%+. The percent next to each letter
-uses that same colour. Click the item for a labelled breakdown with reset
-times, a **pace** line (points per hour, and when 80% hits), this app’s
-**memory** use, and **Refresh now**. Icon options, updates, Caffeinate, and
-**Open at Login** live in **Settings**.
+uses that same colour. Click the icon for a Usage panel: each limit shows
+the time left and how much is left. Right-click, or More, opens the full
+menu, including pace, memory use, and Refresh now. Icon options, updates,
+Caffeinate, and **Open at Login** live in **Settings**.
 
 The icon is configurable from that menu:
 

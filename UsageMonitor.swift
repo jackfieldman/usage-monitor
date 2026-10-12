@@ -172,6 +172,11 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.11.0", "Usage panel", [
+            "A click on the menu-bar icon opens Usage",
+            "Each limit shows the time left and how much is left",
+            "Right-click, or More, still opens the full menu",
+        ]),
         ("2.10.0", "Menu bar preview, use-it-up alerts, tip jar", [
             "Settings shows the menu bar on a dark strip and a light strip before you change it",
             "Optional alert when a limit still has room and resets soon",
@@ -4273,6 +4278,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let updates = UpdateChecker()
     let laptopMode = LaptopModeController.shared
     let settingsController = SettingsController()
+    let usagePanel = UsagePanelController()
+    /// Catches a real click on the status item. The button action alone does not.
+    private var statusClickMonitor: Any?
+    private var lastStatusClickStamp: TimeInterval = -1
+    private var lastStatusClickUptime: TimeInterval = 0
     let newsletterURL = URL(string: "https://buttondown.com/jaco")!
     let communityURL = URL(string: "https://github.com/jackfieldman/usage-monitor/discussions")!
     var timer: Timer?
@@ -4367,7 +4377,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hasAdminKey = apiKeyConfigured()
         notifiedHigh = Set(UserDefaults.standard.stringArray(forKey: "notifiedHigh") ?? [])
         statusMenu.delegate = self
-        statusItem.menu = statusMenu
+        // The click opens a drawn panel. The system menu stays on right-click and More.
+        // A menu attached to the item swallows the click, so the menu stays nil.
+        statusItem.menu = nil
+        if let button = statusItem.button {
+            button.target = self
+            button.action = #selector(toggleUsagePanel(_:))
+            // NSStatusBarButton consumes mouse-up when it has no menu. A mouse-up
+            // action never runs for a real click. Listen on mouse-down.
+            button.sendAction(on: [.leftMouseDown, .rightMouseDown])
+        }
+        installStatusClickMonitor()
         onboarding.onReady = { [weak self] in self?.poll() }
         onboarding.onKeyChanged = { [weak self] in
             guard let self else { return }
@@ -4401,6 +4421,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openSettings() {
         settingsController.present(app: self)
+    }
+
+    /// Left click draws the usage panel. Right click keeps the full system menu.
+    @objc func toggleUsagePanel(_ sender: Any?) {
+        handleStatusClick(NSApp.currentEvent)
+    }
+
+    /// The status button lives in this app, so a local monitor sees the click
+    /// even when the button never sends its action.
+    private func installStatusClickMonitor() {
+        statusClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self, self.eventHitsStatusButton(event) else { return event }
+            self.handleStatusClick(event)
+            return nil
+        }
+    }
+
+    private func eventHitsStatusButton(_ event: NSEvent) -> Bool {
+        guard let button = statusItem.button, event.window === button.window else { return false }
+        return button.bounds.contains(button.convert(event.locationInWindow, from: nil))
+    }
+
+    private func handleStatusClick(_ event: NSEvent?) {
+        if let event {
+            let now = ProcessInfo.processInfo.systemUptime
+            // The monitor and the button action both see one click. A later click must still count.
+            if event.timestamp == lastStatusClickStamp, now - lastStatusClickUptime < 0.05 { return }
+            lastStatusClickStamp = event.timestamp
+            lastStatusClickUptime = now
+        }
+        let right = event?.type == .rightMouseDown
+            || event?.type == .rightMouseUp
+            || event?.modifierFlags.contains(.control) == true
+        guard let button = statusItem.button else { return }
+        if right {
+            usagePanel.close()
+            button.highlight(true)
+            statusMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
+            button.highlight(false)
+            return
+        }
+        usagePanel.toggle(app: self, anchor: button)
     }
 
     func paceForecast(providerId: String, gauge: Gauge) -> PaceForecast {
@@ -5084,6 +5146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.toolTip = tip.joined(separator: "\n")
         }
         updateCaffeinateGlow()
+        usagePanel.reloadIfVisible()
     }
 
     /// Pin status-item width to the bitmap so macOS doesn’t pad a “variable” slot
@@ -6889,6 +6952,592 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return true
         }
     }
+}
+
+// MARK: - Usage panel (the window a click opens)
+
+/// Drawn panel under the menu-bar icon. A system menu cannot carry this layout.
+final class UsagePanelController: NSObject {
+    private let panel: NSPanel
+    private let catcher: NSPanel
+    private weak var app: AppDelegate?
+    private weak var anchor: NSStatusBarButton?
+    private var outsideMonitor: Any?
+    private var localMonitor: Any?
+
+    override init() {
+        panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 340, height: 280),
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: false)
+        catcher = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 10, height: 10),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false)
+        super.init()
+        panel.isFloatingPanel = true
+        panel.level = .statusBar
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        // An accessory app stays inactive on a status click. Hiding on
+        // deactivate removed the panel before it could be seen.
+        panel.hidesOnDeactivate = false
+        panel.isMovable = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // A clear window behind the card catches the next click. A global
+        // monitor misses that click unless Accessibility is on.
+        // A fully clear window is click-through. A trace of ink lets the
+        // window server hit-test it, so the next click dismisses the card.
+        catcher.backgroundColor = NSColor.black.withAlphaComponent(0.01)
+        catcher.isOpaque = false
+        catcher.hasShadow = false
+        catcher.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue - 1)
+        catcher.hidesOnDeactivate = false
+        catcher.ignoresMouseEvents = false
+        catcher.becomesKeyOnlyIfNeeded = true
+        catcher.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let catcherView = CatcherView()
+        catcherView.onClick = { [weak self] in self?.close() }
+        catcher.contentView = catcherView
+    }
+
+    func toggle(app: AppDelegate, anchor: NSStatusBarButton) {
+        self.app = app
+        self.anchor = anchor
+        if panel.isVisible {
+            close()
+        } else {
+            show()
+        }
+    }
+
+    func close() {
+        panel.orderOut(nil)
+        catcher.orderOut(nil)
+        anchor?.highlight(false)
+        disarm()
+    }
+
+    func reloadIfVisible() {
+        guard panel.isVisible, app != nil, anchor != nil else { return }
+        let origin = panel.frame.origin
+        rebuild()
+        place(keeping: origin)
+    }
+
+    private func show() {
+        rebuild()
+        place(keeping: nil)
+        showCatcher()
+        // orderFrontRegardless shows the panel while this app stays inactive.
+        panel.orderFrontRegardless()
+        anchor?.highlight(true)
+        // Arm after this click finishes, so the opening mouse-down cannot dismiss it.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.panel.isVisible else { return }
+            self.arm()
+        }
+    }
+
+    private func place(keeping origin: NSPoint?) {
+        guard let anchor, let window = anchor.window, let button = anchorScreenRect() else { return }
+        let size = panel.frame.size
+        let screen = window.screen ?? NSScreen.main
+        let vis = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1400, height: 900)
+        var x = origin?.x ?? (button.midX - size.width / 2)
+        let y = origin?.y ?? (button.minY - size.height - 6)
+        x = min(max(x, vis.minX + 8), vis.maxX - size.width - 8)
+        let clampedY = max(vis.minY + 8, y)
+        panel.setFrameOrigin(NSPoint(x: x, y: clampedY))
+    }
+
+    private func showCatcher() {
+        var union = NSRect.null
+        for screen in NSScreen.screens {
+            union = union.union(screen.frame)
+        }
+        guard union.width > 1, union.height > 1 else { return }
+        catcher.setFrame(union, display: false)
+        catcher.orderFrontRegardless()
+    }
+
+    private func anchorScreenRect() -> NSRect? {
+        guard let anchor, let window = anchor.window else { return nil }
+        return window.convertToScreen(anchor.convert(anchor.bounds, to: nil))
+    }
+
+    private func arm() {
+        disarm()
+        outsideMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self, !self.clickOnAnchor(event) else { return }
+            self.close()
+        }
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] event in
+            guard let self, self.panel.isVisible else { return event }
+            if event.type == .keyDown, event.keyCode == 53 {
+                self.close()
+                return nil
+            }
+            if event.type != .keyDown, event.window != self.panel, !self.clickOnAnchor(event) {
+                self.close()
+            }
+            return event
+        }
+    }
+
+    private func disarm() {
+        if let outsideMonitor { NSEvent.removeMonitor(outsideMonitor) }
+        if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        outsideMonitor = nil
+        localMonitor = nil
+    }
+
+    private func clickOnAnchor(_ event: NSEvent? = nil) -> Bool {
+        guard let anchor else { return false }
+        if let event, event.window === anchor.window {
+            let point = anchor.convert(event.locationInWindow, from: nil)
+            return anchor.bounds.insetBy(dx: -6, dy: -6).contains(point)
+        }
+        guard let rect = anchorScreenRect() else { return false }
+        let point = event?.locationInWindow ?? NSEvent.mouseLocation
+        return rect.insetBy(dx: -8, dy: -8).contains(point)
+    }
+
+    private func rebuild() {
+        guard let app else { return }
+        let dark = app.menuBarIsDark()
+        panel.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+        let bg = dark
+            ? NSColor(srgbRed: 0.11, green: 0.11, blue: 0.12, alpha: 1)
+            : NSColor(srgbRed: 0.95, green: 0.95, blue: 0.96, alpha: 1)
+        let cardFill = dark
+            ? NSColor(srgbRed: 0.17, green: 0.17, blue: 0.18, alpha: 1)
+            : NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(header())
+
+        if app.providerGauges.isEmpty {
+            stack.addArrangedSubview(card(emptyBody(app), fill: cardFill))
+        } else {
+            for group in app.providerGauges {
+                stack.addArrangedSubview(card(providerBody(group, app: app), fill: cardFill))
+            }
+            if let err = app.lastError, !err.isEmpty {
+                stack.addArrangedSubview(note(err))
+                if AppDelegate.needsSignIn(err) {
+                    stack.addArrangedSubview(textButton("Open Set Up", #selector(setupClicked)))
+                }
+            }
+        }
+        if app.hasAdminKey, let usd = app.monthSpend {
+            stack.addArrangedSubview(note(String(format: "Claude API  $%.2f this month", usd)))
+        }
+        let sessions = sessionRows(app)
+        if !sessions.isEmpty {
+            stack.addArrangedSubview(sectionLabel("Open"))
+            for row in sessions { stack.addArrangedSubview(row) }
+        }
+        stack.addArrangedSubview(footer(app))
+
+        let root = NSView()
+        root.wantsLayer = true
+        root.layer?.cornerRadius = 16
+        root.layer?.backgroundColor = bg.cgColor
+        root.layer?.borderWidth = 1
+        root.layer?.borderColor = NSColor.white.withAlphaComponent(dark ? 0.08 : 0.65).cgColor
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+            stack.widthAnchor.constraint(equalToConstant: 312),
+        ])
+        let fit = stack.fittingSize.height + 28
+        let maxH = min(680, (anchor?.window?.screen?.visibleFrame.height ?? 800) - 48)
+        panel.contentView = root
+        panel.setContentSize(NSSize(width: 340, height: min(max(fit, 140), maxH)))
+        // Keep the stack pinned to the top when the panel is shorter than the fit.
+        stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -14).isActive = true
+    }
+
+    private func header() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        let title = NSTextField(labelWithString: "Usage")
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        let gear = NSButton()
+        gear.bezelStyle = .shadowlessSquare
+        gear.isBordered = false
+        gear.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings")
+        gear.imageScaling = .scaleProportionallyDown
+        gear.target = self
+        gear.action = #selector(settingsClicked)
+        gear.toolTip = "Settings"
+        gear.translatesAutoresizingMaskIntoConstraints = false
+        gear.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        gear.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        row.addArrangedSubview(title)
+        row.addArrangedSubview(spacer)
+        row.addArrangedSubview(gear)
+        row.widthAnchor.constraint(equalToConstant: 312).isActive = true
+        return row
+    }
+
+    private func providerBody(_ group: ProviderGauges, app: AppDelegate) -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        let title = NSTextField(labelWithString: group.config.displayName)
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        stack.addArrangedSubview(title)
+        for gauge in group.gauges {
+            stack.addArrangedSubview(gaugeRow(gauge, group: group, app: app))
+        }
+        if group.config.kind == .codex, let banked = app.codexBanked, banked.available > 0 {
+            stack.addArrangedSubview(note(banked.menuLine()))
+        }
+        stack.widthAnchor.constraint(equalToConstant: 288).isActive = true
+        return stack
+    }
+
+    private func gaugeRow(_ gauge: Gauge, group: ProviderGauges, app: AppDelegate) -> NSView {
+        let left = max(0, min(100, 100 - gauge.percent))
+        let color = leftColor(left)
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+
+        let name = NSTextField(labelWithString: limitTitle(gauge, group: group))
+        name.font = .systemFont(ofSize: 13, weight: .semibold)
+        name.lineBreakMode = .byTruncatingTail
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let when = remain(gauge.resetsAt)
+        let time = NSTextField(labelWithString: when)
+        time.font = .systemFont(ofSize: 12)
+        time.textColor = .secondaryLabelColor
+        time.setContentHuggingPriority(.required, for: .horizontal)
+        time.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+
+        let meter = MeterView(fraction: left / 100, fill: color)
+        let figure = NSTextField(labelWithString: "\(Int(left.rounded()))%")
+        figure.font = .monospacedDigitSystemFont(ofSize: 16, weight: .bold)
+        figure.textColor = color
+        let unit = NSTextField(labelWithString: "left")
+        unit.font = .systemFont(ofSize: 11, weight: .medium)
+        unit.textColor = color
+        let numbers = NSStackView()
+        numbers.orientation = .horizontal
+        numbers.alignment = .firstBaseline
+        numbers.spacing = 3
+        numbers.addArrangedSubview(figure)
+        numbers.addArrangedSubview(unit)
+        numbers.setContentHuggingPriority(.required, for: .horizontal)
+        numbers.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(name)
+        if !when.isEmpty { row.addArrangedSubview(time) }
+        row.addArrangedSubview(spacer)
+        row.addArrangedSubview(meter)
+        row.addArrangedSubview(numbers)
+        row.widthAnchor.constraint(equalToConstant: 288).isActive = true
+
+        let pace = app.paceForecast(providerId: group.config.id, gauge: gauge)
+        guard pace.warn else { return row }
+        let column = NSStackView()
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = 2
+        column.addArrangedSubview(row)
+        column.addArrangedSubview(quiet(pace.line, width: 288))
+        column.widthAnchor.constraint(equalToConstant: 288).isActive = true
+        return column
+    }
+
+    /// The card already names the provider. A gauge titled the same way
+    /// becomes the window it measures, so the row does not say Grok twice.
+    private func limitTitle(_ gauge: Gauge, group: ProviderGauges) -> String {
+        let raw = gauge.label.trimmingCharacters(in: .whitespaces)
+        if raw.compare("Grok month", options: .caseInsensitive) == .orderedSame { return "Monthly" }
+        let same = raw.compare(group.config.displayName, options: .caseInsensitive) == .orderedSame
+        guard same else { return raw }
+        guard let at = gauge.resetsAt else { return "Limit" }
+        let days = at.timeIntervalSinceNow / 86_400
+        if days > 10 { return "Monthly" }
+        if days > 1.2 { return "Weekly" }
+        return "Session"
+    }
+
+    /// Short time until reset: "3h 11m", "8d 2h". Clock phrases stay in More….
+    private func remain(_ date: Date?) -> String {
+        guard let date else { return "" }
+        let secs = date.timeIntervalSinceNow
+        if secs <= 90 { return "now" }
+        let mins = Int(secs / 60)
+        if mins < 60 { return "\(mins)m" }
+        let hours = mins / 60
+        let remMin = mins % 60
+        if hours < 48 {
+            return remMin == 0 ? "\(hours)h" : "\(hours)h \(remMin)m"
+        }
+        let days = hours / 24
+        let remH = hours % 24
+        return remH == 0 ? "\(days)d" : "\(days)d \(remH)h"
+    }
+
+    private func emptyBody(_ app: AppDelegate) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        if app.usageFetchInFlight && app.lastError == nil {
+            stack.addArrangedSubview(note("Reading limits…"))
+        } else if let err = app.lastError, !err.isEmpty {
+            stack.addArrangedSubview(note(err))
+            if AppDelegate.needsSignIn(err) {
+                stack.addArrangedSubview(textButton("Open Set Up", #selector(setupClicked)))
+            }
+        } else {
+            stack.addArrangedSubview(note("Reading limits…"))
+        }
+        stack.widthAnchor.constraint(equalToConstant: 288).isActive = true
+        return stack
+    }
+
+    private func sessionRows(_ app: AppDelegate) -> [NSView] {
+        var rows: [NSView] = []
+        let live = app.activity.filter(\.live).sorted { $0.lastActivity > $1.lastActivity }
+        for session in live.prefix(3) {
+            let title = (session.title?.isEmpty == false) ? session.title! : session.project
+            let button = SessionButton(title: sessionTitle(letter: session.providerLetter, name: title), target: self, action: #selector(sessionClicked(_:)))
+            button.session = session
+            styleSession(button)
+            rows.append(button)
+        }
+        for desk in app.runningDesktopAI().prefix(2) {
+            let button = SessionButton(title: sessionTitle(letter: desk.letter, name: desk.name), target: self, action: #selector(sessionClicked(_:)))
+            button.desktop = desk
+            styleSession(button)
+            rows.append(button)
+        }
+        return Array(rows.prefix(4))
+    }
+
+    private func sessionTitle(letter: String, name: String) -> String {
+        let clean = name.trimmingCharacters(in: .whitespaces)
+        if clean.isEmpty { return letter }
+        if letter.count > 1, clean.range(of: letter, options: .caseInsensitive) != nil { return clean }
+        if letter.count == 1 { return "\(letter)  \(clean)" }
+        return clean
+    }
+
+    private func footer(_ app: AppDelegate) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.addArrangedSubview(textButton("Refresh", #selector(refreshClicked)))
+        let stamp: String
+        if let updated = app.lastUpdated {
+            let stale = Date().timeIntervalSince(updated) > 20 * 60
+            stamp = stale ? "Last good read \(app.relative(updated))" : app.relative(updated)
+        } else {
+            stamp = ""
+        }
+        let mid = NSTextField(labelWithString: stamp)
+        mid.font = .systemFont(ofSize: 11)
+        mid.textColor = .secondaryLabelColor
+        mid.alignment = .center
+        mid.setContentHuggingPriority(.init(1), for: .horizontal)
+        row.addArrangedSubview(mid)
+        row.addArrangedSubview(textButton("More…", #selector(moreClicked(_:))))
+        row.addArrangedSubview(pill("Quit", #selector(quitClicked)))
+        row.widthAnchor.constraint(equalToConstant: 312).isActive = true
+        return row
+    }
+
+    private func card(_ inner: NSView, fill: NSColor) -> NSView {
+        let box = NSView()
+        box.wantsLayer = true
+        box.layer?.cornerRadius = 12
+        box.layer?.backgroundColor = fill.cgColor
+        inner.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(inner)
+        NSLayoutConstraint.activate([
+            inner.topAnchor.constraint(equalTo: box.topAnchor, constant: 10),
+            inner.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 12),
+            inner.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -12),
+            inner.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -10),
+            box.widthAnchor.constraint(equalToConstant: 312),
+        ])
+        return box
+    }
+
+    private func sectionLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text.uppercased())
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        return label
+    }
+
+    private func note(_ text: String) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .secondaryLabelColor
+        label.preferredMaxLayoutWidth = 288
+        return label
+    }
+
+    private func quiet(_ text: String, width: CGFloat = 288) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        label.preferredMaxLayoutWidth = width
+        return label
+    }
+
+    private func textButton(_ title: String, _ action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.bezelStyle = .shadowlessSquare
+        button.isBordered = false
+        button.font = .systemFont(ofSize: 12, weight: .medium)
+        button.contentTintColor = .secondaryLabelColor
+        return button
+    }
+
+    private func pill(_ title: String, _ action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.bezelStyle = .inline
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: 12, weight: .medium)
+        return button
+    }
+
+    private func styleSession(_ button: NSButton) {
+        button.bezelStyle = .shadowlessSquare
+        button.isBordered = false
+        button.font = .systemFont(ofSize: 12, weight: .medium)
+        button.alignment = .left
+        button.lineBreakMode = .byTruncatingTail
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 288).isActive = true
+    }
+
+    /// Colour follows how much is left. Clear on a solid card, not the quiet menu-bar ink.
+    private func leftColor(_ left: Double) -> NSColor {
+        if left >= 50 { return NSColor(srgbRed: 0.18, green: 0.74, blue: 0.42, alpha: 1) }
+        if left >= 20 { return NSColor(srgbRed: 0.93, green: 0.64, blue: 0.18, alpha: 1) }
+        return NSColor(srgbRed: 0.92, green: 0.34, blue: 0.30, alpha: 1)
+    }
+
+    @objc private func settingsClicked() {
+        close()
+        app?.openSettings()
+    }
+
+    @objc private func setupClicked() {
+        close()
+        app?.openSetup()
+    }
+
+    @objc private func refreshClicked() {
+        app?.poll()
+        app?.pollSessions()
+    }
+
+    @objc private func quitClicked() {
+        NSApp.terminate(nil)
+    }
+
+    @objc private func moreClicked(_ sender: NSButton) {
+        guard let app else { return }
+        app.statusMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+    }
+
+    @objc private func sessionClicked(_ sender: SessionButton) {
+        guard let app else { return }
+        close()
+        if let session = sender.session {
+            let item = NSMenuItem()
+            item.representedObject = ActivitySessionBox(session)
+            app.openActivity(item)
+        } else if let desk = sender.desktop {
+            let item = NSMenuItem()
+            item.representedObject = AppDelegate.DesktopAIAppBox(desk)
+            app.openDesktopAI(item)
+        }
+    }
+}
+
+/// Clear full-screen click catcher behind the usage card.
+private final class CatcherView: NSView {
+    var onClick: (() -> Void)?
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(point) ? self : nil
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { onClick?() }
+    override func rightMouseDown(with event: NSEvent) { onClick?() }
+}
+
+/// Five marks for how much limit is left.
+final class MeterView: NSView {
+    private let fraction: CGFloat
+    private let fill: NSColor
+
+    init(fraction: Double, fill: NSColor) {
+        self.fraction = CGFloat(max(0, min(1, fraction)))
+        self.fill = fill
+        super.init(frame: NSRect(x: 0, y: 0, width: 52, height: 8))
+        translatesAutoresizingMaskIntoConstraints = false
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        widthAnchor.constraint(equalToConstant: 52).isActive = true
+        heightAnchor.constraint(equalToConstant: 8).isActive = true
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let count = 5
+        let gap: CGFloat = 3
+        let side = bounds.height
+        let lit = Int((fraction * CGFloat(count)).rounded())
+        let shown = fraction > 0.02 ? max(1, lit) : 0
+        for index in 0..<count {
+            let rect = NSRect(x: CGFloat(index) * (side + gap), y: 0, width: side, height: side)
+            let path = NSBezierPath(roundedRect: rect, xRadius: 1.6, yRadius: 1.6)
+            if index < shown {
+                fill.setFill()
+            } else {
+                NSColor.labelColor.withAlphaComponent(0.16).setFill()
+            }
+            path.fill()
+        }
+    }
+}
+
+/// A button that keeps the session it should open.
+final class SessionButton: NSButton {
+    var session: ActivitySession?
+    var desktop: AppDelegate.DesktopAIApp?
 }
 
 // MARK: - Settings (icon, updates, Caffeinate, links — out of the status menu)

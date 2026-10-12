@@ -8,6 +8,11 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.11.0
+
+- **Usage panel.** A click on the menu-bar icon opens a Usage panel. Each limit is one line: name, time left, and how much is left.
+- **Right-click.** Right-click, or More, still opens the full menu.
+
 ## 2.10.0
 
 - **Settings preview.** Menu bar choices show the live gauges on a dark strip and a light strip.
