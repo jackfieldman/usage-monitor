@@ -41,10 +41,13 @@ The icon is configurable from that menu:
 Each gauge's number is the percent used; the shapes and styles above all show
 the same three example gauges (21% / 58% / 93%).
 
-Turn on **Notify near a limit (80%)** in the menu to get a macOS notification
-the moment any limit first crosses into the red zone — so you hear about it
-without watching the menu bar. It alerts once per crossing and re-arms after the
-limit resets below 80%.
+**Settings** opens from the menu. The Menu bar page previews the live gauges
+on a dark strip and a light strip, so a light wallpaper does not hide the
+percent. **Alerts** can notify at 80% (and on a fast pace) and, separately,
+when a limit still has room and resets soon. Both stay off until you turn
+them on. A Codex banked reset shows in the menu when one is waiting.
+
+The app stays free. **Tip jar** in Settings opens GitHub Sponsors.
 
 The menu has **Active AI** collapsed under a disclosure arrow (so the main menu
 stays short):

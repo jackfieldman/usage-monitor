@@ -8,6 +8,14 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.10.0
+
+- **Settings preview.** Menu bar choices show the live gauges on a dark strip and a light strip.
+- **Use it before it resets.** An optional alert fires when a limit still has room and the window ends soon. Off until you turn it on.
+- **Codex banked resets.** A waiting reset shows in the menu. An optional alert fires when a new one arrives.
+- **Light menu bar.** Percent numbers use a deeper green, amber, and red on a light menu bar. The dark menu bar colours are unchanged.
+- **Tip jar.** Settings has a tip jar. Usage Monitor stays free. The button opens GitHub Sponsors.
+
 ## 2.9.4
 
 - **Install the official Mac app.** Settings and Updates can download the

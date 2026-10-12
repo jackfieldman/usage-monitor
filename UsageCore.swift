@@ -3,6 +3,57 @@
 import Foundation
 import Darwin
 
+struct BankedReset: Equatable {
+    var available: Int
+    var expiresAt: Date?
+
+    func menuLine(now: Date = Date()) -> String {
+        let noun = available == 1 ? "1 banked reset" : "\(available) banked resets"
+        guard let expiresAt, expiresAt > now else { return noun }
+        let df = DateFormatter()
+        df.dateFormat = expiresAt.timeIntervalSince(now) < 36 * 3600 ? "h:mm a" : "EEE h:mm a"
+        return noun + " · expires " + df.string(from: expiresAt)
+    }
+}
+
+struct CodexSnapshot {
+    var gauges: [Gauge]
+    var banked: BankedReset?
+}
+
+/// A limit that still has room and dies soon. Off until the user turns it on.
+enum UseItUp {
+    struct Hit: Equatable {
+        var token: String
+        var title: String
+        var body: String
+    }
+
+    /// Fires once per reset. Skips an untouched window and a window already in the red.
+    static func hit(provider: String,
+                    label: String,
+                    percent: Double,
+                    resetsAt: Date?,
+                    now: Date,
+                    leadMinutes: Int = 90,
+                    minUsed: Double = 8,
+                    maxUsed: Double = 70) -> Hit? {
+        guard let resetsAt else { return nil }
+        let lead = TimeInterval(max(15, leadMinutes) * 60)
+        let left = resetsAt.timeIntervalSince(now)
+        guard left > 60, left <= lead else { return nil }
+        guard percent >= minUsed, percent < maxUsed else { return nil }
+        let mins = max(1, Int(left / 60))
+        let when = mins < 60 ? "\(mins) min" : "\(mins / 60)h \(mins % 60)m"
+        let unused = Int((100 - percent).rounded())
+        let epoch = Int(resetsAt.timeIntervalSince1970)
+        return Hit(
+            token: "\(provider)|\(label)|\(epoch)",
+            title: "\(provider) still has room",
+            body: "\(label) is \(Int(percent.rounded()))% used, so about \(unused)% is left. It resets in \(when).")
+    }
+}
+
 struct Gauge {
     let label: String
     let percent: Double
@@ -118,22 +169,106 @@ enum UsageParsers {
     }
 
     static func codexGauges(from obj: [String: Any], now: Date = Date()) -> [Gauge] {
+        codexSnapshot(from: obj, now: now).gauges
+    }
+
+    static func codexSnapshot(from obj: [String: Any], now: Date = Date()) -> CodexSnapshot {
         var gauges: [Gauge] = []
         if let rl = obj["rate_limit"] as? [String: Any] {
             if let primary = rl["primary_window"] as? [String: Any],
                let pct = number(primary["used_percent"]) {
                 let resets = codexReset(primary, now: now)
-                gauges.append(Gauge(label: "Codex", percent: pct.rounded(),
+                gauges.append(Gauge(label: codexWindowLabel(fallback: "Codex", window: primary),
+                                    percent: pct.rounded(),
                                     sub: resetSub(until: resets, now: now), resetsAt: resets))
             }
             if let secondary = rl["secondary_window"] as? [String: Any],
                let pct = number(secondary["used_percent"]) {
                 let resets = codexReset(secondary, now: now)
-                gauges.append(Gauge(label: "Codex 2", percent: pct.rounded(),
+                gauges.append(Gauge(label: codexWindowLabel(fallback: "Codex 2", window: secondary),
+                                    percent: pct.rounded(),
                                     sub: resetSub(until: resets, now: now), resetsAt: resets))
             }
         }
-        return gauges
+        return CodexSnapshot(gauges: gauges, banked: codexBanked(from: obj, now: now))
+    }
+
+    /// Codex banked resets. Accepts the app-server camelCase summary and the
+    /// snake_case shape the usage HTTP payload has used.
+    static func codexBanked(from obj: [String: Any], now: Date = Date()) -> BankedReset? {
+        let rate = obj["rate_limit"] as? [String: Any] ?? [:]
+        let bags: [[String: Any]] = [obj, rate]
+        for bag in bags {
+            if let summary = dictionary(bag, "rateLimitResetCredits", "rate_limit_reset_credits", "reset_credits") {
+                let listed = creditRows(summary["credits"])
+                let availableRows = listed.filter(isAvailableCredit)
+                let counted = intValue(summary, "availableCount", "available_count")
+                let available = max(counted ?? 0, availableRows.isEmpty ? 0 : availableRows.count)
+                if available > 0 {
+                    return BankedReset(available: available,
+                                       expiresAt: soonestExpiry(availableRows, now: now))
+                }
+            }
+            let rows = creditRows(bag["rate_limit_reset_credits"] ?? bag["reset_credits"] ?? bag["rateLimitResetCredits"])
+            let availableRows = rows.filter(isAvailableCredit)
+            if !availableRows.isEmpty {
+                return BankedReset(available: availableRows.count,
+                                   expiresAt: soonestExpiry(availableRows, now: now))
+            }
+        }
+        return nil
+    }
+
+    private static func codexWindowLabel(fallback: String, window: [String: Any]) -> String {
+        let secs = number(window["limit_window_seconds"])
+            ?? number(window["window_seconds"])
+            ?? number(window["window_minutes"]).map { $0 * 60 }
+        guard let secs else { return fallback }
+        if secs > 0, secs <= 6 * 3600 { return "5-hour" }
+        if secs >= 24 * 3600 { return "Week" }
+        return fallback
+    }
+
+    private static func dictionary(_ bag: [String: Any], _ keys: String...) -> [String: Any]? {
+        for key in keys {
+            if let d = bag[key] as? [String: Any] { return d }
+        }
+        return nil
+    }
+
+    private static func creditRows(_ any: Any?) -> [[String: Any]] {
+        if let rows = any as? [[String: Any]] { return rows }
+        if let summary = any as? [String: Any], let rows = summary["credits"] as? [[String: Any]] {
+            return rows
+        }
+        return []
+    }
+
+    private static func isAvailableCredit(_ row: [String: Any]) -> Bool {
+        let status = (row["status"] as? String)?.lowercased() ?? "available"
+        return status == "available" || status == "redeeming"
+    }
+
+    private static func soonestExpiry(_ rows: [[String: Any]], now: Date) -> Date? {
+        let dates = rows.compactMap { row -> Date? in
+            unixOrISO(row["expiresAt"] ?? row["expires_at"])
+        }.filter { $0 > now }
+        return dates.min()
+    }
+
+    private static func intValue(_ bag: [String: Any], _ keys: String...) -> Int? {
+        for key in keys {
+            if let n = number(bag[key]) { return Int(n.rounded()) }
+        }
+        return nil
+    }
+
+    private static func unixOrISO(_ any: Any?) -> Date? {
+        if let n = number(any), n > 1_000_000_000 {
+            return Date(timeIntervalSince1970: n)
+        }
+        if let s = any as? String { return parseISO(s) }
+        return nil
     }
 
     static func parseISO(_ iso: String?) -> Date? {

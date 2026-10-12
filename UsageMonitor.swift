@@ -172,6 +172,13 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.10.0", "Menu bar preview, use-it-up alerts, tip jar", [
+            "Settings shows the menu bar on a dark strip and a light strip before you change it",
+            "Optional alert when a limit still has room and resets soon",
+            "Codex banked resets show in the menu, with an optional alert when a new one arrives",
+            "A light menu bar uses deeper percent colours so the numbers stay readable",
+            "Tip jar in Settings. The app stays free",
+        ]),
         ("2.9.4", "Install the official Mac app", [
             "Install Official App downloads the signed app into Applications",
             "Copy Download Link copies a link you can send to a friend",
@@ -2052,6 +2059,10 @@ final class CodexUsageClient {
 
     /// Blocking; call off the main thread.
     func fetchUsage() throws -> [Gauge] {
+        try fetchSnapshot().gauges
+    }
+
+    func fetchSnapshot() throws -> CodexSnapshot {
         let (access, accountId) = try CodexAuth.readTokens()
         var req = URLRequest(url: usageURL)
         req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
@@ -2065,9 +2076,9 @@ final class CodexUsageClient {
         guard code == 200 else { throw UsageError.http(code) }
 
         let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-        let gauges = UsageParsers.codexGauges(from: obj)
-        if gauges.isEmpty { throw UsageError.emptyResponse }
-        return gauges
+        let snap = UsageParsers.codexSnapshot(from: obj)
+        if snap.gauges.isEmpty { throw UsageError.emptyResponse }
+        return snap
     }
 }
 
@@ -4271,6 +4282,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var providerGauges: [ProviderGauges] = []
     var lastError: String?
     var lastUpdated: Date?
+    /// True while a usage fetch is in flight and the menu has nothing to show yet.
+    var usageFetchInFlight = false
+    /// Codex banked resets from the latest good read. Nil when Codex is absent.
+    var codexBanked: BankedReset?
     var updateAvailable: (version: String, page: URL, zip: URL?)?
     var updating = false
     /// Hourly marquee state (“Update available” scrolling across the bar).
@@ -4414,6 +4429,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// One notice per reset when the primary limit still has room and dies inside the lead time.
+    func checkUseItUp(_ groups: [ProviderGauges]) {
+        guard useItUpEnabled else { return }
+        let now = Date()
+        let key = "useitup.seen.v1"
+        var seen = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        var changed = false
+        for group in groups {
+            guard let g = Self.primaryGauge(for: group) else { continue }
+            guard let hit = UseItUp.hit(provider: group.config.displayName,
+                                        label: g.label,
+                                        percent: g.percent,
+                                        resetsAt: g.resetsAt,
+                                        now: now,
+                                        leadMinutes: useItUpLead) else { continue }
+            if seen.contains(hit.token) { continue }
+            seen.insert(hit.token)
+            changed = true
+            let c = UNMutableNotificationContent()
+            c.title = hit.title
+            c.body = hit.body
+            UNUserNotificationCenter.current().add(
+                UNNotificationRequest(identifier: "useup-\(hit.token)", content: c, trigger: nil))
+        }
+        guard changed else { return }
+        if seen.count > 48 { seen = Set(Array(seen).suffix(48)) }
+        UserDefaults.standard.set(Array(seen), forKey: key)
+    }
+
+    /// Alert only when a new banked reset appears after the first read.
+    func noteBankedReset(_ banked: BankedReset?) {
+        let count = banked?.available ?? 0
+        let key = "banked.seen.count"
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: key) == nil {
+            defaults.set(count, forKey: key)
+            return
+        }
+        let previous = defaults.integer(forKey: key)
+        defaults.set(count, forKey: key)
+        guard bankedNotify, count > previous, let banked else { return }
+        let c = UNMutableNotificationContent()
+        c.title = "Codex banked reset"
+        c.body = banked.menuLine() + ". It waits until you use it in Codex."
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "banked-\(count)", content: c, trigger: nil))
+    }
+
     /// Background-only. Never call from menuNeedsUpdate (that freezes the menu
     /// tracking loop and steals the keyboard until the scan finishes).
     ///
@@ -4461,11 +4524,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func poll() {
         pollCost()
         checkForUpdate()
+        usageFetchInFlight = true
         let configs = providerConfigs
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             var groups: [ProviderGauges] = []
             var errors: [String] = []
+            var banked: BankedReset?
 
             for cfg in configs where cfg.enabled {
                 switch cfg.kind {
@@ -4490,8 +4555,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .codex:
                     guard signedInToCodex() else { continue }
                     do {
-                        let g = try self.codexClient.fetchUsage()
-                        if !g.isEmpty { groups.append(ProviderGauges(config: cfg, gauges: g)) }
+                        let snap = try self.codexClient.fetchSnapshot()
+                        if !snap.gauges.isEmpty { groups.append(ProviderGauges(config: cfg, gauges: snap.gauges)) }
+                        if banked == nil { banked = snap.banked }
                     } catch {
                         errors.append("\(cfg.displayName): "
                             + ((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))
@@ -4514,7 +4580,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     }
                     self.checkNotifications(flat)
                     self.checkPaceNotifications(groups)
+                    self.checkUseItUp(groups)
+                    self.noteBankedReset(banked)
                     self.providerGauges = groups
+                    self.codexBanked = banked
                     self.lastUpdated = Date()
                     self.lastError = errors.isEmpty ? nil : errors.joined(separator: " · ")
                 } else if self.providerGauges.isEmpty {
@@ -4522,6 +4591,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 } else {
                     self.lastError = errors.joined(separator: " · ")
                 }
+                self.usageFetchInFlight = false
                 self.render()
             }
         }
@@ -4994,6 +5064,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     let pace = self.paceForecast(providerId: group.config.id, gauge: g)
                     return "\(g.label): \(Int(g.percent))% · \(pace.line)"
                 })
+                if group.config.kind == .codex, let banked = codexBanked, banked.available > 0 {
+                    tip.append(banked.menuLine())
+                }
             }
             tip.append("")
             tip.append(AppFootprint.menuLine())
@@ -5166,7 +5239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let letter = NSAttributedString(string: badge,
                 attributes: [.font: letterFont, .foregroundColor: ink])
             let pct = NSAttributedString(string: "\(Int(shown))%",
-                attributes: [.font: numFont, .foregroundColor: levelColor(used)])
+                attributes: [.font: numFont, .foregroundColor: statusInk(used)])
             let w = ceil(letter.size().width) + letterGap + glyphW + pctGap + ceil(pct.size().width)
             return Laid(letter: letter, pct: pct, percent: used, width: w)
         }
@@ -5289,6 +5362,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         get { UserDefaults.standard.bool(forKey: "notifyEnabled") }
         set { UserDefaults.standard.set(newValue, forKey: "notifyEnabled") }
     }
+    var useItUpEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "useItUpEnabled") }
+        set { UserDefaults.standard.set(newValue, forKey: "useItUpEnabled") }
+    }
+    var useItUpLead: Int {
+        get {
+            let n = UserDefaults.standard.integer(forKey: "useItUpLead")
+            return n == 0 ? 90 : n
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "useItUpLead") }
+    }
+    var bankedNotify: Bool {
+        get { UserDefaults.standard.bool(forKey: "bankedResetNotify") }
+        set { UserDefaults.standard.set(newValue, forKey: "bankedResetNotify") }
+    }
+
+    @objc func toggleUseItUp() {
+        useItUpEnabled.toggle()
+        if useItUpEnabled { requestAuthThenConfirm() }
+    }
+
+    @objc func toggleBankedNotify() {
+        bankedNotify.toggle()
+        if bankedNotify { requestAuthThenConfirm() }
+    }
     /// Whether we've shown the one-time "notifications are on" confirmation.
     var notifyConfirmed: Bool {
         get { UserDefaults.standard.bool(forKey: "notifyConfirmed") }
@@ -5317,7 +5415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.notifyConfirmed = true
                 let c = UNMutableNotificationContent()
                 c.title = "Usage Monitor"
-                c.body = "Notifications are on — I'll alert you when a limit passes 80%."
+                c.body = "Notifications are on."
                 UNUserNotificationCenter.current().add(
                     UNNotificationRequest(identifier: "usage-confirm", content: c, trigger: nil))
             }
@@ -5481,12 +5579,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
+    /// Forced while drawing the Settings preview. Nil follows the live menu bar.
+    var drawingOnDarkBar: Bool?
+
+    func menuBarIsDark() -> Bool {
+        if let forced = drawingOnDarkBar { return forced }
+        let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
+        return appearance.bestMatch(from: [.darkAqua, .aqua]) != .aqua
+    }
+
+    /// Percent ink. Dark menu bar keeps the quiet palette. A light menu bar
+    /// uses a deeper ink of the same hue so the number stays readable.
+    func statusInk(_ pct: Double) -> NSColor {
+        guard !menuBarIsDark() else { return levelColor(pct) }
+        switch Level(pct) {
+        case .high: return NSColor(srgbRed: 0.55, green: 0.16, blue: 0.13, alpha: 1)
+        case .mid:  return NSColor(srgbRed: 0.52, green: 0.32, blue: 0.05, alpha: 1)
+        case .low:  return NSColor(srgbRed: 0.10, green: 0.38, blue: 0.22, alpha: 1)
+        }
+    }
+
+    func menuBarPreview(onDark: Bool) -> NSImage {
+        let appearance = NSAppearance(named: onDark ? .darkAqua : .aqua) ?? NSApp.effectiveAppearance
+        var image = NSImage(size: NSSize(width: 1, height: 18))
+        appearance.performAsCurrentDrawingAppearance { [weak self] in
+            guard let self else { return }
+            let previous = self.drawingOnDarkBar
+            self.drawingOnDarkBar = onDark
+            defer { self.drawingOnDarkBar = previous }
+            image = self.iconClusters.isEmpty ? self.warningImage() : self.clusterImage(self.iconClusters)
+        }
+        return image
+    }
+
     /// Charge-bar colour for the current icon style. Greyscale encodes the
     /// level as lightness; System Battery is monochrome until the red zone,
     /// like the macOS battery icon.
     func fillColor(_ pct: Double) -> NSColor {
         switch iconStyle {
-        case .colour: return levelColor(pct)
+        case .colour: return statusInk(pct)
         case .greyscale:
             switch Level(pct) {
             case .high: return .labelColor
@@ -5494,7 +5625,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case .low:  return NSColor.labelColor.withAlphaComponent(0.38)
             }
         case .battery:
-            return Level(pct) == .high ? levelColor(pct) : .labelColor
+            // High stays the quiet red on a dark bar, and the deeper ink on a light bar.
+            return Level(pct) == .high ? statusInk(pct) : .labelColor
         }
     }
 
@@ -5509,11 +5641,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addActivitySection(to: menu)
 
         // —— Usage gauges ——
-        if providerGauges.isEmpty, let err = lastError {
+        if providerGauges.isEmpty {
             menu.addItem(.separator())
-            menu.addItem(disabled("⚠︎  \(err)"))
-            if err.lowercased().contains("signed") {
-                menu.addItem(disabled("Sign in to a provider, then Refresh."))
+            if usageFetchInFlight && lastError == nil {
+                menu.addItem(disabled("Reading limits…"))
+            } else if let err = lastError {
+                menu.addItem(disabled(err))
+                if Self.needsSignIn(err) {
+                    menu.addItem(item("Open Set Up", #selector(openSetup), ""))
+                }
+            } else {
+                menu.addItem(disabled("Reading limits…"))
             }
         } else if !providerGauges.isEmpty {
             menu.addItem(.separator())
@@ -5534,9 +5672,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         menu.addItem(paceRow)
                     }
                 }
+                if group.config.kind == .codex, let banked = codexBanked, banked.available > 0 {
+                    menu.addItem(disabled("Banked:  \(banked.menuLine())"))
+                }
             }
-            if let err = lastError {
-                menu.addItem(disabled("⚠︎  \(err) (showing last good data)"))
+            if let err = lastError, !err.isEmpty {
+                menu.addItem(disabled("\(err). Showing the last good read."))
+                if Self.needsSignIn(err) {
+                    menu.addItem(item("Open Set Up", #selector(openSetup), ""))
+                }
             }
         }
         if hasAdminKey {
@@ -5553,7 +5697,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if let updated = lastUpdated {
             menu.addItem(.separator())
-            menu.addItem(disabled("Updated \(relative(updated))"))
+            let stale = Date().timeIntervalSince(updated) > 20 * 60
+            let title = stale ? "Last good read \(relative(updated))" : "Updated \(relative(updated))"
+            menu.addItem(disabled(title))
         }
         menu.addItem(disabled(AppFootprint.menuLine()))
         menu.addItem(.separator())
@@ -6432,7 +6578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let item = NSMenuItem(title: head, action: nil, keyEquivalent: "")
                 let nest = NSMenu()
                 nest.addItem(numberPickItem(
-                    title: "Highest",
+                    title: "Tightest limit",
                     providerId: group.config.id,
                     label: "",
                     selected: Self.numberShows(for: group.config.id).isEmpty))
@@ -6456,7 +6602,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Single provider — flat list, same as classic Number Shows.
             let pref = Self.numberShows(for: group.config.id)
             sub.addItem(numberPickItem(
-                title: "Highest",
+                title: "Tightest limit",
                 providerId: group.config.id,
                 label: "",
                 selected: pref.isEmpty && numberLabel.isEmpty))
@@ -6480,6 +6626,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         i.representedObject = ["id": providerId, "label": label]
         i.state = selected ? .on : .off
         return i
+    }
+
+    static func needsSignIn(_ err: String) -> Bool {
+        let e = err.lowercased()
+        return e.contains("signed") || e.contains("login") || e.contains("credential")
     }
 
     func disabled(_ title: String) -> NSMenuItem {
@@ -6743,69 +6894,134 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 // MARK: - Settings (icon, updates, Caffeinate, links — out of the status menu)
 
 final class SettingsController: NSObject {
+    private enum Page: String, CaseIterable {
+        case menuBar = "Menu bar"
+        case alerts = "Alerts"
+        case awake = "Keep awake"
+        case account = "Account"
+        case tip = "Tip jar"
+    }
+
     private var window: NSWindow?
     private weak var app: AppDelegate?
+    private var page: Page = .menuBar
+    /// Public tip page. GitHub Sponsors is the jar. Amounts are confirmed there.
+    private let tipURL = URL(string: "https://github.com/sponsors/jackfieldman")!
 
     func present(app: AppDelegate) {
         self.app = app
-        let win = build()
-        window = win
+        if window == nil { window = makeWindow() }
+        refill()
         NSApp.activate(ignoringOtherApps: true)
-        win.makeKeyAndOrderFront(nil)
+        window?.makeKeyAndOrderFront(nil)
     }
 
-    private func build() -> NSWindow {
+    private func makeWindow() -> NSWindow {
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 720),
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 480),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false)
         win.title = "Settings"
         win.isReleasedWhenClosed = false
         win.center()
+        return win
+    }
 
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        let title = NSTextField(labelWithString: "Settings")
-        title.font = .systemFont(ofSize: 18, weight: .semibold)
-        let blurb = NSTextField(wrappingLabelWithString: "The menu bar shows limits, pace, live sessions, and how much memory this app uses. Everything else is here.")
-        blurb.font = .systemFont(ofSize: 12)
-        blurb.textColor = .secondaryLabelColor
-        blurb.preferredMaxLayoutWidth = 412
-        stack.addArrangedSubview(title)
-        stack.addArrangedSubview(blurb)
-        stack.addArrangedSubview(section("Menu bar"))
-        if let app {
-            stack.addArrangedSubview(popup("Layout", MenuBarLayout.allCases.map { ($0.title, $0.rawValue) },
-                                           appIcon: ProviderStore.layout.rawValue, action: #selector(layoutPicked(_:))))
-            stack.addArrangedSubview(popup("Shape", IconShape.allCases.map { ($0.title, $0.rawValue) },
-                                           appIcon: app.iconShape.rawValue, action: #selector(shapePicked(_:))))
-            stack.addArrangedSubview(popup("Style", IconStyle.allCases.map { ($0.title, $0.rawValue) },
-                                           appIcon: app.iconStyle.rawValue, action: #selector(stylePicked(_:))))
-            stack.addArrangedSubview(popup("Density", Density.allCases.map { ($0.title, $0.rawValue) },
-                                           appIcon: app.density.rawValue, action: #selector(densityPicked(_:))))
-            if app.iconShape == .battery {
-                stack.addArrangedSubview(popup("Battery fill", BatteryFillMode.allCases.map { ($0.title, $0.rawValue) },
-                                               appIcon: app.batteryFill.rawValue, action: #selector(fillPicked(_:))))
-                stack.addArrangedSubview(check("Consolidated icon", app.consolidated, #selector(consolidatedClicked(_:))))
-            }
-            stack.addArrangedSubview(button("Which percent the bar shows…", #selector(showBarPercent(_:))))
-            stack.addArrangedSubview(check("Notify near a limit (80%) and on a fast pace", app.notifyEnabled, #selector(notifyClicked(_:))))
-            stack.addArrangedSubview(check("Open at Login", app.loginEnabled, #selector(loginClicked(_:))))
+    private func refill() {
+        guard let win = window else { return }
+        let root = NSView()
+        let side = NSStackView()
+        side.orientation = .vertical
+        side.alignment = .leading
+        side.spacing = 2
+        side.translatesAutoresizingMaskIntoConstraints = false
+        let heading = NSTextField(labelWithString: "Settings")
+        heading.font = .systemFont(ofSize: 13, weight: .semibold)
+        side.addArrangedSubview(heading)
+        side.setCustomSpacing(10, after: heading)
+        for item in Page.allCases {
+            side.addArrangedSubview(sideButton(item))
         }
 
-        stack.addArrangedSubview(section("Caffeinate"))
+        let body = pageBody()
+        body.translatesAutoresizingMaskIntoConstraints = false
+
+        let rule = NSBox()
+        rule.boxType = .separator
+        rule.translatesAutoresizingMaskIntoConstraints = false
+
+        root.addSubview(side)
+        root.addSubview(rule)
+        root.addSubview(body)
+        win.contentView = root
+        NSLayoutConstraint.activate([
+            side.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
+            side.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            side.widthAnchor.constraint(equalToConstant: 132),
+            rule.leadingAnchor.constraint(equalTo: side.trailingAnchor, constant: 12),
+            rule.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
+            rule.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
+            body.leadingAnchor.constraint(equalTo: rule.trailingAnchor, constant: 16),
+            body.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
+            body.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
+            body.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -16),
+        ])
+    }
+
+    private func pageBody() -> NSStackView {
+        switch page {
+        case .menuBar: return menuBarBody()
+        case .alerts: return alertsBody()
+        case .awake: return awakeBody()
+        case .account: return accountBody()
+        case .tip: return tipBody()
+        }
+    }
+
+    private func menuBarBody() -> NSStackView {
+        let stack = baseStack()
+        stack.addArrangedSubview(section("Menu bar"))
+        stack.addArrangedSubview(wrap("The preview uses the same gauges as the menu bar. The dark side matches a dark wallpaper. The light side matches a light one."))
+        stack.addArrangedSubview(previewStrip())
+        guard let app else { return stack }
+        stack.addArrangedSubview(popup("Layout", MenuBarLayout.allCases.map { ($0.title, $0.rawValue) },
+                                       appIcon: ProviderStore.layout.rawValue, action: #selector(layoutPicked(_:))))
+        stack.addArrangedSubview(popup("Shape", IconShape.allCases.map { ($0.title, $0.rawValue) },
+                                       appIcon: app.iconShape.rawValue, action: #selector(shapePicked(_:))))
+        stack.addArrangedSubview(popup("Style", IconStyle.allCases.map { ($0.title, $0.rawValue) },
+                                       appIcon: app.iconStyle.rawValue, action: #selector(stylePicked(_:))))
+        stack.addArrangedSubview(popup("Density", Density.allCases.map { ($0.title, $0.rawValue) },
+                                       appIcon: app.density.rawValue, action: #selector(densityPicked(_:))))
+        if app.iconShape == .battery {
+            stack.addArrangedSubview(popup("Battery fill", BatteryFillMode.allCases.map { ($0.title, $0.rawValue) },
+                                           appIcon: app.batteryFill.rawValue, action: #selector(fillPicked(_:))))
+            stack.addArrangedSubview(check("Consolidated icon", app.consolidated, #selector(consolidatedClicked(_:))))
+        }
+        stack.addArrangedSubview(button("Which limit the percent follows…", #selector(showBarPercent(_:))))
+        stack.addArrangedSubview(check("Open at Login", app.loginEnabled, #selector(loginClicked(_:))))
+        return stack
+    }
+
+    private func alertsBody() -> NSStackView {
+        let stack = baseStack()
+        stack.addArrangedSubview(section("Alerts"))
+        stack.addArrangedSubview(wrap("These stay off until you turn them on. Each one fires once for a reset, then waits for the next one."))
+        stack.addArrangedSubview(check("Notify at 80% and on a fast pace", app?.notifyEnabled == true, #selector(notifyClicked(_:))))
+        stack.addArrangedSubview(check("Tell me before a limit resets if room is left", app?.useItUpEnabled == true, #selector(useItUpClicked(_:))))
+        stack.addArrangedSubview(popup("How early", [("45 min", "45"), ("90 min", "90"), ("3 hours", "180")],
+                                       appIcon: String(app?.useItUpLead ?? 90), action: #selector(leadPicked(_:))))
+        stack.addArrangedSubview(check("Tell me when a new Codex banked reset arrives", app?.bankedNotify == true, #selector(bankedClicked(_:))))
+        return stack
+    }
+
+    private func awakeBody() -> NSStackView {
+        let stack = baseStack()
+        stack.addArrangedSubview(section("Keep awake"))
         let active = app?.laptopMode.isActive == true || app?.laptopMode.isEngaged == true
-        let status = NSTextField(labelWithString: active
+        stack.addArrangedSubview(wrap(active
             ? "On. This app is keeping the Mac awake until you turn it off."
-            : "Off. This app is not keeping the Mac awake.")
-        status.font = .systemFont(ofSize: 12)
-        status.textColor = .secondaryLabelColor
-        stack.addArrangedSubview(status)
+            : "Off. This app is not keeping the Mac awake."))
         stack.addArrangedSubview(button(active ? "Turn Off Caffeinate Mode" : "Turn On Caffeinate Mode",
                                         #selector(caffeinateClicked(_:))))
         if LaptopModeController.isPortableMac {
@@ -6818,7 +7034,11 @@ final class SettingsController: NSObject {
                                        #selector(hotspotJoinClicked(_:))))
         stack.addArrangedSubview(button("Choose Favorite Hotspot…", #selector(hotspotClicked(_:))))
         stack.addArrangedSubview(button("Caffeinate options…", #selector(showCaffeinateMenu(_:))))
+        return stack
+    }
 
+    private func accountBody() -> NSStackView {
+        let stack = baseStack()
         stack.addArrangedSubview(section("Account"))
         stack.addArrangedSubview(button("Install Official App to Applications", #selector(installOfficialClicked(_:))))
         stack.addArrangedSubview(button("Copy Download Link", #selector(copyDownloadLink(_:))))
@@ -6828,17 +7048,87 @@ final class SettingsController: NSObject {
         stack.addArrangedSubview(button("Set Up…", #selector(showSetup(_:))))
         stack.addArrangedSubview(button("Subscribe to Updates…", #selector(showNewsletter(_:))))
         stack.addArrangedSubview(button("Join the Community…", #selector(showCommunity(_:))))
+        return stack
+    }
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 720))
-        content.addSubview(stack)
-        win.contentView = content
+    private func tipBody() -> NSStackView {
+        let stack = baseStack()
+        stack.addArrangedSubview(section("Tip jar"))
+        stack.addArrangedSubview(wrap("Usage Monitor stays free. A tip is optional. It opens GitHub Sponsors, where you pick the amount."))
+        stack.addArrangedSubview(button("Leave a tip", #selector(tipClicked(_:))))
+        return stack
+    }
+
+    private func previewStrip() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 12
+        row.distribution = .fillEqually
+        row.translatesAutoresizingMaskIntoConstraints = false
+        if let app {
+            row.addArrangedSubview(well("Dark menu bar", app.menuBarPreview(onDark: true), dark: true))
+            row.addArrangedSubview(well("Light menu bar", app.menuBarPreview(onDark: false), dark: false))
+        }
+        row.heightAnchor.constraint(equalToConstant: 78).isActive = true
+        return row
+    }
+
+    private func well(_ caption: String, _ image: NSImage, dark: Bool) -> NSView {
+        let box = NSBox()
+        box.boxType = .custom
+        box.cornerRadius = 8
+        box.borderWidth = 1
+        box.borderColor = .separatorColor
+        box.fillColor = dark
+            ? NSColor(srgbRed: 0.12, green: 0.12, blue: 0.13, alpha: 1)
+            : NSColor(srgbRed: 0.94, green: 0.94, blue: 0.95, alpha: 1)
+        let img = NSImageView()
+        img.image = image
+        img.imageScaling = .scaleProportionallyDown
+        img.translatesAutoresizingMaskIntoConstraints = false
+        let cap = NSTextField(labelWithString: caption)
+        cap.font = .systemFont(ofSize: 11)
+        cap.textColor = dark ? NSColor(white: 0.75, alpha: 1) : .secondaryLabelColor
+        cap.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(img)
+        box.addSubview(cap)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -16),
+            cap.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 8),
+            cap.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -6),
+            img.centerXAnchor.constraint(equalTo: box.centerXAnchor),
+            img.topAnchor.constraint(equalTo: box.topAnchor, constant: 14),
+            img.heightAnchor.constraint(lessThanOrEqualToConstant: 22),
+            img.widthAnchor.constraint(lessThanOrEqualTo: box.widthAnchor, constant: -16),
         ])
-        return win
+        return box
+    }
+
+    private func baseStack() -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 12, right: 0)
+        return stack
+    }
+
+    private func sideButton(_ item: Page) -> NSButton {
+        let b = NSButton(title: item.rawValue, target: self, action: #selector(sidePicked(_:)))
+        b.identifier = NSUserInterfaceItemIdentifier(item.rawValue)
+        b.bezelStyle = .recessed
+        b.setButtonType(.onOff)
+        b.state = item == page ? .on : .off
+        b.alignment = .left
+        b.font = .systemFont(ofSize: 13, weight: item == page ? .semibold : .regular)
+        return b
+    }
+
+    private func wrap(_ text: String) -> NSTextField {
+        let blurb = NSTextField(wrappingLabelWithString: text)
+        blurb.font = .systemFont(ofSize: 12)
+        blurb.textColor = .secondaryLabelColor
+        blurb.preferredMaxLayoutWidth = 480
+        return blurb
     }
 
     private func section(_ text: String) -> NSView {
@@ -6901,6 +7191,33 @@ final class SettingsController: NSObject {
     private func presentAgain() {
         guard let app else { return }
         present(app: app)
+    }
+
+    @objc private func sidePicked(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue,
+              let next = Page(rawValue: raw) else { return }
+        page = next
+        refill()
+    }
+
+    @objc private func leadPicked(_ sender: NSPopUpButton) {
+        if let raw = sender.selectedItem?.representedObject as? String, let mins = Int(raw) {
+            app?.useItUpLead = mins
+        }
+    }
+
+    @objc private func useItUpClicked(_ sender: NSButton) {
+        guard let app else { return }
+        if (sender.state == .on) != app.useItUpEnabled { app.toggleUseItUp() }
+    }
+
+    @objc private func bankedClicked(_ sender: NSButton) {
+        guard let app else { return }
+        if (sender.state == .on) != app.bankedNotify { app.toggleBankedNotify() }
+    }
+
+    @objc private func tipClicked(_: NSButton) {
+        NSWorkspace.shared.open(tipURL)
     }
 
     @objc private func consolidatedClicked(_ sender: NSButton) {

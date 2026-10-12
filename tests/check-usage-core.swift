@@ -73,6 +73,46 @@ check("codex reset_at", codex.first?.resetsAt == Date(timeIntervalSince1970: 1_7
 check("codex reset_after", codex.last?.resetsAt == now.addingTimeInterval(7200))
 check("codex empty", UsageParsers.codexGauges(from: [:], now: now).isEmpty)
 
+let named = UsageParsers.codexGauges(from: [
+    "rate_limit": [
+        "primary_window": ["used_percent": 10, "limit_window_seconds": 18_000, "reset_at": 1_791_705_600],
+        "secondary_window": ["used_percent": 20, "window_minutes": 10_080, "reset_after_seconds": 7200],
+    ],
+], now: now)
+check("codex 5-hour label", named.first?.label == "5-hour")
+check("codex week label", named.last?.label == "Week")
+
+let banked = UsageParsers.codexBanked(from: [
+    "rate_limit_reset_credits": [
+        "available_count": 2,
+        "credits": [
+            ["status": "available", "expires_at": now.addingTimeInterval(3 * 3600).timeIntervalSince1970],
+            ["status": "redeemed", "expires_at": now.addingTimeInterval(3600).timeIntervalSince1970],
+        ],
+    ],
+], now: now)
+check("banked count", banked?.available == 2)
+check("banked ignores redeemed expiry", banked?.expiresAt == now.addingTimeInterval(3 * 3600))
+check("banked line", banked?.menuLine(now: now).contains("2 banked resets") == true)
+
+let camel = UsageParsers.codexBanked(from: [
+    "rateLimitResetCredits": ["availableCount": 1, "credits": []],
+], now: now)
+check("banked camel count", camel?.available == 1)
+check("banked none", UsageParsers.codexBanked(from: ["rate_limit": [:]], now: now) == nil)
+
+let soon = now.addingTimeInterval(50 * 60)
+let room = UseItUp.hit(provider: "Claude", label: "Session", percent: 22, resetsAt: soon, now: now, leadMinutes: 90)
+check("use-it-up fires", room?.body.contains("78%") == true && room?.body.contains("50 min") == true)
+check("use-it-up token", room?.token.contains("Session") == true)
+check("use-it-up skips unused",
+      UseItUp.hit(provider: "Claude", label: "Session", percent: 0, resetsAt: soon, now: now) == nil)
+check("use-it-up skips red",
+      UseItUp.hit(provider: "Claude", label: "Session", percent: 81, resetsAt: soon, now: now) == nil)
+check("use-it-up skips far reset",
+      UseItUp.hit(provider: "Claude", label: "Session", percent: 22,
+                  resetsAt: now.addingTimeInterval(8 * 3600), now: now) == nil)
+
 let t0 = now
 let t1 = now.addingTimeInterval(3600)
 let rising = PaceMath.forecast(
