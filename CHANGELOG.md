@@ -8,6 +8,10 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.13.1
+
+- **Caffeinate turns on right away.** The switch updates before any hotspot join. Sleep settings are still unchanged.
+
 ## 2.13.0
 
 - **Updates install themselves.** A newer signed release downloads, replaces the app, and restarts it. This is on unless you turn it off.

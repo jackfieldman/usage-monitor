@@ -172,6 +172,10 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.13.1", "Caffeinate turns on right away", [
+            "The On switch updates before a hotspot join starts",
+            "Sleep settings stay as they are",
+        ]),
         ("2.13.0", "Updates install themselves", [
             "A newer signed release downloads, installs, and restarts the app",
             "This is on unless you turn it off under Updates",
@@ -3095,6 +3099,10 @@ final class LaptopModeController {
     private var caffeinatePID: pid_t = 0
     private(set) var lastProof: String = ""
     private(set) var lastError: String?
+    /// Bumped on On and Off so a hotspot join still in flight does not finish after Off.
+    private let joinLock = NSLock()
+    private var hotspotJoinGeneration: UInt = 0
+    private let hotspotQueue = DispatchQueue(label: "com.usagemonitor.app.hotspot", qos: .userInitiated)
 
     /// True on MacBooks / portables (internal battery or clamshell hardware).
     static var isPortableMac: Bool = {
@@ -3168,98 +3176,138 @@ final class LaptopModeController {
 
     // MARK: activate / deactivate
 
+    /// Hold keep-awake and return. No Wi-Fi scan, no `pmset`, no sleep.
+    /// The helper starts once, with the lid flag already decided.
     @discardableResult
-    func activate() -> (ok: Bool, proof: String) {
+    func engageKeepAwake() -> (ok: Bool, line: String) {
         lastError = nil
-        var lines: [String] = []
-        var ok = true
+        bumpHotspotJoin()
+        _ = forceReleaseAllKeepAwake(reason: "pre-activate clean")
 
-        // Start from a clean slate so a prior half-dead helper cannot stack.
-        forceReleaseAllKeepAwake(reason: "pre-activate clean")
-
-        // 1) Always hold idle keep-awake when Caffeinate Mode is on.
-        let idle = engageIdleKeepAwake()
-        lines.append(idle.line)
-        if !idle.ok { ok = false; lastError = idle.line }
-
-        // 2) Optional lid-shut (portable Macs only).
-        if Self.isPortableMac && lidShutOnActivate {
-            let lid = engageLidShut()
+        let wantLid = Self.isPortableMac && lidShutOnActivate
+        let idle = engageIdleKeepAwake(startHelper: false)
+        var lines = [idle.line]
+        if !idle.ok {
+            lastError = idle.line
+            isActive = false
+            let text = lines.joined(separator: "\n")
+            lastProof = text
+            return (false, text)
+        }
+        if wantLid {
+            let lid = engageLidShut(startHelper: false)
             lines.append(lid.line)
-            if !lid.ok { ok = false; lastError = lid.line }
-        } else {
+            if !lid.ok { lastError = lid.line }
+        } else if lidAssertionHeld || lidAssertionID != 0 {
             releaseLidShut(restartHelper: false)
-            if Self.isPortableMac {
-                lines.append("Lid shut: off (option disabled)")
-            } else {
-                lines.append("Lid shut: n/a (desktop Mac)")
-            }
         }
-
-        // 3) Optional hotspot join.
-        if joinHotspotOnActivate {
-            let ssid = favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
-            if ssid.isEmpty {
-                lines.append("Hotspot: skipped (set a favorite SSID first)")
-            } else {
-                let result = joinWiFi(ssid: ssid)
-                lines.append(result.line)
-                if !result.ok { ok = false; lastError = result.line }
-            }
-        } else {
-            lines.append("Hotspot: skipped (join toggle off)")
+        if !wantLid {
+            lines.append(Self.isPortableMac
+                ? "Lid shut: off (option disabled)"
+                : "Lid shut: n/a (desktop Mac)")
         }
-
+        startCaffeinateHelper(lidShut: wantLid && lidAssertionHeld)
         isActive = idleAssertionHeld
         if !isActive {
             lines.append("Caffeinate Mode could not engage keep-awake.")
-            ok = false
+            lastError = lines.last
         }
-        lines.append("System sleep settings: unchanged")
-
-        lines.append(contentsOf: statusSnapshot())
-        lastProof = lines.joined(separator: "\n")
-        NSLog("UsageMonitor Caffeinate Mode activate:\n\(lastProof)")
-        return (ok, lastProof)
+        let lidOK = !wantLid || lidAssertionHeld
+        if isActive { lines.append("System sleep settings: unchanged") }
+        let text = lines.joined(separator: "\n")
+        lastProof = text
+        return (isActive && lidOK, text)
     }
 
-    /// Turn Caffeinate Mode off. Release only the keep-awake this app holds
-    /// (IOPM assertions and the helper this app started). Does not change
-    /// system sleep settings and does not touch other apps’ assertions.
-    func deactivate() {
-        // Flip preference first so a concurrent restore/launch cannot re-arm.
+    /// Drop keep-awake and cancel an in-flight hotspot join. No `pmset`, no sleep.
+    func releaseKeepAwake() {
         isActive = false
+        bumpHotspotJoin()
         let killed = forceReleaseAllKeepAwake(reason: "user turned off")
         var lines = [
             "Caffeinate Mode turned off.",
             "This app’s keep-awake is released. System sleep settings were not changed.",
         ]
         lines.append(contentsOf: killed)
+        lastProof = lines.joined(separator: "\n")
+    }
+
+    /// Synchronous path for the self-test. The Usage panel must not call this:
+    /// the hotspot join and the `pmset` proof block the caller.
+    @discardableResult
+    func activate() -> (ok: Bool, proof: String) {
+        let held = engageKeepAwake()
+        var lines = held.line.components(separatedBy: "\n")
+        var ok = held.ok
+        if held.ok || idleAssertionHeld {
+            let joined = joinFavoriteHotspot(generation: hotspotJoinGenerationNow())
+            lines.append(joined.line)
+            if !joined.cancelled && !joined.ok {
+                ok = false
+                lastError = joined.line
+            }
+        }
         lines.append(contentsOf: statusSnapshot())
-        // Prove our names / helper are gone.
+        lastProof = lines.joined(separator: "\n")
+        NSLog("UsageMonitor Caffeinate Mode activate:\n\(lastProof)")
+        return (ok, lastProof)
+    }
+
+    /// Turn Caffeinate Mode off, then prove it. The proof sleeps and runs `pmset`.
+    /// The Usage panel uses `releaseKeepAwake()` so Off does not wait for that.
+    func deactivate() {
+        releaseKeepAwake()
+        var lines = lastProof.components(separatedBy: "\n")
+        lines.append(contentsOf: statusSnapshot())
         lines.append(contentsOf: verifySleepAllowed())
         lastProof = lines.joined(separator: "\n")
         NSLog("UsageMonitor Caffeinate Mode deactivate:\n\(lastProof)")
     }
 
     /// Re-assert after relaunch if the user left Caffeinate Mode on.
+    /// Does not join Wi-Fi. A failed assertion does not forget that On was saved.
     func restoreIfNeeded() {
-        // Reap only a helper this app started. An old helper must not keep running
-        // after the switch is off. Do not touch any other caffeinate process.
-        let orphans = killAllOwnedCaffeinateHelpers()
-        if !orphans.isEmpty {
-            NSLog("UsageMonitor Caffeinate: cleaned own helper on launch: \(orphans.joined(separator: "; "))")
-        }
         if isActive {
-            _ = engageIdleKeepAwake()
-            if Self.isPortableMac && lidShutOnActivate { _ = engageLidShut() }
+            let held = engageKeepAwake()
+            if !idleAssertionHeld {
+                isActive = true
+                NSLog("UsageMonitor Caffeinate restore failed, will retry next launch: \(held.line)")
+            } else {
+                NSLog("UsageMonitor Caffeinate restore: \(held.line)")
+            }
+        } else {
+            let orphans = killAllOwnedCaffeinateHelpers()
+            if !orphans.isEmpty {
+                NSLog("UsageMonitor Caffeinate: cleaned own helper on launch: \(orphans.joined(separator: "; "))")
+            }
         }
-        // Do not force a Wi‑Fi rejoin on every launch — only re-hold sleep.
         // Undo a SleepDisabled an older version set, once, and only if we own it.
         DispatchQueue.global(qos: .utility).async { [self] in
             let line = releaseOwnedSleepDisabledOnce()
             NSLog("UsageMonitor Caffeinate launch: \(line)")
         }
+    }
+
+    func hotspotJoinGenerationNow() -> UInt {
+        joinLock.lock()
+        defer { joinLock.unlock() }
+        return hotspotJoinGeneration
+    }
+
+    @discardableResult
+    private func bumpHotspotJoin() -> UInt {
+        joinLock.lock()
+        hotspotJoinGeneration &+= 1
+        let value = hotspotJoinGeneration
+        joinLock.unlock()
+        return value
+    }
+
+    private func hotspotJoinStillCurrent(_ generation: UInt) -> Bool {
+        joinLock.lock()
+        let current = hotspotJoinGeneration
+        joinLock.unlock()
+        return generation == current && isActive
     }
 
     /// True when this process is currently holding any keep-awake path.
@@ -3324,9 +3372,39 @@ final class LaptopModeController {
         }
     }
 
-    private func joinWiFi(ssid: String) -> (ok: Bool, line: String) {
+    /// Join the favorite hotspot. Safe to call off the main thread.
+    /// `cancelled` is true when On was released before the join finished.
+    func joinFavoriteHotspot(generation: UInt) -> (ok: Bool, cancelled: Bool, line: String) {
+        guard hotspotJoinStillCurrent(generation) else {
+            return (false, true, "Hotspot: cancelled")
+        }
+        guard joinHotspotOnActivate else {
+            return (true, false, "Hotspot: skipped (join toggle off)")
+        }
+        let ssid = favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ssid.isEmpty {
+            return (true, false, "Hotspot: skipped (set a favorite SSID first)")
+        }
+        return joinWiFi(ssid: ssid, generation: generation)
+    }
+
+    /// Run `joinFavoriteHotspot` off the main thread and deliver the result on main.
+    func joinFavoriteHotspotLater(generation: UInt,
+                                  done: @escaping (_ ok: Bool, _ cancelled: Bool, _ line: String) -> Void) {
+        hotspotQueue.async { [self] in
+            let result = joinFavoriteHotspot(generation: generation)
+            DispatchQueue.main.async {
+                done(result.ok, result.cancelled, result.line)
+            }
+        }
+    }
+
+    private func joinWiFi(ssid: String, generation: UInt) -> (ok: Bool, cancelled: Bool, line: String) {
+        guard hotspotJoinStillCurrent(generation) else {
+            return (false, true, "Hotspot: cancelled")
+        }
         if let cur = currentSSID(), cur.caseInsensitiveCompare(ssid) == .orderedSame {
-            return (true, "Hotspot: already on “\(ssid)”")
+            return (true, false, "Hotspot: already on “\(ssid)”")
         }
 
         let password = loadHotspotPassword(for: ssid) ?? ""
@@ -3335,21 +3413,33 @@ final class LaptopModeController {
         if let iface = CWWiFiClient.shared().interface() {
             do {
                 let networks = try iface.scanForNetworks(withName: ssid)
+                guard hotspotJoinStillCurrent(generation) else {
+                    return (false, true, "Hotspot: cancelled")
+                }
                 if let net = networks.first {
                     try iface.associate(to: net, password: password.isEmpty ? nil : password)
                     Thread.sleep(forTimeInterval: 1.2)
+                    guard hotspotJoinStillCurrent(generation) else {
+                        return (false, true, "Hotspot: cancelled")
+                    }
                     if let cur = currentSSID(), cur.caseInsensitiveCompare(ssid) == .orderedSame {
-                        return (true, "Hotspot: joined “\(ssid)” (CoreWLAN)")
+                        return (true, false, "Hotspot: joined “\(ssid)” (CoreWLAN)")
                     }
                 }
             } catch {
                 NSLog("UsageMonitor CoreWLAN join: \(error.localizedDescription)")
+                if !hotspotJoinStillCurrent(generation) {
+                    return (false, true, "Hotspot: cancelled")
+                }
             }
         }
 
+        guard hotspotJoinStillCurrent(generation) else {
+            return (false, true, "Hotspot: cancelled")
+        }
         // 2) networksetup — uses the system preferred-network password when known.
         guard let dev = wifiDevice() else {
-            return (false, "Hotspot: no Wi‑Fi device found")
+            return (false, false, "Hotspot: no Wi‑Fi device found")
         }
         let escapedSSID = shellEscape(ssid)
         let cmd: String
@@ -3360,24 +3450,28 @@ final class LaptopModeController {
         }
         let out = shell(cmd)
         Thread.sleep(forTimeInterval: 1.5)
+        guard hotspotJoinStillCurrent(generation) else {
+            return (false, true, "Hotspot: cancelled")
+        }
         if let cur = currentSSID(), cur.caseInsensitiveCompare(ssid) == .orderedSame {
-            return (true, "Hotspot: joined “\(ssid)”")
+            return (true, false, "Hotspot: joined “\(ssid)”")
         }
         let detail = out.trimmingCharacters(in: .whitespacesAndNewlines)
         if password.isEmpty {
-            return (false, "Hotspot: could not join “\(ssid)” — set the password under Caffeinate Mode"
+            return (false, false, "Hotspot: could not join “\(ssid)” — set the password under Caffeinate Mode"
                 + (detail.isEmpty ? "" : " (\(detail))"))
         }
-        return (false, "Hotspot: could not join “\(ssid)”"
+        return (false, false, "Hotspot: could not join “\(ssid)”"
             + (detail.isEmpty ? "" : " — \(detail)"))
     }
 
     // MARK: sleep assertions
 
     /// Base keep-awake: prevent idle sleep (desktops + laptops).
-    private func engageIdleKeepAwake() -> (ok: Bool, line: String) {
+    /// `startHelper` false lets the caller start the helper once, after lid is decided.
+    private func engageIdleKeepAwake(startHelper: Bool = true) -> (ok: Bool, line: String) {
         if idleAssertionHeld {
-            startCaffeinateHelper(lidShut: lidAssertionHeld)
+            if startHelper { startCaffeinateHelper(lidShut: lidAssertionHeld) }
             return (true, "Caffeinate: already holding NoIdleSleep (#\(idleAssertionID))")
         }
         var id: IOPMAssertionID = 0
@@ -3391,7 +3485,7 @@ final class LaptopModeController {
         }
         idleAssertionID = id
         idleAssertionHeld = true
-        startCaffeinateHelper(lidShut: false)
+        if startHelper { startCaffeinateHelper(lidShut: false) }
         return (true, "Caffeinate: system stays awake (NoIdleSleep #\(id))")
     }
 
@@ -3401,9 +3495,10 @@ final class LaptopModeController {
     }
 
     /// Stronger: prevent system sleep so a laptop can stay on with the lid shut.
-    private func engageLidShut() -> (ok: Bool, line: String) {
+    /// `startHelper` false lets the caller start the helper once, after lid is decided.
+    private func engageLidShut(startHelper: Bool = true) -> (ok: Bool, line: String) {
         if lidAssertionHeld {
-            startCaffeinateHelper(lidShut: true)
+            if startHelper { startCaffeinateHelper(lidShut: true) }
             return (true, "Lid shut: already holding PreventSystemSleep (#\(lidAssertionID))")
         }
         var id: IOPMAssertionID = 0
@@ -3417,7 +3512,7 @@ final class LaptopModeController {
         }
         lidAssertionID = id
         lidAssertionHeld = true
-        startCaffeinateHelper(lidShut: true)
+        if startHelper { startCaffeinateHelper(lidShut: true) }
         return (true, "Lid shut: PreventSystemSleep held (#\(id)) — lid may stay closed")
     }
 
@@ -3579,23 +3674,23 @@ final class LaptopModeController {
     private func forceKillPID(_ pid: pid_t, label: String) -> Bool {
         guard pid > 1 else { return false }
         guard isProcessAlive(pid) else { return true }
-        // SIGTERM first so caffeinate can drop its IOPM assertions cleanly.
+        // Do not spin-wait. The kernel drops this helper's assertions when it dies.
+        // This app's own IOPM assertions are separate and are released by the caller.
         kill(pid, SIGTERM)
-        let deadline = Date().addingTimeInterval(0.8)
-        while Date() < deadline {
-            if !isProcessAlive(pid) { return true }
-            Thread.sleep(forTimeInterval: 0.05)
-        }
         if isProcessAlive(pid) {
-            NSLog("UsageMonitor \(label) pid \(pid) ignored SIGTERM — SIGKILL")
-            kill(pid, SIGKILL)
-            Thread.sleep(forTimeInterval: 0.1)
+            // kill() returns before the process is reaped. Do not treat that race as failure.
+            if kill(pid, SIGKILL) != 0 && errno != ESRCH {
+                NSLog("UsageMonitor \(label) pid \(pid) SIGKILL failed errno \(errno)")
+                return false
+            }
         }
-        // Also drop the Process object if it matches.
         if let p = caffeinate, p.processIdentifier == pid {
             caffeinate = nil
         }
-        return !isProcessAlive(pid)
+        // Reap our child so a zombie is not still "alive" to kill(pid, 0).
+        var status: Int32 = 0
+        _ = waitpid(pid, &status, WNOHANG)
+        return true
     }
 
     /// Post-off proof: **this process** must not hold keep-awake. Other apps (or a
@@ -6483,12 +6578,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return root
     }
 
+    /// The Usage panel sits at status-bar level, above a normal alert.
+    /// Raise the alert or the click looks frozen behind the panel.
+    @discardableResult
+    private func runAlertAbovePanel(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        alert.window.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal()
+    }
+
+    private func showCaffeinateProblem(_ text: String) {
+        let alert = NSAlert()
+        alert.messageText = "Caffeinate Mode — check details"
+        alert.informativeText = text
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        _ = runAlertAbovePanel(alert)
+    }
+
     /// False when the user cancels the hotspot warning. No prompt when join is off.
     private func confirmHotspotJoinIfNeeded() -> Bool {
         guard laptopMode.joinHotspotOnActivate,
               !laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return true }
-        NSApp.activate(ignoringOtherApps: true)
         let warn = NSAlert()
         warn.messageText = "About to use Wi‑Fi"
         warn.informativeText = """
@@ -6504,26 +6616,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         warn.alertStyle = .informational
         warn.addButton(withTitle: "Continue")
         warn.addButton(withTitle: "Cancel")
-        return warn.runModal() == .alertFirstButtonReturn
+        return runAlertAbovePanel(warn) == .alertFirstButtonReturn
+    }
+
+    /// Keep-awake is already on. The hotspot join must not block this call.
+    private func startHotspotJoinIfNeeded() {
+        guard laptopMode.joinHotspotOnActivate else { return }
+        let ssid = laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !ssid.isEmpty else { return }
+        let generation = laptopMode.hotspotJoinGenerationNow()
+        laptopMode.joinFavoriteHotspotLater(generation: generation) { [weak self] ok, cancelled, line in
+            guard let self, !cancelled, !ok else { return }
+            guard self.laptopMode.hotspotJoinGenerationNow() == generation,
+                  self.laptopMode.isActive else { return }
+            self.showCaffeinateProblem(line)
+        }
     }
 
     @objc func activateLaptopMode() {
         guard confirmHotspotJoinIfNeeded() else { return }
-        let result = laptopMode.activate()
+        let held = laptopMode.engageKeepAwake()
         render()
-        if result.ok {
-            showCaffeinateNotice(kind: .activated)
-        } else {
-            let alert = NSAlert()
-            alert.messageText = "Caffeinate Mode — check details"
-            alert.informativeText = result.proof
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-        }
+        if !held.ok { showCaffeinateProblem(held.line) }
+        guard laptopMode.isActive else { return }
+        showCaffeinateNotice(kind: .activated)
+        startHotspotJoinIfNeeded()
     }
 
-    /// Usage panel switch. The switch shows the new state, so there is no success alert.
+    /// Usage panel switch. The switch shows the new state before any hotspot join.
     func setCaffeinateFromPanel(on: Bool) {
         if !on {
             deactivateLaptopModeQuiet()
@@ -6531,20 +6651,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard confirmHotspotJoinIfNeeded() else { return }
-        let result = laptopMode.activate()
+        let held = laptopMode.engageKeepAwake()
         updateCaffeinateGlow()
         render()
         usagePanel.reloadIfVisible()
-        guard result.ok else {
-            let alert = NSAlert()
-            alert.messageText = "Caffeinate Mode — check details"
-            alert.informativeText = result.proof
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "OK")
-            NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
-            return
-        }
+        if !held.ok { showCaffeinateProblem(held.line) }
+        guard laptopMode.isActive else { return }
+        startHotspotJoinIfNeeded()
     }
 
     /// Usage panel lid switch. Saves the choice. Applies it only while Caffeinate is on.
@@ -6556,13 +6669,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
         usagePanel.reloadIfVisible()
         guard result.ok else {
-            let alert = NSAlert()
-            alert.messageText = "Caffeinate Mode — check details"
-            alert.informativeText = result.line
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "OK")
-            NSApp.activate(ignoringOtherApps: true)
-            alert.runModal()
+            showCaffeinateProblem(result.line)
             return
         }
     }
@@ -6583,8 +6690,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Turn off without an extra alert (used by the modern notice panel).
     func deactivateLaptopModeQuiet() {
-        laptopMode.deactivate()
-        // Glow + menu status must flip immediately off actual engagement.
+        laptopMode.releaseKeepAwake()
         updateCaffeinateGlow()
         render()
     }
@@ -6598,8 +6704,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleLaptopClamshell() {
-        laptopMode.lidShutOnActivate.toggle()
-        if laptopMode.isActive { _ = laptopMode.activate(); render() }
+        let next = !laptopMode.lidShutOnActivate
+        _ = laptopMode.applyLidShut(next)
+        render()
     }
 
     @objc func setFavoriteHotspot() {

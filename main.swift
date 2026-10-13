@@ -80,6 +80,15 @@ if CommandLine.arguments.contains("--laptop-mode-self-test") {
         exit(clean && parseOK && policyOK ? 0 : 1)
     }
 
+    let engageStart = Date()
+    let engaged = lm.engageKeepAwake()
+    let engageMs = Date().timeIntervalSince(engageStart) * 1000
+    let engageFast = engaged.ok && engageMs < 800
+    print(String(format: engageFast
+        ? "PASS: keep-awake on in %.0f ms"
+        : "FAIL: keep-awake on took %.0f ms", engageMs))
+    lm.releaseKeepAwake()
+
     let result = lm.activate()
     print(result.proof)
     print("---")
@@ -128,7 +137,7 @@ if CommandLine.arguments.contains("--laptop-mode-self-test") {
         }
         print("Cleaned up. Use --keep to leave active.")
         restorePrefs()
-        exit(idleOK && lidOK && result.ok && offOK && parseOK && policyOK ? 0 : 1)
+        exit(idleOK && lidOK && result.ok && offOK && parseOK && policyOK && engageFast ? 0 : 1)
     }
 }
 
