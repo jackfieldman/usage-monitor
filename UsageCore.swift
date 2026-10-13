@@ -1,4 +1,4 @@
-// UsageCore — pure usage parsing, pace, memory, and Caffeinate policy.
+// UsageCore — pure usage parsing, pace, memory, Caffeinate policy, and update policy.
 // No AppKit. The app and the fixture tests both compile this file.
 import Foundation
 import Darwin
@@ -515,5 +515,30 @@ enum CaffeinatePolicy {
             if last == "0" { return false }
         }
         return nil
+    }
+}
+
+// MARK: - Automatic updates
+
+/// Update choices that do not need the network or AppKit.
+enum UpdatePolicy {
+    /// A missing choice means on. A stored false stays off.
+    static func autoInstall(stored: Any?) -> Bool {
+        guard let stored else { return true }
+        if let number = stored as? NSNumber { return number.boolValue }
+        return true
+    }
+
+    /// Version from a GitHub releases/latest redirect.
+    /// `…/releases/tag/v2.13.0` → `2.13.0`.
+    static func versionFromReleaseURL(_ url: URL) -> String? {
+        let parts = url.path.split(separator: "/").map(String.init)
+        guard let tagIndex = parts.lastIndex(of: "tag"),
+              parts.index(after: tagIndex) < parts.endIndex else { return nil }
+        let tag = parts[parts.index(after: tagIndex)]
+        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        let bits = version.split(separator: ".")
+        guard !bits.isEmpty, bits.allSatisfy({ Int($0) != nil }) else { return nil }
+        return version
     }
 }

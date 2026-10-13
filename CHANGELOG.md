@@ -8,6 +8,12 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.13.0
+
+- **Updates install themselves.** A newer signed release downloads, replaces the app, and restarts it. This is on unless you turn it off.
+- **Official signature only.** The download must be signed by the Usage Monitor Developer ID. Anything else is left uninstalled.
+- **Check on open.** The app looks for a release when it opens, and about four times a day after that.
+
 ## 2.12.0
 
 - **Caffeinate on the Usage panel.** On and Off sit on the panel a click opens. On a MacBook, Lid shut is a switch on that card. Hotspot stays in Settings.

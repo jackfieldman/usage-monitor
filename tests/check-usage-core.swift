@@ -179,6 +179,17 @@ check("parse sleep on", CaffeinatePolicy.parseSleepDisabled("System-wide power s
 check("parse sleep off", CaffeinatePolicy.parseSleepDisabled(" SleepDisabled 0\n") == false)
 check("parse sleep missing", CaffeinatePolicy.parseSleepDisabled("no flag here\n") == nil)
 
+check("auto on when unset", UpdatePolicy.autoInstall(stored: nil))
+check("auto stays off", UpdatePolicy.autoInstall(stored: false) == false)
+check("auto stays on", UpdatePolicy.autoInstall(stored: true))
+check("auto reads a stored no", UpdatePolicy.autoInstall(stored: NSNumber(value: false)) == false)
+check("release tag",
+      UpdatePolicy.versionFromReleaseURL(URL(string: "https://github.com/jackfieldman/usage-monitor/releases/tag/v2.13.0")!) == "2.13.0")
+check("release tag without v",
+      UpdatePolicy.versionFromReleaseURL(URL(string: "https://github.com/jackfieldman/usage-monitor/releases/tag/2.13.0")!) == "2.13.0")
+check("release tag rejects a repo url",
+      UpdatePolicy.versionFromReleaseURL(URL(string: "https://github.com/jackfieldman/usage-monitor")!) == nil)
+
 if failed > 0 {
     fputs("\(failed) failed\n", stderr)
     exit(1)

@@ -88,12 +88,13 @@ chooses how clusters pack: per-provider letter+%, all gauges, or highest only.
 - **Community** — questions, ideas, and show-and-tell live in
   [GitHub Discussions](https://github.com/jackfieldman/usage-monitor/discussions)
   (**Join the Community…** in the app menu).
-- The app checks GitHub for releases **about four times a day**. When a new
-  version is waiting, **Update available** scrolls across the menu bar **once
-  an hour**. Open **Updates** in the menu to install now, turn on **Install
-  Updates Automatically**, skip this version, skip all future updates, or pause
-  for days/weeks. Updates install only if the download’s code signature matches
-  the app’s own Developer ID team.
+- The app checks GitHub for a release **when it opens**, and **about four
+  times a day** after that. A newer release downloads, the signature must be
+  the official Usage Monitor signature, then the app installs it and
+  **restarts**. That is on unless you turn off **Install Updates Automatically**.
+  You can still install now, skip this version, skip all future updates, or
+  pause for days or weeks. If automatic install is off, **Update available**
+  scrolls across the menu bar **once an hour**.
 
 ## Requirements
 
@@ -210,10 +211,13 @@ files those CLIs already wrote. If you add an Admin API key, it lives only
 in your macOS Keychain, is never written to disk or logged, and is sent only
 to Anthropic over HTTPS to read your cost report.
 
-About four times a day the app also asks GitHub for the latest release
-(`api.github.com/repos/jackfieldman/usage-monitor/releases/latest`) so it can
-offer you updates. That's an anonymous HTTP request — nothing about you or
-your usage is sent.
+When the app opens, and about four times a day after that, it asks GitHub
+whether a newer release exists
+(`api.github.com/repos/jackfieldman/usage-monitor/releases/latest`, or the
+public releases page if that API does not answer). If one does, it downloads
+the zip and restarts onto that version. The request is anonymous — nothing
+about you or your usage is sent. Turn this off under **Updates** if you want
+to install by hand.
 
 ### ⚠️ Unofficial
 

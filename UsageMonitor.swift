@@ -172,6 +172,11 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.13.0", "Updates install themselves", [
+            "A newer signed release downloads, installs, and restarts the app",
+            "This is on unless you turn it off under Updates",
+            "The download must be the official signed app",
+        ]),
         ("2.12.0", "Caffeinate and first-system setup", [
             "Caffeinate On and Off are on the Usage panel",
             "On a MacBook, Lid shut is a switch on that panel",
@@ -755,12 +760,19 @@ func runTool(_ path: String, _ args: [String]) -> (status: Int32, text: String) 
 /// Synchronous HTTP: performs `req` and blocks until it completes. MUST be called
 /// off the main thread. Returns (body, statusCode); throws on transport failure.
 func httpSync(_ req: URLRequest) throws -> (Data, Int) {
+    let full = try httpSyncFull(req)
+    return (full.data, full.code)
+}
+
+/// Same as `httpSync`, plus the URL after redirects.
+func httpSyncFull(_ req: URLRequest) throws -> (data: Data, code: Int, finalURL: URL?) {
     let sem = DispatchSemaphore(value: 0)
-    var result: (Data, Int)?
+    var result: (Data, Int, URL?)?
     var failure: Error?
     URLSession.shared.dataTask(with: req) { d, resp, e in
         if let e { failure = e } else {
-            result = (d ?? Data(), (resp as? HTTPURLResponse)?.statusCode ?? 0)
+            let http = resp as? HTTPURLResponse
+            result = (d ?? Data(), http?.statusCode ?? 0, http?.url)
         }
         sem.signal()
     }.resume()
@@ -1633,6 +1645,7 @@ enum UpdatePrefs {
     private static let pauseUntilKey = "updates.pauseUntil"
     private static let lastMarqueeKey = "updates.lastMarquee"
     private static let autoKey = "autoUpdate"
+    private static let retryKey = "updates.autoRetries"
 
     static var lastCheckAt: TimeInterval {
         get { UserDefaults.standard.double(forKey: lastCheckKey) }
@@ -1670,7 +1683,7 @@ enum UpdatePrefs {
     }
 
     static var autoUpdateEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: autoKey) }
+        get { UpdatePolicy.autoInstall(stored: UserDefaults.standard.object(forKey: autoKey)) }
         set { UserDefaults.standard.set(newValue, forKey: autoKey) }
     }
 
@@ -1684,11 +1697,30 @@ enum UpdatePrefs {
     }
 
     /// Network check allowed now?
-    static func shouldNetworkCheck(force: Bool = false) -> Bool {
+    /// `force` is Check Now: it ignores pause and skip.
+    /// `launch` checks immediately, but still honours pause and skip.
+    static func shouldNetworkCheck(force: Bool = false, launch: Bool = false) -> Bool {
         if force { return true }
         if skipAllFuture { return false }
         if isPaused { return false }
+        if launch { return true }
         return Date().timeIntervalSince1970 - lastCheckAt >= checkInterval
+    }
+
+    /// A failed automatic install tries again in about 15 minutes, twice,
+    /// then waits for the normal check.
+    static func scheduleRetrySoon() {
+        let n = UserDefaults.standard.integer(forKey: retryKey)
+        if n >= 2 {
+            UserDefaults.standard.set(0, forKey: retryKey)
+            return
+        }
+        UserDefaults.standard.set(n + 1, forKey: retryKey)
+        lastCheckAt = Date().timeIntervalSince1970 - checkInterval + 15 * 60
+    }
+
+    static func clearInstallRetries() {
+        UserDefaults.standard.set(0, forKey: retryKey)
     }
 
     /// Should this version appear in UI / marquee / auto-install?
@@ -1742,42 +1774,67 @@ final class UpdateChecker {
     let latestURL = URL(string: "https://api.github.com/repos/jackfieldman/usage-monitor/releases/latest")!
 
     /// Blocking; call off the main thread. Returns (version, release page,
-    /// zip asset) when a newer release exists, else nil. `zip` is nil when the
-    /// release has no UsageMonitor.zip asset — then we can only open the page.
+    /// zip asset) when a newer release exists, else nil.
+    /// Tries the GitHub API first. If that does not answer, follows the public
+    /// releases/latest redirect. The zip is the stable latest download.
     func check() -> (version: String, page: URL, zip: URL?)? {
-        var req = URLRequest(url: latestURL)
-        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        guard let (data, code) = try? httpSync(req), code == 200,
+        let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+        if let api = releaseFromAPI() {
+            return Self.isNewer(api.version, than: current) ? api : nil
+        }
+        guard let final = followLatestPage(),
+              let version = UpdatePolicy.versionFromReleaseURL(final),
+              Self.isNewer(version, than: current) else { return nil }
+        return (version, final, OfficialDownload.zipURL)
+    }
+
+    private func githubRequest(_ url: URL, api: Bool = true) -> URLRequest {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 30
+        req.setValue("UsageMonitor", forHTTPHeaderField: "User-Agent")
+        if api {
+            req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        }
+        return req
+    }
+
+    private func releaseFromAPI() -> (version: String, page: URL, zip: URL?)? {
+        guard let (data, code) = try? httpSync(githubRequest(latestURL)), code == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let tag = obj["tag_name"] as? String,
               let page = URL(string: obj["html_url"] as? String ?? "") else { return nil }
-        var zip: URL?
+        var zip = OfficialDownload.zipURL
         for asset in obj["assets"] as? [[String: Any]] ?? []
         where asset["name"] as? String == "UsageMonitor.zip" {
-            zip = URL(string: asset["browser_download_url"] as? String ?? "")
+            if let url = URL(string: asset["browser_download_url"] as? String ?? "") {
+                zip = url
+            }
         }
         let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-        let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
-        return Self.isNewer(latest, than: current) ? (latest, page, zip) : nil
+        return (latest, page, zip)
     }
 
-    /// Downloads `zip`, verifies the app inside is signed by the SAME
-    /// Developer ID team as the running app, and swaps it into the running
-    /// bundle's path. Returns false (leaving the current install untouched)
-    /// on any download, signature, or filesystem failure. Blocking.
+    /// Final URL of https://github.com/.../releases/latest after redirects.
+    private func followLatestPage() -> URL? {
+        let page = URL(string: "https://github.com/jackfieldman/usage-monitor/releases/latest")!
+        var req = githubRequest(page)
+        req.setValue("text/html", forHTTPHeaderField: "Accept")
+        guard let (_, code, final) = try? httpSyncFull(req),
+              (200...399).contains(code) else { return nil }
+        return final
+    }
+
+    /// Downloads `zip`, requires the official Developer ID team, and swaps it
+    /// into the running bundle's path. Returns false (leaving the current
+    /// install untouched) on any download, signature, or filesystem failure.
+    /// Blocking.
     func downloadAndInstall(_ zip: URL) -> Bool {
         let fm = FileManager.default
         let tmp = fm.temporaryDirectory.appendingPathComponent("UsageMonitorUpdate-\(getpid())")
         defer { try? fm.removeItem(at: tmp) }
         do {
             try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
-            let (data, code) = try httpSync(URLRequest(url: zip))
-            guard code == 200, !data.isEmpty else { return false }
-            let zipPath = tmp.appendingPathComponent("UsageMonitor.zip")
-            try data.write(to: zipPath)
-            guard runTool("/usr/bin/ditto", ["-xk", zipPath.path, tmp.path]).status == 0 else { return false }
-            let newApp = tmp.appendingPathComponent("UsageMonitor.app")
-            guard fm.fileExists(atPath: newApp.path), signedBySameTeam(newApp) else { return false }
+            guard let newApp = unpackOfficialApp(zip, into: tmp, requireNewerThan: Self.runningVersion) else { return false }
             let current = URL(fileURLWithPath: Bundle.main.bundlePath)
             // Move the running bundle aside, the new one into place; restore
             // the old one if the second move fails.
@@ -1791,7 +1848,7 @@ final class UpdateChecker {
 
     /// Downloads the latest official zip and installs it at `/Applications`.
     /// `replacedRunning` is true when that path is the app that is running now.
-    func installOfficialCopy() -> (ok: Bool, replacedRunning: Bool, message: String) {
+    func installOfficialCopy(requireNewerThan: String? = nil) -> (ok: Bool, replacedRunning: Bool, message: String) {
         let fm = FileManager.default
         let dest = OfficialDownload.installURL
         let replacedRunning = dest.path == Bundle.main.bundlePath
@@ -1799,20 +1856,7 @@ final class UpdateChecker {
         defer { try? fm.removeItem(at: tmp) }
         do {
             try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
-            var req = URLRequest(url: OfficialDownload.zipURL)
-            req.timeoutInterval = 60
-            let (data, code) = try httpSync(req)
-            guard code == 200, !data.isEmpty else {
-                return (false, false, "The download did not complete.")
-            }
-            let zipPath = tmp.appendingPathComponent("UsageMonitor.zip")
-            try data.write(to: zipPath)
-            guard runTool("/usr/bin/ditto", ["-xk", zipPath.path, tmp.path]).status == 0 else {
-                return (false, false, "The download could not be opened.")
-            }
-            let newApp = tmp.appendingPathComponent("UsageMonitor.app")
-            guard fm.fileExists(atPath: newApp.path),
-                  signedByTeam(newApp, OfficialDownload.teamID) else {
+            guard let newApp = unpackOfficialApp(OfficialDownload.zipURL, into: tmp, requireNewerThan: requireNewerThan) else {
                 return (false, false, "The download was not the official signed app.")
             }
             if replacedRunning {
@@ -1838,12 +1882,36 @@ final class UpdateChecker {
         }
     }
 
-    /// True only if `app` passes strict codesign verification AND carries the
-    /// same TeamIdentifier as the running app. Ad-hoc builds ("not set")
-    /// never match, so development copies won't self-update.
-    private func signedBySameTeam(_ app: URL) -> Bool {
-        guard let mine = teamID(Bundle.main.bundlePath) else { return false }
-        return signedByTeam(app, mine) && mine != "not set"
+    /// Download, unpack, clear quarantine, and require the official team.
+    /// Ad-hoc and other teams are rejected. The running app's own signature
+    /// does not matter, so an old copy can still move onto the official app.
+    private func unpackOfficialApp(_ zip: URL, into tmp: URL, requireNewerThan floor: String? = nil) -> URL? {
+        var req = githubRequest(zip, api: false)
+        req.timeoutInterval = 120
+        guard let (data, code) = try? httpSync(req), code == 200, !data.isEmpty else { return nil }
+        let zipPath = tmp.appendingPathComponent("UsageMonitor.zip")
+        do { try data.write(to: zipPath) } catch { return nil }
+        guard runTool("/usr/bin/ditto", ["-xk", zipPath.path, tmp.path]).status == 0 else { return nil }
+        let newApp = tmp.appendingPathComponent("UsageMonitor.app")
+        guard FileManager.default.fileExists(atPath: newApp.path) else { return nil }
+        _ = runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", newApp.path])
+        guard signedByTeam(newApp, OfficialDownload.teamID) else { return nil }
+        if let floor {
+            guard let packed = Self.bundleShortVersion(newApp), Self.isNewer(packed, than: floor) else { return nil }
+        }
+        return newApp
+    }
+
+    static var runningVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    }
+
+    static func bundleShortVersion(_ app: URL) -> String? {
+        let plist = app.appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: plist),
+              let obj = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        else { return nil }
+        return obj["CFBundleShortVersionString"] as? String
     }
 
     private func signedByTeam(_ app: URL, _ team: String) -> Bool {
@@ -4776,6 +4844,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         caffeinateNotice.onTurnOff = { [weak self] in self?.deactivateLaptopModeQuiet() }
         render()
         updateCaffeinateGlow()
+        // Look before the usage poll stamps a check, so open means one request.
+        checkForUpdate(launch: true)
         poll()
         pollSessions()
         if notifyEnabled && !notifyConfirmed { requestAuthThenConfirm() }
@@ -5043,23 +5113,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// GitHub latest-release check — up to **4× per day** (every 6 hours).
-    /// Respects skip-all, skip-version, and pause. Call with `force: true`
-    /// from “Check for Updates Now” to ignore the schedule (still honours skip-all
-    /// only as a soft preference: force still checks, but won’t surface skipped).
-    func checkForUpdate(force: Bool = false) {
-        guard UpdatePrefs.shouldNetworkCheck(force: force) else { return }
-        // Record attempt so we don't hammer GitHub on repeated polls.
-        if !force { UpdatePrefs.lastCheckAt = Date().timeIntervalSince1970 }
-        else { UpdatePrefs.lastCheckAt = Date().timeIntervalSince1970 }
+    /// GitHub latest-release check. Once when the app opens, then about
+    /// four times a day. Pause and skip-all still apply, except Check Now.
+    func checkForUpdate(force: Bool = false, launch: Bool = false) {
+        guard UpdatePrefs.shouldNetworkCheck(force: force, launch: launch) else { return }
+        UpdatePrefs.lastCheckAt = Date().timeIntervalSince1970
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let found = self.updates.check()
             DispatchQueue.main.async {
                 guard let found else {
-                    // No newer release (or network fail) — clear stale banner only on success path.
-                    // Keep existing updateAvailable if we already know of one and check failed silently.
+                    // No newer release, or the check did not answer.
+                    // Clear a banner only when the user asked.
                     if force { self.updateAvailable = nil }
                     return
                 }
@@ -5067,7 +5133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     let isNew = self.updateAvailable?.version != found.version
                     self.updateAvailable = found
                     if UpdatePrefs.autoUpdateEnabled {
-                        self.installUpdate()
+                        self.beginInstall(automatic: true)
                     } else {
                         self.notifyUpdateOnce(found.version)
                         // First sighting: marquee soon (don't wait a full hour).
@@ -5195,29 +5261,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         note.runModal()
     }
 
-    /// Installs in place and relaunches. Any failure falls back to opening
-    /// the release page so the user can update by hand.
+    /// Installs in place and relaunches. A manual failure opens the release
+    /// page. An automatic failure tries Applications, then retries quietly.
     @objc func installUpdate() {
+        beginInstall(automatic: false)
+    }
+
+    func beginInstall(automatic: Bool) {
         guard let up = updateAvailable, !updating else { return }
-        // Manual install from the Updates menu always allowed if we still hold the release.
-        guard let zip = up.zip else { openUpdatePage(); return }
+        guard let zip = up.zip else {
+            if !automatic { openUpdatePage() }
+            return
+        }
+        let version = up.version
         updating = true
         stopUpdateMarquee(restore: false)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let ok = self.updates.downloadAndInstall(zip)
+            var ok = self.updates.downloadAndInstall(zip)
+            var relaunchPath = Bundle.main.bundlePath
+            // The running copy could not be replaced. Put the official app
+            // in Applications when that is a different path.
+            if !ok, relaunchPath != OfficialDownload.installURL.path {
+                let official = self.updates.installOfficialCopy(requireNewerThan: UpdateChecker.runningVersion)
+                if official.ok {
+                    ok = true
+                    relaunchPath = OfficialDownload.installURL.path
+                }
+            }
             DispatchQueue.main.async {
                 self.updating = false
-                if ok { self.relaunch() } else { self.openUpdatePage() }
+                if ok {
+                    UpdatePrefs.clearInstallRetries()
+                    self.noteRestart(version)
+                    self.relaunch(path: relaunchPath)
+                } else if automatic {
+                    UpdatePrefs.scheduleRetrySoon()
+                } else {
+                    self.openUpdatePage()
+                }
             }
         }
     }
 
-    /// Relaunch the (just-replaced) bundle: the `open` runs after we exit.
-    private func relaunch() {
+    private func noteRestart(_ version: String) {
+        let c = UNMutableNotificationContent()
+        c.title = "Usage Monitor updated"
+        c.body = "Version \(version) is ready. The app is restarting."
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "updated-\(version)", content: c, trigger: nil))
+    }
+
+    /// Relaunch a bundle after we exit. `path` is the app that was just installed.
+    private func relaunch(path: String? = nil) {
+        let target = path ?? Bundle.main.bundlePath
+        let quoted = target.replacingOccurrences(of: "\"", with: "\\\"")
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", "sleep 0.5; /usr/bin/open \"\(Bundle.main.bundlePath)\""]
+        p.arguments = ["-c", "sleep 0.6; /usr/bin/open \"\(quoted)\""]
         try? p.run()
         NSApp.terminate(nil)
     }
@@ -5368,7 +5469,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                               action: #selector(toggleAutoUpdate), keyEquivalent: "")
         auto.target = self
         auto.state = autoUpdateEnabled ? .on : .off
-        auto.toolTip = "When on, a found update downloads, signature-checks, and installs without asking."
+        auto.toolTip = "On unless you turn it off. A new release downloads, the signature must be official, then the app installs and restarts."
         sub.addItem(auto)
 
         let check = NSMenuItem(title: "Check for Updates Now",
@@ -5434,7 +5535,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         sub.addItem(.separator())
-        sub.addItem(disabled("Checks ~4× per day · scroll once per hour when pending"))
+        sub.addItem(disabled(autoUpdateEnabled
+            ? "On open and ~4× a day · installs and restarts"
+            : "On open and ~4× a day · automatic install is off"))
 
         root.submenu = sub
         // Badge the parent when an update is waiting.
@@ -8442,6 +8545,8 @@ final class SettingsController: NSObject {
     private func accountBody() -> NSStackView {
         let stack = baseStack()
         stack.addArrangedSubview(section("Account"))
+        stack.addArrangedSubview(wrap("A newer signed release installs itself and the app restarts. Turn this off to choose when to install."))
+        stack.addArrangedSubview(check("Install updates automatically", app?.autoUpdateEnabled == true, #selector(autoUpdateClicked(_:))))
         stack.addArrangedSubview(button("Install Official App to Applications", #selector(installOfficialClicked(_:))))
         stack.addArrangedSubview(button("Copy Download Link", #selector(copyDownloadLink(_:))))
         stack.addArrangedSubview(button("Providers…", #selector(showProviders(_:))))
@@ -8629,6 +8734,10 @@ final class SettingsController: NSObject {
     @objc private func notifyClicked(_ sender: NSButton) {
         guard let app else { return }
         if (sender.state == .on) != app.notifyEnabled { app.toggleNotify() }
+    }
+    @objc private func autoUpdateClicked(_ sender: NSButton) {
+        guard let app else { return }
+        if (sender.state == .on) != app.autoUpdateEnabled { app.toggleAutoUpdate() }
     }
     @objc private func loginClicked(_ sender: NSButton) {
         guard let app else { return }
