@@ -172,6 +172,13 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.12.0", "Caffeinate and first-system setup", [
+            "Caffeinate On and Off are on the Usage panel",
+            "On a MacBook, Lid shut is a switch on that panel",
+            "Each limit lines up: name, time left, marks, and percent left",
+            "A first launch with nothing signed in opens Let's get you started",
+            "Right-click, or More, still opens the full menu",
+        ]),
         ("2.11.0", "Usage panel", [
             "A click on the menu-bar icon opens Usage",
             "Each limit shows the time left and how much is left",
@@ -2316,6 +2323,22 @@ func signedInToCodex() -> Bool {
     (try? CodexAuth.readTokens()) != nil
 }
 
+func codexInstalled() -> Bool {
+    let paths = ["\(NSHomeDirectory())/.local/bin/codex",
+                 "/opt/homebrew/bin/codex", "/usr/local/bin/codex"]
+    if paths.contains(where: { FileManager.default.isExecutableFile(atPath: $0) }) { return true }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    p.arguments = ["which", "codex"]
+    p.standardOutput = Pipe(); p.standardError = Pipe()
+    do { try p.run(); p.waitUntilExit(); return p.terminationStatus == 0 } catch { return false }
+}
+
+/// Claude, Grok, or Codex signed in. Cursor alone does not count: it has no usage limits here.
+func usageProviderSignedIn() -> Bool {
+    signedInToClaude() || signedInToGrok() || signedInToCodex()
+}
+
 func cursorInstalled() -> Bool {
     FileManager.default.fileExists(atPath: "/Applications/Cursor.app")
         || NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.todesktop.230313mzl4w4u92") != nil
@@ -2327,193 +2350,528 @@ func anyProviderSignedIn() -> Bool {
 
 func apiKeyConfigured() -> Bool { Keychain.readAdminKey() != nil }
 
-/// First-run window: sets up Claude Code and/or Grok (for the gauges) and,
-/// optionally, an Anthropic Admin API key (for Claude dollar spend).
+/// One usage system a new person can connect. Cursor is activity-only, so it is not a choice here.
+private enum StartSystem: CaseIterable {
+    case claude, grok, codex
+
+    var name: String {
+        switch self {
+        case .claude: return "Claude"
+        case .grok: return "Grok"
+        case .codex: return "Codex"
+        }
+    }
+
+    var installCommand: String {
+        switch self {
+        case .claude: return "curl -fsSL https://claude.ai/install.sh | bash"
+        case .grok: return "curl -fsSL https://x.ai/cli/install.sh | bash"
+        case .codex: return "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+        }
+    }
+
+    var signInCommand: String {
+        switch self {
+        case .claude: return "claude"
+        case .grok: return "grok"
+        case .codex: return "codex"
+        }
+    }
+
+    var planNote: String {
+        switch self {
+        case .claude: return "Limits need a Claude Pro or Max plan."
+        case .grok: return "Sign in in the browser when Grok asks."
+        case .codex: return "Sign in with ChatGPT when Codex asks."
+        }
+    }
+
+    var installed: Bool {
+        switch self {
+        case .claude: return claudeInstalled()
+        case .grok: return grokInstalled()
+        case .codex: return codexInstalled()
+        }
+    }
+
+    var signedIn: Bool {
+        switch self {
+        case .claude: return signedInToClaude()
+        case .grok: return signedInToGrok()
+        case .codex: return signedInToCodex()
+        }
+    }
+
+    static func suggested(blocked: (StartSystem) -> Bool = { _ in false }) -> StartSystem {
+        if let ready = allCases.first(where: { $0.signedIn && !blocked($0) }) { return ready }
+        if let installed = allCases.first(where: { $0.installed }) { return installed }
+        return .claude
+    }
+}
+
+/// Clickable system row. A neutral lift marks the choice. Quota green stays off this screen.
+private final class SystemRow: NSView {
+    var onClick: (() -> Void)?
+    private let nameField = NSTextField(labelWithString: "")
+    private let statusField = NSTextField(labelWithString: "")
+    private let mark = NSImageView()
+    private let systemName: String
+    private let statusWord: String
+
+    var isChosen = false { didSet { needsDisplay = true } }
+
+    init(name: String, status: String) {
+        systemName = name
+        statusWord = status
+        super.init(frame: .zero)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
+        nameField.stringValue = name
+        nameField.font = .systemFont(ofSize: 13, weight: .medium)
+        nameField.textColor = .labelColor
+        nameField.translatesAutoresizingMaskIntoConstraints = false
+        statusField.stringValue = status
+        statusField.font = .systemFont(ofSize: 12, weight: .regular)
+        statusField.textColor = .secondaryLabelColor
+        statusField.alignment = .right
+        statusField.translatesAutoresizingMaskIntoConstraints = false
+        mark.translatesAutoresizingMaskIntoConstraints = false
+        mark.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        addSubview(mark)
+        addSubview(nameField)
+        addSubview(statusField)
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 392),
+            heightAnchor.constraint(equalToConstant: 44),
+            mark.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            mark.centerYAnchor.constraint(equalTo: centerYAnchor),
+            mark.widthAnchor.constraint(equalToConstant: 16),
+            mark.heightAnchor.constraint(equalToConstant: 16),
+            nameField.leadingAnchor.constraint(equalTo: mark.trailingAnchor, constant: 10),
+            nameField.centerYAnchor.constraint(equalTo: centerYAnchor),
+            statusField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            statusField.centerYAnchor.constraint(equalTo: centerYAnchor),
+            nameField.trailingAnchor.constraint(lessThanOrEqualTo: statusField.leadingAnchor, constant: -8),
+        ])
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        applyAccessibility()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.cornerRadius = 8
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        layer?.backgroundColor = isChosen
+            ? (dark ? NSColor.white.withAlphaComponent(0.10) : NSColor.black.withAlphaComponent(0.05)).cgColor
+            : NSColor.clear.cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.separatorColor.cgColor
+        let symbol = isChosen ? "circle.inset.filled" : "circle"
+        mark.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        mark.contentTintColor = isChosen ? .labelColor : .tertiaryLabelColor
+        applyAccessibility()
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) { onClick?() }
+
+    private func applyAccessibility() {
+        setAccessibilityLabel("\(systemName), \(statusWord)")
+    }
+}
+
+/// Opaque page fill. A clear content view snapshots as black and hides dark text.
+private final class PageBackground: NSView {
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+    }
+}
+
+/// Monospaced command. Appearance updates the fill, so a theme change does not leave a stale colour.
+private final class CommandWell: NSView {
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.cornerRadius = 8
+        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.separatorColor.cgColor
+    }
+}
+
+/// First launch: connect one usage system. Claude API spend stays on a later, optional page.
 final class OnboardingController: NSObject, NSWindowDelegate {
+    static let seenKey = "startWalkthrough.seen.v1"
+    static var wasSeen: Bool { UserDefaults.standard.bool(forKey: seenKey) }
+    static func markSeen() { UserDefaults.standard.set(true, forKey: seenKey) }
+
     var onReady: (() -> Void)?
     var onKeyChanged: (() -> Void)?
+
+    private enum Step { case pick, connect, done, spend }
+
     private var window: NSWindow?
-    private var body: NSTextField?
-    private var grokBody: NSTextField?
+    private var step: Step = .pick
+    private var choice: StartSystem = .claude
+    private var rows: [SystemRow] = []
+    private var statusLine: NSTextField?
+    private weak var primaryButton: NSButton?
     private var apiStatus: NSTextField?
-    private var status: NSTextField?
-    private var primary: NSButton?
     private var apiButtons: [NSButton] = []
+    private var dismissed = false
+    /// Last usage error, so an expired login is not treated as already connected.
+    private var trouble = ""
     private let cost = CostClient()
     private var busy = false
+    private let pageWidth: CGFloat = 392
 
-    func present() {
-        if window == nil { build() }
+    func present(trouble: String? = nil) {
+        dismissed = false
+        self.trouble = trouble ?? ""
+        choice = StartSystem.suggested { needsReauth($0) }
+        if window == nil { makeWindow() }
+        show(.pick)
         NSApp.activate(ignoringOtherApps: true)
         window?.center()
         window?.makeKeyAndOrderFront(nil)
-        refresh()
     }
 
-    private func build() {
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 580),
+    /// True when the menu's last error says this system's login needs a refresh.
+    private func needsReauth(_ system: StartSystem) -> Bool {
+        guard AppDelegate.needsSignIn(trouble) else { return false }
+        return trouble.lowercased().contains(system.name.lowercased())
+    }
+
+    /// A token on disk is not enough when that token just failed.
+    private func ready(_ system: StartSystem) -> Bool {
+        system.signedIn && !needsReauth(system)
+    }
+
+    private func statusWord(_ system: StartSystem) -> String {
+        if ready(system) { return "Ready" }
+        if system.installed || needsReauth(system) { return "Sign in" }
+        return "Install"
+    }
+
+    private func makeWindow() {
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 460),
                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        win.title = "Usage Monitor Setup"
+        win.title = "Let's get you started"
         win.delegate = self
         win.isReleasedWhenClosed = false
-
-        let iconView = NSImageView()
-        iconView.image = NSApp.applicationIconImage
-        iconView.imageScaling = .scaleProportionallyUpOrDown
-        iconView.translatesAutoresizingMaskIntoConstraints = false
-        iconView.widthAnchor.constraint(equalToConstant: 44).isActive = true
-        iconView.heightAnchor.constraint(equalToConstant: 44).isActive = true
-        let title = NSTextField(labelWithString: "Welcome to Usage Monitor")
-        title.font = .systemFont(ofSize: 18, weight: .bold)
-        let heading = NSStackView(views: [iconView, title])
-        heading.orientation = .horizontal
-        heading.spacing = 12
-        heading.alignment = .centerY
-
-        // Section 1 — Claude Code subscription (powers Claude % gauges).
-        let sub = sectionTitle("Claude usage gauges")
-        let body = NSTextField(wrappingLabelWithString: "")
-        body.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        self.body = body
-        let copyBtn = button("Copy Claude install", #selector(copyInstall))
-        let recheck = button("Re-check", #selector(refresh))
-        let subRow = NSStackView(views: [copyBtn, NSView(), recheck])
-        subRow.orientation = .horizontal; subRow.spacing = 8
-
-        // Section 1b — Grok CLI (powers Grok % gauges). Either provider is enough.
-        let grokTitle = sectionTitle("Grok usage gauges")
-        let grokBody = NSTextField(wrappingLabelWithString: "")
-        grokBody.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        self.grokBody = grokBody
-        let copyGrok = button("Copy Grok install", #selector(copyGrokInstall))
-        let grokRow = NSStackView(views: [copyGrok, NSView()])
-        grokRow.orientation = .horizontal; grokRow.spacing = 8
-
-        // Section 2 — optional Admin API key (powers Claude dollar spend).
-        let apiTitle = sectionTitle("Claude API dollar spend  (optional)")
-        let apiBody = NSTextField(wrappingLabelWithString:
-            "To also show what you've spent on the Anthropic pay-as-you-go API, add an "
-            + "Admin API key (starts with sk-ant-admin) from console.anthropic.com. "
-            + "It's stored only in your macOS Keychain and used solely to read your "
-            + "cost report — never shared. Skip this if you only use a Pro/Max plan.")
-        apiBody.font = .systemFont(ofSize: 11)
-        apiBody.textColor = .secondaryLabelColor
-        let apiStatus = NSTextField(labelWithString: "")
-        apiStatus.font = .systemFont(ofSize: 12, weight: .medium)
-        self.apiStatus = apiStatus
-        let getBtn = button("Get a key…", #selector(openConsole))
-        let scanBtn = button("Scan Mac…", #selector(scanForKeys))
-        let enterBtn = button("Enter manually…", #selector(enterKey))
-        let removeBtn = button("Remove", #selector(removeKey))
-        apiButtons = [getBtn, scanBtn, enterBtn, removeBtn]
-        let apiRow = NSStackView(views: [getBtn, scanBtn, enterBtn, removeBtn, NSView()])
-        apiRow.orientation = .horizontal; apiRow.spacing = 8
-
-        let status = NSTextField(labelWithString: "")
-        status.font = .systemFont(ofSize: 11)
-        status.textColor = .secondaryLabelColor
-        self.status = status
-        let primary = button("Get Started", #selector(finish))
-        primary.keyEquivalent = "\r"
-        self.primary = primary
-        let footer = NSStackView(views: [status, NSView(), primary])
-        footer.orientation = .horizontal; footer.spacing = 8
-
-        let stack = NSStackView(views: [heading, sub, body, subRow,
-                                        separator(), grokTitle, grokBody, grokRow,
-                                        separator(), apiTitle, apiBody, apiStatus, apiRow,
-                                        separator(), footer])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 20, left: 24, bottom: 20, right: 24)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        let content = NSView()
-        content.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            body.widthAnchor.constraint(equalToConstant: 432),
-            grokBody.widthAnchor.constraint(equalToConstant: 432),
-            apiBody.widthAnchor.constraint(equalToConstant: 432),
-            footer.widthAnchor.constraint(equalToConstant: 432),
-        ])
-        win.contentView = content
         self.window = win
     }
 
-    private func sectionTitle(_ s: String) -> NSTextField {
-        let t = NSTextField(labelWithString: s)
-        t.font = .systemFont(ofSize: 13, weight: .semibold)
-        return t
-    }
-    private func button(_ title: String, _ action: Selector) -> NSButton {
-        let b = NSButton(title: title, target: self, action: action)
-        b.bezelStyle = .rounded
-        return b
-    }
-    private func separator() -> NSBox {
-        let b = NSBox(); b.boxType = .separator
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.widthAnchor.constraint(equalToConstant: 432).isActive = true
-        return b
+    func windowWillClose(_ notification: Notification) {
+        OnboardingController.markSeen()
+        guard !dismissed else { return }
+        dismissed = true
+        onReady?()
     }
 
-    @objc func refresh() {
-        let hasClaude = claudeInstalled()
-        let claudeIn = signedInToClaude()
-        let hasGrok = grokInstalled()
-        let grokIn = signedInToGrok()
-        func mark(_ ok: Bool) -> String { ok ? "✅" : "⬜️" }
-        body?.stringValue = """
-        \(mark(hasClaude))  1. Install Claude Code
-              curl -fsSL https://claude.ai/install.sh | bash
+    private func show(_ next: Step) {
+        step = next
+        statusLine = nil
+        apiStatus = nil
+        apiButtons = []
+        rows = []
+        guard let window else { return }
 
-        \(mark(claudeIn))  2. Sign in to Claude Code
-              Run  claude  in a terminal and complete sign-in.
-              (Requires a Claude Pro or Max subscription.)
-        """
-        grokBody?.stringValue = """
-        \(mark(hasGrok))  1. Install Grok CLI
-              See https://docs.x.ai  (or your usual Grok install path)
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        fill(stack, step: next)
 
-        \(mark(grokIn))  2. Sign in to Grok
-              Run  grok login  in a terminal and complete sign-in.
-        """
-        if apiKeyConfigured() {
-            apiStatus?.stringValue = "✅  API key configured — Claude dollar spend is on."
-            apiStatus?.textColor = .labelColor
-        } else {
-            apiStatus?.stringValue = "⬜️  No API key — Claude dollar spend is off."
-            apiStatus?.textColor = .secondaryLabelColor
-        }
-        // Either provider is enough to start; the Admin key is optional.
-        let ready = (hasClaude && claudeIn) || (hasGrok && grokIn) || claudeIn || grokIn
-        primary?.isEnabled = ready
-        if ready {
-            var parts: [String] = []
-            if claudeIn { parts.append("Claude") }
-            if grokIn { parts.append("Grok") }
-            status?.stringValue = "Ready (\(parts.joined(separator: " + "))). Admin API key is optional."
-        } else {
-            status?.stringValue = "Sign in to Claude and/or Grok, then Re-check."
+        let content = PageBackground(frame: NSRect(x: 0, y: 0, width: 440, height: 520))
+        content.wantsLayer = true
+        content.addSubview(stack)
+        stack.setContentHuggingPriority(.required, for: .vertical)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 22),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            stack.widthAnchor.constraint(equalToConstant: pageWidth),
+        ])
+        window.contentView = content
+        if let primaryButton { window.defaultButtonCell = primaryButton.cell as? NSButtonCell }
+        content.layoutSubtreeIfNeeded()
+        let height = max(240, stack.fittingSize.height + 42)
+        var frame = window.frame
+        let nextFrame = window.frameRect(forContentRect: NSRect(x: 0, y: 0, width: 440, height: height))
+        frame.origin.y += frame.height - nextFrame.height
+        frame.size = nextFrame.size
+        window.setFrame(frame, display: true)
+    }
+
+    private func fill(_ stack: NSStackView, step: Step) {
+        switch step {
+        case .pick: fillPick(stack)
+        case .connect: fillConnect(stack)
+        case .done: fillDone(stack)
+        case .spend: fillSpend(stack)
         }
     }
 
-    @objc func copyInstall() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString("curl -fsSL https://claude.ai/install.sh | bash", forType: .string)
-        status?.stringValue = "Claude install command copied — paste it into a terminal."
+    private func fillPick(_ stack: NSStackView) {
+        stack.addArrangedSubview(kicker("GET STARTED"))
+        stack.setCustomSpacing(4, after: stack.arrangedSubviews.last!)
+        stack.addArrangedSubview(titleField("Let's get you started"))
+        stack.setCustomSpacing(8, after: stack.arrangedSubviews.last!)
+        stack.addArrangedSubview(bodyField(
+            "Pick one system. Usage Monitor reads its limits from the sign-in that system already has."))
+        for system in StartSystem.allCases {
+            let row = SystemRow(name: system.name, status: statusWord(system))
+            row.isChosen = system == choice
+            row.onClick = { [weak self, weak row] in
+                guard let self, let row else { return }
+                self.choice = system
+                self.rows.forEach { $0.isChosen = false }
+                row.isChosen = true
+            }
+            rows.append(row)
+            stack.addArrangedSubview(row)
+            stack.setCustomSpacing(6, after: row)
+        }
+        stack.addArrangedSubview(actionButton("Claude API spend…", #selector(showSpend), primary: false))
+        stack.addArrangedSubview(hairline())
+        let next = actionButton("Continue", #selector(continueClicked), primary: true)
+        stack.addArrangedSubview(footer(left: actionButton("Not now", #selector(notNow), primary: false),
+                                        primary: next))
     }
 
-    @objc func copyGrokInstall() {
+    private func fillConnect(_ stack: NSStackView) {
+        let system = choice
+        stack.addArrangedSubview(kicker("CONNECT"))
+        stack.setCustomSpacing(4, after: stack.arrangedSubviews.last!)
+        stack.addArrangedSubview(titleField("Connect \(system.name)"))
+        stack.setCustomSpacing(8, after: stack.arrangedSubviews.last!)
+        let lead: String
+        if needsReauth(system) {
+            lead = "\(system.name) needs a fresh sign-in. Run this in Terminal. \(system.planNote)"
+        } else if system.installed {
+            lead = "\(system.name) is installed. Run this in Terminal and sign in. \(system.planNote)"
+        } else {
+            lead = "Copy this command and paste it into Terminal. Then run \(system.signInCommand) and sign in. \(system.planNote)"
+        }
+        stack.addArrangedSubview(bodyField(lead))
+        let command = system.installed ? system.signInCommand : system.installCommand
+        stack.addArrangedSubview(commandWell(command))
+        let actions = NSStackView(views: [
+            actionButton("Copy command", #selector(copyCommand), primary: false),
+            actionButton("Open Terminal", #selector(openTerminal), primary: false),
+            actionButton("Check again", #selector(checkAgain), primary: false),
+        ])
+        actions.orientation = .horizontal
+        actions.spacing = 8
+        stack.addArrangedSubview(actions)
+        let status = NSTextField(labelWithString: ready(system)
+            ? "\(system.name) is signed in."
+            : "Not signed in yet.")
+        status.font = .systemFont(ofSize: 12, weight: .medium)
+        status.textColor = .secondaryLabelColor
+        statusLine = status
+        stack.addArrangedSubview(status)
+        stack.addArrangedSubview(hairline())
+        let next = actionButton("Continue", #selector(continueClicked), primary: true)
+        next.isEnabled = ready(system)
+        stack.addArrangedSubview(footer(left: actionButton("Back", #selector(backClicked), primary: false),
+                                        primary: next))
+    }
+
+    private func fillDone(_ stack: NSStackView) {
+        stack.addArrangedSubview(kicker("READY"))
+        stack.setCustomSpacing(4, after: stack.arrangedSubviews.last!)
+        stack.addArrangedSubview(titleField("\(choice.name) is connected"))
+        stack.setCustomSpacing(8, after: stack.arrangedSubviews.last!)
+        stack.addArrangedSubview(bodyField(
+            "Click the menu-bar icon to see how much is left. Add another system any time from Set Up."))
+        stack.addArrangedSubview(actionButton("Claude API spend…", #selector(showSpend), primary: false))
+        stack.addArrangedSubview(hairline())
+        stack.addArrangedSubview(footer(left: nil,
+                                        primary: actionButton("Done", #selector(finish), primary: true)))
+    }
+
+    private func fillSpend(_ stack: NSStackView) {
+        stack.addArrangedSubview(kicker("OPTIONAL"))
+        stack.setCustomSpacing(4, after: stack.arrangedSubviews.last!)
+        stack.addArrangedSubview(titleField("Claude API spend"))
+        stack.setCustomSpacing(8, after: stack.arrangedSubviews.last!)
+        stack.addArrangedSubview(bodyField(
+            "Optional. This reads Anthropic API dollar spend. It does not change your plan limits. "
+            + "The key stays in the Keychain on this Mac."))
+        let status = NSTextField(wrappingLabelWithString: apiKeyConfigured()
+            ? "A key is saved. Claude API spend is on."
+            : "No key saved. Claude API spend stays off.")
+        status.font = .systemFont(ofSize: 12, weight: .medium)
+        status.textColor = apiKeyConfigured() ? .labelColor : .secondaryLabelColor
+        status.preferredMaxLayoutWidth = pageWidth
+        apiStatus = status
+        stack.addArrangedSubview(status)
+        let getBtn = actionButton("Get a key…", #selector(openConsole), primary: false)
+        let scanBtn = actionButton("Scan Mac…", #selector(scanForKeys), primary: false)
+        let enterBtn = actionButton("Enter key…", #selector(enterKey), primary: false)
+        let removeBtn = actionButton("Remove", #selector(removeKey), primary: false)
+        apiButtons = [getBtn, scanBtn, enterBtn, removeBtn]
+        let row1 = NSStackView(views: [getBtn, scanBtn])
+        row1.orientation = .horizontal
+        row1.spacing = 8
+        let row2 = NSStackView(views: [enterBtn, removeBtn])
+        row2.orientation = .horizontal
+        row2.spacing = 8
+        stack.addArrangedSubview(row1)
+        stack.setCustomSpacing(8, after: row1)
+        stack.addArrangedSubview(row2)
+        stack.addArrangedSubview(hairline())
+        stack.addArrangedSubview(footer(left: actionButton("Back", #selector(backClicked), primary: false),
+                                        primary: actionButton("Done", #selector(finish), primary: true)))
+    }
+
+    private func kicker(_ text: String) -> NSTextField {
+        let field = NSTextField(labelWithString: "")
+        field.attributedStringValue = NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .kern: 0.8,
+        ])
+        return field
+    }
+
+    private func titleField(_ text: String) -> NSTextField {
+        let field = NSTextField(labelWithString: text)
+        field.font = .systemFont(ofSize: 22, weight: .semibold)
+        field.textColor = .labelColor
+        field.lineBreakMode = .byTruncatingTail
+        return field
+    }
+
+    private func bodyField(_ text: String) -> NSTextField {
+        let field = NSTextField(wrappingLabelWithString: text)
+        field.font = .systemFont(ofSize: 13)
+        field.textColor = .secondaryLabelColor
+        field.preferredMaxLayoutWidth = pageWidth
+        return field
+    }
+
+    private func actionButton(_ title: String, _ action: Selector, primary: Bool) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.bezelStyle = .rounded
+        button.controlSize = .large
+        if primary {
+            button.keyEquivalent = "\r"
+            primaryButton = button
+        }
+        return button
+    }
+
+    private func footer(left: NSButton?, primary: NSButton) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        if let left { row.addArrangedSubview(left) }
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
+        row.addArrangedSubview(primary)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: pageWidth).isActive = true
+        return row
+    }
+
+    private func hairline() -> NSBox {
+        let line = NSBox()
+        line.boxType = .separator
+        line.translatesAutoresizingMaskIntoConstraints = false
+        line.widthAnchor.constraint(equalToConstant: pageWidth).isActive = true
+        return line
+    }
+
+    private func commandWell(_ command: String) -> NSView {
+        let well = CommandWell()
+        well.wantsLayer = true
+        well.translatesAutoresizingMaskIntoConstraints = false
+        let label = NSTextField(wrappingLabelWithString: command)
+        label.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        label.textColor = .labelColor
+        label.isSelectable = true
+        label.preferredMaxLayoutWidth = pageWidth - 24
+        label.translatesAutoresizingMaskIntoConstraints = false
+        well.addSubview(label)
+        NSLayoutConstraint.activate([
+            well.widthAnchor.constraint(equalToConstant: pageWidth),
+            label.topAnchor.constraint(equalTo: well.topAnchor, constant: 10),
+            label.leadingAnchor.constraint(equalTo: well.leadingAnchor, constant: 12),
+            label.trailingAnchor.constraint(equalTo: well.trailingAnchor, constant: -12),
+            label.bottomAnchor.constraint(equalTo: well.bottomAnchor, constant: -10),
+        ])
+        return well
+    }
+
+    @objc func continueClicked() {
+        switch step {
+        case .pick:
+            show(ready(choice) ? .done : .connect)
+        case .connect:
+            guard ready(choice) else { return }
+            show(.done)
+        case .done, .spend:
+            finish()
+        }
+    }
+
+    @objc func backClicked() {
+        switch step {
+        case .connect: show(.pick)
+        case .spend: show(.done)
+        case .pick, .done: break
+        }
+    }
+
+    @objc func notNow() { finish() }
+
+    @objc func showSpend() { show(.spend) }
+
+    @objc func checkAgain() {
+        trouble = ""
+        show(.connect)
+    }
+
+    @objc func copyCommand() {
+        let command = choice.installed ? choice.signInCommand : choice.installCommand
         NSPasteboard.general.clearContents()
-        // Grok's install path varies by channel; point people at login once installed.
-        NSPasteboard.general.setString("grok login", forType: .string)
-        status?.stringValue = "“grok login” copied — paste it into a terminal after installing Grok."
+        NSPasteboard.general.setString(command, forType: .string)
+        statusLine?.stringValue = "Copied. Paste it into Terminal."
+    }
+
+    @objc func openTerminal() {
+        let url = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
+        if NSWorkspace.shared.open(url) {
+            statusLine?.stringValue = "Terminal is open. Paste the command, then choose Check again."
+        } else {
+            statusLine?.stringValue = "Open Terminal yourself and paste the command."
+        }
+    }
+
+    @objc func finish() {
+        guard !dismissed else { return }
+        dismissed = true
+        OnboardingController.markSeen()
+        window?.close()
+        onReady?()
+    }
+
+    /// Rebuild the optional spend page after a key change. The other steps do not show the key.
+    private func refreshSpend() {
+        guard step == .spend else { return }
+        show(.spend)
     }
 
     // MARK: API key — scan / manual / remove
@@ -2547,7 +2905,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
             a.informativeText = "Couldn't find an Anthropic key in your shell profiles or "
                 + "the ant CLI config. Use “Enter key…” to type one in."
             a.beginSheetModal(for: window) { _ in }
-            refresh(); return
+            self.refreshSpend(); return
         }
         let alert = NSAlert()
         alert.messageText = "Use a key found on this Mac?"
@@ -2559,7 +2917,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         alert.addButton(withTitle: "Use This Key")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: window) { [weak self] resp in
-            guard resp == .alertFirstButtonReturn else { self?.refresh(); return }
+            guard resp == .alertFirstButtonReturn else { self?.refreshSpend(); return }
             self?.validateAndStore(found[popup.indexOfSelectedItem].key)
         }
     }
@@ -2603,7 +2961,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
                     try? Keychain.storeAdminKey(key)
                     self.onKeyChanged?()
                 }
-                self.refresh()
+                self.refreshSpend()
                 switch outcome {
                 case .unverified:
                     self.apiStatus?.stringValue = "Saved — couldn't reach Anthropic to verify; will check on next refresh."
@@ -2626,12 +2984,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     @objc func removeKey() {
         Keychain.deleteAdminKey()
         onKeyChanged?()
-        refresh()
-    }
-
-    @objc func finish() {
-        window?.close()
-        onReady?()
+        refreshSpend()
     }
 }
 
@@ -3004,6 +3357,28 @@ final class LaptopModeController {
         releaseAssertionID(&lidAssertionID, held: &lidAssertionHeld)
         // Downgrade caffeinate helper flags if idle is still held.
         if restartHelper && idleAssertionHeld { startCaffeinateHelper(lidShut: false) }
+    }
+
+    /// Store the lid-shut choice. When Caffeinate is already on, engage or
+    /// release that assertion only. Does not join Wi-Fi and does not write pmset.
+    func applyLidShut(_ on: Bool) -> (ok: Bool, line: String) {
+        guard Self.isPortableMac else {
+            return (true, "Lid shut: n/a (desktop Mac)")
+        }
+        lidShutOnActivate = on
+        let awake = isActive || idleAssertionHeld
+        guard awake else {
+            return (true, on
+                ? "Lid shut: saved. It applies when Caffeinate is on."
+                : "Lid shut: off")
+        }
+        if on {
+            let lid = engageLidShut()
+            if !lid.ok { lastError = lid.line }
+            return lid
+        }
+        releaseLidShut(restartHelper: idleAssertionHeld)
+        return (true, "Lid shut: released. System sleep settings unchanged.")
     }
 
     private func releaseAssertionID(_ id: inout IOPMAssertionID, held: inout Bool) {
@@ -4290,6 +4665,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var providerConfigs: [ProviderConfig] = ProviderStore.load()
     /// Live gauge groups for enabled providers that returned data.
     var providerGauges: [ProviderGauges] = []
+    /// Cached. The live check shells out to `security`, so the panel must not call it on every paint.
+    var usageSignedIn = false
     var lastError: String?
     var lastUpdated: Date?
     /// True while a usage fetch is in flight and the menu has nothing to show yet.
@@ -4414,10 +4791,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.maybeRunUpdateMarquee()
         }
         if let t = marqueeTickTimer { RunLoop.main.add(t, forMode: .common) }
-        if !anyProviderSignedIn() { onboarding.present() }
+        usageSignedIn = usageProviderSignedIn()
+        if usageSignedIn {
+            OnboardingController.markSeen()
+        } else if !OnboardingController.wasSeen {
+            onboarding.present()
+        }
     }
 
-    @objc func openSetup() { onboarding.present() }
+    @objc func openSetup() { onboarding.present(trouble: lastError) }
 
     @objc func openSettings() {
         settingsController.present(app: self)
@@ -4590,6 +4972,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let configs = providerConfigs
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
+            let signed = signedInToClaude() || signedInToGrok() || signedInToCodex()
             var groups: [ProviderGauges] = []
             var errors: [String] = []
             var banked: BankedReset?
@@ -4635,6 +5018,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             DispatchQueue.main.async {
+                self.usageSignedIn = signed
                 let flat = groups.flatMap(\.gauges)
                 if !flat.isEmpty {
                     for group in groups {
@@ -5706,7 +6090,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // —— Usage gauges ——
         if providerGauges.isEmpty {
             menu.addItem(.separator())
-            if usageFetchInFlight && lastError == nil {
+            if !usageSignedIn {
+                menu.addItem(disabled("No system is connected yet."))
+                menu.addItem(item("Let's get you started", #selector(openSetup), ""))
+            } else if usageFetchInFlight && lastError == nil {
                 menu.addItem(disabled("Reading limits…"))
             } else if let err = lastError {
                 menu.addItem(disabled(err))
@@ -5993,27 +6380,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return root
     }
 
-    @objc func activateLaptopMode() {
+    /// False when the user cancels the hotspot warning. No prompt when join is off.
+    private func confirmHotspotJoinIfNeeded() -> Bool {
+        guard laptopMode.joinHotspotOnActivate,
+              !laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return true }
         NSApp.activate(ignoringOtherApps: true)
-        if laptopMode.joinHotspotOnActivate,
-           !laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let warn = NSAlert()
-            warn.messageText = "About to use Wi‑Fi"
-            warn.informativeText = """
-            Caffeinate Mode will try to join your favorite hotspot using only \
-            normal Wi‑Fi APIs (no admin password).
+        let warn = NSAlert()
+        warn.messageText = "About to use Wi‑Fi"
+        warn.informativeText = """
+        Caffeinate Mode will try to join your favorite hotspot using only \
+        normal Wi‑Fi APIs (no admin password).
 
-            macOS may show a Location / Wi‑Fi permission prompt so the app can \
-            see or join the network. That is system-controlled — Usage Monitor \
-            does not request elevated admin rights.
+        macOS may show a Location / Wi‑Fi permission prompt so the app can \
+        see or join the network. That is system-controlled — Usage Monitor \
+        does not request elevated admin rights.
 
-            Continue only if you are ready for that system prompt (if it appears).
-            """
-            warn.alertStyle = .informational
-            warn.addButton(withTitle: "Continue")
-            warn.addButton(withTitle: "Cancel")
-            guard warn.runModal() == .alertFirstButtonReturn else { return }
-        }
+        Continue only if you are ready for that system prompt (if it appears).
+        """
+        warn.alertStyle = .informational
+        warn.addButton(withTitle: "Continue")
+        warn.addButton(withTitle: "Cancel")
+        return warn.runModal() == .alertFirstButtonReturn
+    }
+
+    @objc func activateLaptopMode() {
+        guard confirmHotspotJoinIfNeeded() else { return }
         let result = laptopMode.activate()
         render()
         if result.ok {
@@ -6025,6 +6417,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.alertStyle = .warning
             alert.addButton(withTitle: "OK")
             alert.runModal()
+        }
+    }
+
+    /// Usage panel switch. The switch shows the new state, so there is no success alert.
+    func setCaffeinateFromPanel(on: Bool) {
+        if !on {
+            deactivateLaptopModeQuiet()
+            usagePanel.reloadIfVisible()
+            return
+        }
+        guard confirmHotspotJoinIfNeeded() else { return }
+        let result = laptopMode.activate()
+        updateCaffeinateGlow()
+        render()
+        usagePanel.reloadIfVisible()
+        guard result.ok else {
+            let alert = NSAlert()
+            alert.messageText = "Caffeinate Mode — check details"
+            alert.informativeText = result.proof
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            return
+        }
+    }
+
+    /// Usage panel lid switch. Saves the choice. Applies it only while Caffeinate is on.
+    func setLidShutFromPanel(on: Bool) {
+        guard LaptopModeController.isPortableMac else { return }
+        if laptopMode.lidShutOnActivate == on { return }
+        let result = laptopMode.applyLidShut(on)
+        updateCaffeinateGlow()
+        render()
+        usagePanel.reloadIfVisible()
+        guard result.ok else {
+            let alert = NSAlert()
+            alert.messageText = "Caffeinate Mode — check details"
+            alert.informativeText = result.line
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            return
         }
     }
 
@@ -6958,6 +7394,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
 /// Drawn panel under the menu-bar icon. A system menu cannot carry this layout.
 final class UsagePanelController: NSObject {
+    private static let panelWidth: CGFloat = 368
+    private static let sideInset: CGFloat = 14
+    private static let contentWidth: CGFloat = 340
+    private static let cardInset: CGFloat = 12
+    private static let rowWidth: CGFloat = 316
+
     private let panel: NSPanel
     private let catcher: NSPanel
     private weak var app: AppDelegate?
@@ -6967,7 +7409,7 @@ final class UsagePanelController: NSObject {
 
     override init() {
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 340, height: 280),
+            contentRect: NSRect(x: 0, y: 0, width: Self.panelWidth, height: 280),
             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false)
@@ -7121,52 +7563,56 @@ final class UsagePanelController: NSObject {
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 10
+        stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(header())
+        let head = header()
+        stack.addArrangedSubview(head)
+        stack.setCustomSpacing(12, after: head)
+        let awake = caffeinateCard(app: app, fill: cardFill, dark: dark)
+        stack.addArrangedSubview(awake)
+        stack.setCustomSpacing(12, after: awake)
 
         if app.providerGauges.isEmpty {
-            stack.addArrangedSubview(card(emptyBody(app), fill: cardFill))
+            stack.addArrangedSubview(card(emptyBody(app), fill: cardFill, dark: dark))
         } else {
             for group in app.providerGauges {
-                stack.addArrangedSubview(card(providerBody(group, app: app), fill: cardFill))
+                stack.addArrangedSubview(card(providerBody(group, app: app), fill: cardFill, dark: dark))
             }
             if let err = app.lastError, !err.isEmpty {
-                stack.addArrangedSubview(note(err))
+                stack.addArrangedSubview(note(err, width: Self.contentWidth))
                 if AppDelegate.needsSignIn(err) {
                     stack.addArrangedSubview(textButton("Open Set Up", #selector(setupClicked)))
                 }
             }
         }
         if app.hasAdminKey, let usd = app.monthSpend {
-            stack.addArrangedSubview(note(String(format: "Claude API  $%.2f this month", usd)))
+            stack.addArrangedSubview(note(String(format: "Claude API  $%.2f this month", usd), width: Self.contentWidth))
         }
         let sessions = sessionRows(app)
         if !sessions.isEmpty {
-            stack.addArrangedSubview(sectionLabel("Open"))
-            for row in sessions { stack.addArrangedSubview(row) }
+            stack.addArrangedSubview(card(openBody(sessions), fill: cardFill, dark: dark))
         }
-        stack.addArrangedSubview(footer(app))
+        stack.addArrangedSubview(footer(app, dark: dark))
 
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.cornerRadius = 16
+        root.layer?.cornerRadius = 14
         root.layer?.backgroundColor = bg.cgColor
         root.layer?.borderWidth = 1
         root.layer?.borderColor = NSColor.white.withAlphaComponent(dark ? 0.08 : 0.65).cgColor
         root.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
-            stack.widthAnchor.constraint(equalToConstant: 312),
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: Self.sideInset),
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: Self.sideInset),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -Self.sideInset),
+            stack.widthAnchor.constraint(equalToConstant: Self.contentWidth),
         ])
-        let fit = stack.fittingSize.height + 28
-        let maxH = min(680, (anchor?.window?.screen?.visibleFrame.height ?? 800) - 48)
+        let fit = stack.fittingSize.height + Self.sideInset * 2
+        let maxH = min(720, (anchor?.window?.screen?.visibleFrame.height ?? 800) - 48)
         panel.contentView = root
-        panel.setContentSize(NSSize(width: 340, height: min(max(fit, 140), maxH)))
+        panel.setContentSize(NSSize(width: Self.panelWidth, height: min(max(fit, 160), maxH)))
         // Keep the stack pinned to the top when the panel is shorter than the fit.
-        stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -14).isActive = true
+        stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -Self.sideInset).isActive = true
     }
 
     private func header() -> NSView {
@@ -7180,36 +7626,223 @@ final class UsagePanelController: NSObject {
         let gear = NSButton()
         gear.bezelStyle = .shadowlessSquare
         gear.isBordered = false
-        gear.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings")
+        let symbol = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        gear.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings")?
+            .withSymbolConfiguration(symbol)
         gear.imageScaling = .scaleProportionallyDown
+        gear.contentTintColor = .secondaryLabelColor
         gear.target = self
         gear.action = #selector(settingsClicked)
         gear.toolTip = "Settings"
         gear.translatesAutoresizingMaskIntoConstraints = false
-        gear.widthAnchor.constraint(equalToConstant: 22).isActive = true
-        gear.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        gear.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        gear.heightAnchor.constraint(equalToConstant: 28).isActive = true
         row.addArrangedSubview(title)
         row.addArrangedSubview(spacer)
         row.addArrangedSubview(gear)
-        row.widthAnchor.constraint(equalToConstant: 312).isActive = true
+        row.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
         return row
+    }
+
+    /// Both words stay on screen. Amber means on. Green stays reserved for quota.
+    private func caffeinateCard(app: AppDelegate, fill: NSColor, dark: Bool) -> NSView {
+        let active = app.laptopMode.isActive || app.laptopMode.isEngaged
+        let column = NSStackView()
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = 10
+        column.translatesAutoresizingMaskIntoConstraints = false
+
+        let top = awakeControlRow(
+            icon: active ? "cup.and.saucer.fill" : "cup.and.saucer",
+            iconTint: active ? AwakeChoice.amber : .secondaryLabelColor,
+            title: "Caffeinate",
+            titleWeight: .semibold,
+            detail: caffeinateDetail(active: active, lidEngaged: app.laptopMode.lidShutEngaged),
+            control: caffeinateSwitch(active: active, dark: dark))
+        column.addArrangedSubview(top)
+        stretch(top, in: column)
+
+        if LaptopModeController.isPortableMac {
+            let lidOn = app.laptopMode.lidShutOnActivate
+            let lid = awakeControlRow(
+                icon: nil,
+                iconTint: .secondaryLabelColor,
+                title: "Lid shut",
+                titleWeight: .medium,
+                detail: lidDetail(on: lidOn, caffeinateOn: active),
+                control: lidSwitch(on: lidOn, dark: dark))
+            column.addArrangedSubview(lid)
+            stretch(lid, in: column)
+        }
+        column.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+        return card(column, fill: fill, dark: dark)
+    }
+
+    private func caffeinateDetail(active: Bool, lidEngaged: Bool) -> String {
+        if !active { return "Sleep is allowed" }
+        if lidEngaged { return "Awake with the lid shut" }
+        return "This Mac stays awake"
+    }
+
+    private func lidDetail(on: Bool, caffeinateOn: Bool) -> String {
+        if on && caffeinateOn { return "Stays awake with the lid closed" }
+        if on { return "Applies when Caffeinate is on" }
+        return "Sleeps when the lid closes"
+    }
+
+    /// Icon, two lines of text, and a switch on one full-width row.
+    private func awakeControlRow(icon: String?, iconTint: NSColor, title: String,
+                                 titleWeight: NSFont.Weight, detail: String, control: NSView) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.distribution = .fill
+
+        let mark = NSImageView()
+        mark.translatesAutoresizingMaskIntoConstraints = false
+        mark.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        mark.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        mark.setContentHuggingPriority(.required, for: .horizontal)
+        if let icon {
+            let symbol = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+            mark.image = NSImage(systemSymbolName: icon, accessibilityDescription: title)?
+                .withSymbolConfiguration(symbol)
+            mark.contentTintColor = iconTint
+            mark.imageScaling = .scaleProportionallyDown
+        }
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 1
+        let heading = NSTextField(labelWithString: title)
+        heading.font = .systemFont(ofSize: 13, weight: titleWeight)
+        let sub = NSTextField(labelWithString: detail)
+        sub.font = .systemFont(ofSize: 11)
+        sub.textColor = .secondaryLabelColor
+        sub.lineBreakMode = .byTruncatingTail
+        text.addArrangedSubview(heading)
+        text.addArrangedSubview(sub)
+        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        row.addArrangedSubview(mark)
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(control)
+        return row
+    }
+
+    private func caffeinateSwitch(active: Bool, dark: Bool) -> NSView {
+        wordSwitch(
+            on: active,
+            dark: dark,
+            offTip: "Turn Caffeinate off. This releases only this app’s keep-awake.",
+            onTip: "Turn Caffeinate on. This Mac stays awake. Sleep settings stay as they are.",
+            offLabel: "Caffeinate off",
+            onLabel: "Caffeinate on",
+            offClick: { [weak self] in self?.caffeinateOffClicked() },
+            onClick: { [weak self] in self?.caffeinateOnClicked() })
+    }
+
+    private func lidSwitch(on: Bool, dark: Bool) -> NSView {
+        wordSwitch(
+            on: on,
+            dark: dark,
+            offTip: "Allow sleep when the lid closes. This does not change the Mac’s sleep settings.",
+            onTip: "Keep this Mac awake with the lid closed while Caffeinate is on. Sleep settings stay as they are.",
+            offLabel: "Lid shut off",
+            onLabel: "Lid shut on",
+            offClick: { [weak self] in self?.lidOffClicked() },
+            onClick: { [weak self] in self?.lidOnClicked() })
+    }
+
+    /// Off and On stay visible. Amber only when On is selected.
+    private func wordSwitch(on: Bool, dark: Bool, offTip: String, onTip: String,
+                            offLabel: String, onLabel: String,
+                            offClick: @escaping () -> Void, onClick: @escaping () -> Void) -> NSView {
+        let track = NSView()
+        track.wantsLayer = true
+        track.layer?.cornerRadius = 8
+        let trackFill = dark
+            ? NSColor.white.withAlphaComponent(0.06)
+            : NSColor.black.withAlphaComponent(0.05)
+        track.layer?.backgroundColor = trackFill.cgColor
+        track.translatesAutoresizingMaskIntoConstraints = false
+        track.widthAnchor.constraint(equalToConstant: 96).isActive = true
+        track.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        track.setContentHuggingPriority(.required, for: .horizontal)
+        track.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let off = AwakeChoice()
+        off.title = "Off"
+        off.selected = !on
+        off.amber = false
+        off.dark = dark
+        off.toolTip = offTip
+        off.setAccessibilityElement(true)
+        off.setAccessibilityRole(.button)
+        off.setAccessibilityLabel(offLabel)
+        off.onClick = offClick
+        let onChoice = AwakeChoice()
+        onChoice.title = "On"
+        onChoice.selected = on
+        onChoice.amber = true
+        onChoice.dark = dark
+        onChoice.toolTip = onTip
+        onChoice.setAccessibilityElement(true)
+        onChoice.setAccessibilityRole(.button)
+        onChoice.setAccessibilityLabel(onLabel)
+        onChoice.onClick = onClick
+        for choice in [off, onChoice] {
+            choice.translatesAutoresizingMaskIntoConstraints = false
+            track.addSubview(choice)
+        }
+        NSLayoutConstraint.activate([
+            off.leadingAnchor.constraint(equalTo: track.leadingAnchor, constant: 2),
+            off.topAnchor.constraint(equalTo: track.topAnchor, constant: 2),
+            off.bottomAnchor.constraint(equalTo: track.bottomAnchor, constant: -2),
+            off.widthAnchor.constraint(equalToConstant: 46),
+            onChoice.trailingAnchor.constraint(equalTo: track.trailingAnchor, constant: -2),
+            onChoice.topAnchor.constraint(equalTo: track.topAnchor, constant: 2),
+            onChoice.bottomAnchor.constraint(equalTo: track.bottomAnchor, constant: -2),
+            onChoice.widthAnchor.constraint(equalToConstant: 46),
+        ])
+        return track
     }
 
     private func providerBody(_ group: ProviderGauges, app: AppDelegate) -> NSStackView {
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 8
-        let title = NSTextField(labelWithString: group.config.displayName)
-        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        stack.spacing = 6
+        let title = groupTitle(group.config.displayName)
         stack.addArrangedSubview(title)
+        stack.setCustomSpacing(8, after: title)
         for gauge in group.gauges {
-            stack.addArrangedSubview(gaugeRow(gauge, group: group, app: app))
+            let line = gaugeRow(gauge, group: group, app: app)
+            stack.addArrangedSubview(line)
+            stretch(line, in: stack)
         }
         if group.config.kind == .codex, let banked = app.codexBanked, banked.available > 0 {
-            stack.addArrangedSubview(note(banked.menuLine()))
+            stack.addArrangedSubview(note(banked.menuLine(), width: Self.rowWidth))
         }
-        stack.widthAnchor.constraint(equalToConstant: 288).isActive = true
+        stack.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+        return stack
+    }
+
+    private func openBody(_ rows: [NSView]) -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        let title = groupTitle("Open")
+        stack.addArrangedSubview(title)
+        stack.setCustomSpacing(6, after: title)
+        for row in rows { stack.addArrangedSubview(row) }
+        stack.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
         return stack
     }
 
@@ -7220,44 +7853,38 @@ final class UsagePanelController: NSObject {
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 8
+        row.distribution = .fill
+        // A vertical stack's gravity areas size each row to its text.
+        // Fill the card width so the time, marks, and percent share one edge.
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         let name = NSTextField(labelWithString: limitTitle(gauge, group: group))
-        name.font = .systemFont(ofSize: 13, weight: .semibold)
+        name.font = .systemFont(ofSize: 13, weight: .medium)
         name.lineBreakMode = .byTruncatingTail
+        name.setContentHuggingPriority(.defaultLow, for: .horizontal)
         name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let when = remain(gauge.resetsAt)
-        let time = NSTextField(labelWithString: when)
-        time.font = .systemFont(ofSize: 12)
+        let time = fixedLabel(remain(gauge.resetsAt), width: 56, align: .right)
+        time.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         time.textColor = .secondaryLabelColor
-        time.setContentHuggingPriority(.required, for: .horizontal)
-        time.setContentCompressionResistancePriority(.required, for: .horizontal)
-
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
 
         let meter = MeterView(fraction: left / 100, fill: color)
-        let figure = NSTextField(labelWithString: "\(Int(left.rounded()))%")
-        figure.font = .monospacedDigitSystemFont(ofSize: 16, weight: .bold)
+
+        let figure = fixedLabel("\(Int(left.rounded()))%", width: 42, align: .right)
+        figure.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
         figure.textColor = color
-        let unit = NSTextField(labelWithString: "left")
-        unit.font = .systemFont(ofSize: 11, weight: .medium)
-        unit.textColor = color
-        let numbers = NSStackView()
-        numbers.orientation = .horizontal
-        numbers.alignment = .firstBaseline
-        numbers.spacing = 3
-        numbers.addArrangedSubview(figure)
-        numbers.addArrangedSubview(unit)
-        numbers.setContentHuggingPriority(.required, for: .horizontal)
-        numbers.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let unit = fixedLabel("left", width: 26, align: .left)
+        unit.font = .systemFont(ofSize: 11, weight: .regular)
+        unit.textColor = .tertiaryLabelColor
 
         row.addArrangedSubview(name)
-        if !when.isEmpty { row.addArrangedSubview(time) }
-        row.addArrangedSubview(spacer)
+        row.addArrangedSubview(time)
         row.addArrangedSubview(meter)
-        row.addArrangedSubview(numbers)
-        row.widthAnchor.constraint(equalToConstant: 288).isActive = true
+        row.addArrangedSubview(figure)
+        row.setCustomSpacing(4, after: figure)
+        row.addArrangedSubview(unit)
 
         let pace = app.paceForecast(providerId: group.config.id, gauge: gauge)
         guard pace.warn else { return row }
@@ -7265,10 +7892,17 @@ final class UsagePanelController: NSObject {
         column.orientation = .vertical
         column.alignment = .leading
         column.spacing = 2
+        column.translatesAutoresizingMaskIntoConstraints = false
         column.addArrangedSubview(row)
-        column.addArrangedSubview(quiet(pace.line, width: 288))
-        column.widthAnchor.constraint(equalToConstant: 288).isActive = true
+        column.addArrangedSubview(quiet(pace.line, width: Self.rowWidth))
+        stretch(row, in: column)
         return column
+    }
+
+    /// Make an arranged row use the full width of its card stack.
+    private func stretch(_ child: NSView, in parent: NSView) {
+        child.leadingAnchor.constraint(equalTo: parent.leadingAnchor).isActive = true
+        child.trailingAnchor.constraint(equalTo: parent.trailingAnchor).isActive = true
     }
 
     /// The card already names the provider. A gauge titled the same way
@@ -7307,17 +7941,20 @@ final class UsagePanelController: NSObject {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
-        if app.usageFetchInFlight && app.lastError == nil {
-            stack.addArrangedSubview(note("Reading limits…"))
+        if !app.usageSignedIn {
+            stack.addArrangedSubview(note("No system is connected yet.", width: Self.rowWidth))
+            stack.addArrangedSubview(textButton("Let's get you started", #selector(setupClicked), tint: .labelColor))
+        } else if app.usageFetchInFlight && app.lastError == nil {
+            stack.addArrangedSubview(note("Reading limits…", width: Self.rowWidth))
         } else if let err = app.lastError, !err.isEmpty {
-            stack.addArrangedSubview(note(err))
+            stack.addArrangedSubview(note(err, width: Self.rowWidth))
             if AppDelegate.needsSignIn(err) {
                 stack.addArrangedSubview(textButton("Open Set Up", #selector(setupClicked)))
             }
         } else {
-            stack.addArrangedSubview(note("Reading limits…"))
+            stack.addArrangedSubview(note("Reading limits…", width: Self.rowWidth))
         }
-        stack.widthAnchor.constraint(equalToConstant: 288).isActive = true
+        stack.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
         return stack
     }
 
@@ -7344,64 +7981,108 @@ final class UsagePanelController: NSObject {
         let clean = name.trimmingCharacters(in: .whitespaces)
         if clean.isEmpty { return letter }
         if letter.count > 1, clean.range(of: letter, options: .caseInsensitive) != nil { return clean }
-        if letter.count == 1 { return "\(letter)  \(clean)" }
+        if letter.count == 1 { return "\(letter) \(clean)" }
         return clean
     }
 
-    private func footer(_ app: AppDelegate) -> NSView {
+    private func footer(_ app: AppDelegate, dark: Bool) -> NSView {
+        let column = NSStackView()
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = 8
+        column.addArrangedSubview(hairline(dark: dark))
+
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 8
+        row.spacing = 14
         row.addArrangedSubview(textButton("Refresh", #selector(refreshClicked)))
         let stamp: String
         if let updated = app.lastUpdated {
             let stale = Date().timeIntervalSince(updated) > 20 * 60
-            stamp = stale ? "Last good read \(app.relative(updated))" : app.relative(updated)
+            stamp = stale ? "Last good read \(app.relative(updated))" : "Updated \(app.relative(updated))"
         } else {
             stamp = ""
         }
         let mid = NSTextField(labelWithString: stamp)
         mid.font = .systemFont(ofSize: 11)
-        mid.textColor = .secondaryLabelColor
+        mid.textColor = .tertiaryLabelColor
         mid.alignment = .center
+        mid.lineBreakMode = .byTruncatingTail
         mid.setContentHuggingPriority(.init(1), for: .horizontal)
+        mid.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         row.addArrangedSubview(mid)
         row.addArrangedSubview(textButton("More…", #selector(moreClicked(_:))))
-        row.addArrangedSubview(pill("Quit", #selector(quitClicked)))
-        row.widthAnchor.constraint(equalToConstant: 312).isActive = true
-        return row
+        row.addArrangedSubview(textButton("Quit", #selector(quitClicked), tint: .labelColor))
+        row.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
+        column.addArrangedSubview(row)
+        column.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
+        return column
     }
 
-    private func card(_ inner: NSView, fill: NSColor) -> NSView {
+    private func card(_ inner: NSView, fill: NSColor, dark: Bool) -> NSView {
         let box = NSView()
         box.wantsLayer = true
-        box.layer?.cornerRadius = 12
+        box.layer?.cornerRadius = 10
         box.layer?.backgroundColor = fill.cgColor
+        box.layer?.borderWidth = 1
+        box.layer?.borderColor = (dark
+            ? NSColor.white.withAlphaComponent(0.07)
+            : NSColor.black.withAlphaComponent(0.06)).cgColor
         inner.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(inner)
         NSLayoutConstraint.activate([
-            inner.topAnchor.constraint(equalTo: box.topAnchor, constant: 10),
-            inner.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 12),
-            inner.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -12),
-            inner.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -10),
-            box.widthAnchor.constraint(equalToConstant: 312),
+            inner.topAnchor.constraint(equalTo: box.topAnchor, constant: 11),
+            inner.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: Self.cardInset),
+            inner.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -Self.cardInset),
+            inner.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -11),
+            box.widthAnchor.constraint(equalToConstant: Self.contentWidth),
         ])
         return box
     }
 
-    private func sectionLabel(_ text: String) -> NSTextField {
-        let label = NSTextField(labelWithString: text.uppercased())
-        label.font = .systemFont(ofSize: 11, weight: .semibold)
-        label.textColor = .secondaryLabelColor
+    private func hairline(dark: Bool) -> NSView {
+        let line = NSView()
+        line.wantsLayer = true
+        line.layer?.backgroundColor = (dark
+            ? NSColor.white.withAlphaComponent(0.08)
+            : NSColor.black.withAlphaComponent(0.08)).cgColor
+        line.translatesAutoresizingMaskIntoConstraints = false
+        line.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        line.widthAnchor.constraint(equalToConstant: Self.contentWidth).isActive = true
+        return line
+    }
+
+    private func groupTitle(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: "")
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byTruncatingTail
+        label.attributedStringValue = NSAttributedString(string: text.uppercased(), attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .kern: 0.7,
+            .paragraphStyle: style,
+        ])
         return label
     }
 
-    private func note(_ text: String) -> NSTextField {
+    private func fixedLabel(_ text: String, width: CGFloat, align: NSTextAlignment) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.alignment = align
+        label.translatesAutoresizingMaskIntoConstraints = false
+        // Below required so the fixed width wins over the text's own size.
+        label.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        label.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        label.lineBreakMode = .byClipping
+        label.widthAnchor.constraint(equalToConstant: width).isActive = true
+        return label
+    }
+
+    private func note(_ text: String, width: CGFloat) -> NSTextField {
         let label = NSTextField(wrappingLabelWithString: text)
         label.font = .systemFont(ofSize: 12)
         label.textColor = .secondaryLabelColor
-        label.preferredMaxLayoutWidth = 288
+        label.preferredMaxLayoutWidth = width
         return label
     }
 
@@ -7413,31 +8094,24 @@ final class UsagePanelController: NSObject {
         return label
     }
 
-    private func textButton(_ title: String, _ action: Selector) -> NSButton {
+    private func textButton(_ title: String, _ action: Selector, tint: NSColor = .secondaryLabelColor) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .shadowlessSquare
         button.isBordered = false
         button.font = .systemFont(ofSize: 12, weight: .medium)
-        button.contentTintColor = .secondaryLabelColor
-        return button
-    }
-
-    private func pill(_ title: String, _ action: Selector) -> NSButton {
-        let button = NSButton(title: title, target: self, action: action)
-        button.bezelStyle = .inline
-        button.controlSize = .small
-        button.font = .systemFont(ofSize: 12, weight: .medium)
+        button.contentTintColor = tint
         return button
     }
 
     private func styleSession(_ button: NSButton) {
         button.bezelStyle = .shadowlessSquare
         button.isBordered = false
-        button.font = .systemFont(ofSize: 12, weight: .medium)
+        button.font = .systemFont(ofSize: 13, weight: .regular)
+        button.contentTintColor = .labelColor
         button.alignment = .left
         button.lineBreakMode = .byTruncatingTail
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: 288).isActive = true
+        button.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
     }
 
     /// Colour follows how much is left. Clear on a solid card, not the quiet menu-bar ink.
@@ -7445,6 +8119,28 @@ final class UsagePanelController: NSObject {
         if left >= 50 { return NSColor(srgbRed: 0.18, green: 0.74, blue: 0.42, alpha: 1) }
         if left >= 20 { return NSColor(srgbRed: 0.93, green: 0.64, blue: 0.18, alpha: 1) }
         return NSColor(srgbRed: 0.92, green: 0.34, blue: 0.30, alpha: 1)
+    }
+
+    @objc private func caffeinateOffClicked() {
+        guard let app else { return }
+        guard app.laptopMode.isActive || app.laptopMode.isEngaged else { return }
+        app.setCaffeinateFromPanel(on: false)
+    }
+
+    @objc private func caffeinateOnClicked() {
+        guard let app else { return }
+        guard !(app.laptopMode.isActive || app.laptopMode.isEngaged) else { return }
+        app.setCaffeinateFromPanel(on: true)
+    }
+
+    @objc private func lidOffClicked() {
+        guard let app, app.laptopMode.lidShutOnActivate else { return }
+        app.setLidShutFromPanel(on: false)
+    }
+
+    @objc private func lidOnClicked() {
+        guard let app, !app.laptopMode.lidShutOnActivate else { return }
+        app.setLidShutFromPanel(on: true)
     }
 
     @objc private func settingsClicked() {
@@ -7486,6 +8182,56 @@ final class UsagePanelController: NSObject {
     }
 }
 
+/// One side of the Caffeinate switch. Off and On both stay visible.
+private final class AwakeChoice: NSView {
+    static let amber = NSColor(srgbRed: 0.95, green: 0.62, blue: 0.18, alpha: 1)
+    static let ink = NSColor(srgbRed: 0.22, green: 0.12, blue: 0.02, alpha: 1)
+
+    var title = ""
+    var selected = false
+    var amber = false
+    var dark = false
+    var onClick: (() -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let fill: NSColor
+        let text: NSColor
+        if selected && amber {
+            fill = Self.amber
+            text = Self.ink
+        } else if selected {
+            fill = dark
+                ? NSColor.white.withAlphaComponent(0.14)
+                : NSColor.black.withAlphaComponent(0.08)
+            text = .labelColor
+        } else {
+            fill = .clear
+            text = .secondaryLabelColor
+        }
+        if fill.alphaComponent > 0.001 {
+            fill.setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+        }
+        let font = NSFont.systemFont(ofSize: 12, weight: selected ? .semibold : .medium)
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        let attr = NSAttributedString(string: title, attributes: [
+            .font: font,
+            .foregroundColor: text,
+            .paragraphStyle: style,
+        ])
+        let size = attr.size()
+        let y = ((bounds.height - size.height) / 2).rounded()
+        attr.draw(in: NSRect(x: 0, y: y, width: bounds.width, height: size.height))
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+}
+
 /// Clear full-screen click catcher behind the usage card.
 private final class CatcherView: NSView {
     var onClick: (() -> Void)?
@@ -7502,23 +8248,30 @@ final class MeterView: NSView {
     private let fraction: CGFloat
     private let fill: NSColor
 
+    private static let markCount = 5
+    private static let markSide: CGFloat = 7
+    private static let markGap: CGFloat = 2
+    private static var markWidth: CGFloat {
+        markSide * CGFloat(markCount) + markGap * CGFloat(markCount - 1)
+    }
+
     init(fraction: Double, fill: NSColor) {
         self.fraction = CGFloat(max(0, min(1, fraction)))
         self.fill = fill
-        super.init(frame: NSRect(x: 0, y: 0, width: 52, height: 8))
+        super.init(frame: NSRect(x: 0, y: 0, width: Self.markWidth, height: Self.markSide))
         translatesAutoresizingMaskIntoConstraints = false
         setContentHuggingPriority(.required, for: .horizontal)
         setContentCompressionResistancePriority(.required, for: .horizontal)
-        widthAnchor.constraint(equalToConstant: 52).isActive = true
-        heightAnchor.constraint(equalToConstant: 8).isActive = true
+        widthAnchor.constraint(equalToConstant: Self.markWidth).isActive = true
+        heightAnchor.constraint(equalToConstant: Self.markSide).isActive = true
     }
 
     required init?(coder: NSCoder) { nil }
 
     override func draw(_ dirtyRect: NSRect) {
-        let count = 5
-        let gap: CGFloat = 3
-        let side = bounds.height
+        let count = Self.markCount
+        let gap = Self.markGap
+        let side = Self.markSide
         let lit = Int((fraction * CGFloat(count)).rounded())
         let shown = fraction > 0.02 ? max(1, lit) : 0
         for index in 0..<count {

@@ -21,9 +21,11 @@ tab, Orbit window, or desktop app.
 
 Green under 50%, amber 50–79%, red at 80%+. The percent next to each letter
 uses that same colour. Click the icon for a Usage panel: each limit shows
-the time left and how much is left. Right-click, or More, opens the full
-menu, including pace, memory use, and Refresh now. Icon options, updates,
-Caffeinate, and **Open at Login** live in **Settings**.
+the time left and how much is left, and Caffeinate On and Off are on that
+panel. On a MacBook, Lid shut is a switch on the same panel. Right-click, or
+More, opens the full menu, including pace, memory use, and Refresh now. Icon
+options, updates, and **Open at Login** live in **Settings**. Hotspot stays
+there too.
 
 The icon is configurable from that menu:
 
@@ -68,7 +70,8 @@ included; project names are path tails only. Reopen anytime with **Open Last
 Report**.
 
 **Caffeinate Mode** keeps the Mac awake (desktop or laptop) while it is on.
-On a MacBook you can also **keep the laptop on with the lid shut**. Turning it
+On and Off are on the Usage panel. On a MacBook, **Lid shut** on that panel
+keeps the laptop on with the lid closed while Caffeinate is on. Turning it
 off releases only that keep-awake. It does not change the Mac’s sleep settings.
 The display may still sleep. While active, a glowing cup appears in the menu
 bar — click it for a short reminder (heat / battery notes). Optional: join a
@@ -123,15 +126,17 @@ cd usage-monitor
 open UsageMonitor.app
 ```
 
-On first launch (or any time neither provider is signed in) a **setup window**
-walks you through installing Claude Code and/or Grok and signing in. The same
-window has an optional **Claude API dollar spend** section — add an Admin API
-key and the menu also shows your month-to-date Anthropic pay-as-you-go cost.
-You can either let the app **scan your Mac** for a key it already finds (shell
-profiles, the `ant` CLI config), or **type one in confidentially** (hidden
-field). The key is verified against the cost endpoint before it's saved,
-stored only in your macOS Keychain, and used solely to read your cost report.
-Reopen setup any time from the menu-bar **Set Up…** item.
+On first launch, if Claude, Grok, and Codex are all signed out, **Let's get you started**
+walks you through connecting one of them. Pick a system, copy its install command,
+and sign in in Terminal. The app does not run the installer for you. When that
+system is signed in, the menu-bar icon shows its limits. Add the others later
+from **Set Up…**.
+
+Claude API dollar spend stays optional. A **Claude API spend…** button on that
+window can scan this Mac for an Admin API key or take one you type (hidden
+field). The key is checked against the cost endpoint, stored only in the macOS
+Keychain, and used only to read the cost report. Reopen setup any time from
+**Settings → Set Up…**.
 
 Then use **Open at Login** in the menu to have it start automatically. Move
 `UsageMonitor.app` to `/Applications` first if you want it to live there.

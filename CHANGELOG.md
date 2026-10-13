@@ -8,6 +8,12 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.12.0
+
+- **Caffeinate on the Usage panel.** On and Off sit on the panel a click opens. On a MacBook, Lid shut is a switch on that card. Hotspot stays in Settings.
+- **Aligned limits.** Each row is one width: name, time left, marks, and percent left share the same columns.
+- **Let's get you started.** The first launch with no Claude, Grok, or Codex sign-in walks through connecting one system. Claude API spend stays optional.
+
 ## 2.11.0
 
 - **Usage panel.** A click on the menu-bar icon opens a Usage panel. Each limit is one line: name, time left, and how much is left.
