@@ -8,6 +8,10 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.13.2
+
+- **Menu bar text follows the background.** Letters and percent colours stay readable when the menu bar is light, dark, or tinted by the wallpaper. A plain black or white bar keeps the same colours as before. A busy wallpaper gets a quiet backing behind the gauges.
+
 ## 2.13.1
 
 - **Caffeinate turns on right away.** The switch updates before any hotspot join. Sleep settings are still unchanged.

@@ -542,3 +542,168 @@ enum UpdatePolicy {
         return version
     }
 }
+
+// MARK: - Menu bar contrast
+
+/// What the gauges are drawn on, and the solid backing used when that field is busy.
+struct MenuBarField: Equatable {
+    var luminance: Double
+    var variance: Double
+    /// Relative luminance the ink has to clear. A busy field uses the plate, not the photo.
+    var inkLuminance: Double
+    var needsPlate: Bool
+    /// sRGB gray of the plate. Nil when the gauges sit directly on the menu bar.
+    var plateSRGB: Double?
+}
+
+/// sRGB contrast for menu-bar letters and percent colours.
+/// Quiet dark-bar colours stay as they are when they already clear the floor.
+enum MenuBarContrast {
+    static let minimumContrast = 4.5
+    /// Black text beats white text once the field is lighter than this.
+    static let quietPaletteCeiling = 0.18
+    /// Column-to-column spread above this means a photo or a row of icons, not a flat bar.
+    static let busyVariance = 0.08
+
+    static func linear(_ channel: Double) -> Double {
+        let c = min(1, max(0, channel))
+        if c <= 0.04045 { return c / 12.92 }
+        return pow((c + 0.055) / 1.055, 2.4)
+    }
+
+    static func relativeLuminance(r: Double, g: Double, b: Double) -> Double {
+        0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+    }
+
+    static func contrastRatio(_ foreground: (Double, Double, Double), on backgroundLuminance: Double) -> Double {
+        let fg = relativeLuminance(r: foreground.0, g: foreground.1, b: foreground.2)
+        let bg = min(1, max(0, backgroundLuminance))
+        let lighter = max(fg, bg)
+        let darker = min(fg, bg)
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
+    static func usesQuietDarkPalette(inkLuminance: Double) -> Bool {
+        inkLuminance < quietPaletteCeiling
+    }
+
+    static func field(luminance: Double, variance: Double) -> MenuBarField {
+        if variance >= busyVariance {
+            let srgb = luminance < quietPaletteCeiling ? 0.07 : 0.95
+            let plate = relativeLuminance(r: srgb, g: srgb, b: srgb)
+            return MenuBarField(luminance: luminance, variance: variance,
+                                inkLuminance: plate, needsPlate: true, plateSRGB: srgb)
+        }
+        return MenuBarField(luminance: luminance, variance: variance,
+                            inkLuminance: luminance, needsPlate: false, plateSRGB: nil)
+    }
+
+    /// Move `seed` toward white or black until it clears `minimumContrast`.
+    /// A seed that already clears is returned unchanged.
+    static func readable(seed: (Double, Double, Double),
+                         on backgroundLuminance: Double,
+                         minimum: Double = minimumContrast) -> (Double, Double, Double) {
+        if contrastRatio(seed, on: backgroundLuminance) >= minimum { return seed }
+        let towardWhite = contrastRatio((1, 1, 1), on: backgroundLuminance)
+            >= contrastRatio((0, 0, 0), on: backgroundLuminance)
+        let target: (Double, Double, Double) = towardWhite ? (1, 1, 1) : (0, 0, 0)
+        var lo = 0.0
+        var hi = 1.0
+        var best = target
+        for _ in 0..<16 {
+            let t = (lo + hi) / 2
+            let mix = (
+                seed.0 + (target.0 - seed.0) * t,
+                seed.1 + (target.1 - seed.1) * t,
+                seed.2 + (target.2 - seed.2) * t
+            )
+            if contrastRatio(mix, on: backgroundLuminance) >= minimum {
+                best = mix
+                hi = t
+            } else {
+                lo = t
+            }
+        }
+        return best
+    }
+
+    /// Letters and tracks. Near-white on a dark field, near-black on a light one.
+    static func neutralSRGB(on inkLuminance: Double) -> (Double, Double, Double) {
+        let seed: (Double, Double, Double) = usesQuietDarkPalette(inkLuminance: inkLuminance)
+            ? (0.93, 0.93, 0.94) : (0.09, 0.09, 0.10)
+        return readable(seed: seed, on: inkLuminance)
+    }
+
+    /// Pick the flat patch closest to the gauges.
+    /// `preferHighIndex` is true when the gauges sit to the right of these columns.
+    static func pickLuminance(columnLuminance: [Double],
+                              columnVariance: [Double],
+                              preferHighIndex: Bool) -> (luminance: Double, variance: Double)? {
+        let n = min(columnLuminance.count, columnVariance.count)
+        guard n > 0 else { return nil }
+        let window = min(16, n)
+        var bestL = 0.0
+        var bestV = Double.greatestFiniteMagnitude
+        var bestIndex = preferHighIndex ? -1 : n + 1
+        var i = 0
+        while i + window <= n {
+            var sum = 0.0
+            var varSum = 0.0
+            for k in i..<(i + window) {
+                sum += columnLuminance[k]
+                varSum += columnVariance[k]
+            }
+            let mean = sum / Double(window)
+            var spread = 0.0
+            for k in i..<(i + window) {
+                let d = columnLuminance[k] - mean
+                spread += d * d
+            }
+            let variance = varSum / Double(window) + spread / Double(window)
+            let closer: Bool
+            if preferHighIndex {
+                closer = i >= bestIndex
+            } else {
+                closer = i <= bestIndex
+            }
+            if variance < bestV - 0.02 || (abs(variance - bestV) <= 0.02 && closer) {
+                bestV = variance
+                bestL = mean
+                bestIndex = i
+            }
+            i += 1
+        }
+        return (bestL, bestV)
+    }
+}
+
+/// Percent colours. The quiet triple is the dark-bar palette. The deep triple is the light-bar palette.
+enum MenuBarInk {
+    enum Level {
+        case low, mid, high
+        init(_ pct: Double) { self = pct >= 80 ? .high : (pct >= 50 ? .mid : .low) }
+    }
+
+    static func quietDark(_ level: Level) -> (Double, Double, Double) {
+        switch level {
+        case .high: return (0.76, 0.46, 0.42)
+        case .mid:  return (0.78, 0.60, 0.38)
+        case .low:  return (0.40, 0.62, 0.48)
+        }
+    }
+
+    static func deepLight(_ level: Level) -> (Double, Double, Double) {
+        switch level {
+        case .high: return (0.55, 0.16, 0.13)
+        case .mid:  return (0.52, 0.32, 0.05)
+        case .low:  return (0.10, 0.38, 0.22)
+        }
+    }
+
+    static func percent(pct: Double, inkLuminance: Double) -> (Double, Double, Double) {
+        let level = Level(pct)
+        let seed = MenuBarContrast.usesQuietDarkPalette(inkLuminance: inkLuminance)
+            ? quietDark(level) : deepLight(level)
+        return MenuBarContrast.readable(seed: seed, on: inkLuminance)
+    }
+}

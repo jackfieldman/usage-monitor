@@ -190,6 +190,62 @@ check("release tag without v",
 check("release tag rejects a repo url",
       UpdatePolicy.versionFromReleaseURL(URL(string: "https://github.com/jackfieldman/usage-monitor")!) == nil)
 
+check("white on black is 21",
+      abs(MenuBarContrast.contrastRatio((1, 1, 1), on: 0) - 21) < 0.05)
+check("black on white is 21",
+      abs(MenuBarContrast.contrastRatio((0, 0, 0), on: 1) - 21) < 0.05)
+
+let quietLow = MenuBarInk.quietDark(.low)
+let onBlack = MenuBarInk.percent(pct: 3, inkLuminance: 0)
+check("black bar keeps quiet green",
+      abs(onBlack.0 - quietLow.0) < 0.001
+        && abs(onBlack.1 - quietLow.1) < 0.001
+        && abs(onBlack.2 - quietLow.2) < 0.001)
+let quietHigh = MenuBarInk.quietDark(.high)
+let highOnBlack = MenuBarInk.percent(pct: 94, inkLuminance: 0)
+check("black bar keeps quiet red",
+      abs(highOnBlack.0 - quietHigh.0) < 0.001 && abs(highOnBlack.1 - quietHigh.1) < 0.001)
+
+let deepLow = MenuBarInk.deepLight(.low)
+let onWhite = MenuBarInk.percent(pct: 3, inkLuminance: 0.96)
+check("white bar keeps deep green",
+      abs(onWhite.0 - deepLow.0) < 0.001
+        && abs(onWhite.1 - deepLow.1) < 0.001
+        && abs(onWhite.2 - deepLow.2) < 0.001)
+
+// The menu bar in the readability report: flat gray, not black.
+let gray = MenuBarContrast.relativeLuminance(r: 154.0 / 255, g: 151.0 / 255, b: 152.0 / 255)
+let grayField = MenuBarContrast.field(luminance: gray, variance: 0.001)
+check("gray bar is a light field",
+      !MenuBarContrast.usesQuietDarkPalette(inkLuminance: grayField.inkLuminance))
+check("gray bar has no plate", !grayField.needsPlate)
+let grayHigh = MenuBarInk.percent(pct: 94, inkLuminance: grayField.inkLuminance)
+let grayLow = MenuBarInk.percent(pct: 3, inkLuminance: grayField.inkLuminance)
+let grayLetter = MenuBarContrast.neutralSRGB(on: grayField.inkLuminance)
+check("94% on gray clears 4.5",
+      MenuBarContrast.contrastRatio(grayHigh, on: grayField.inkLuminance) >= 4.5)
+check("3% on gray clears 4.5",
+      MenuBarContrast.contrastRatio(grayLow, on: grayField.inkLuminance) >= 4.5)
+check("letters on gray clear 4.5",
+      MenuBarContrast.contrastRatio(grayLetter, on: grayField.inkLuminance) >= 4.5)
+check("gray ink is darker than the quiet red",
+      grayHigh.0 + grayHigh.1 + grayHigh.2 < quietHigh.0 + quietHigh.1 + quietHigh.2)
+
+let busy = MenuBarContrast.field(luminance: 0.62, variance: 0.2)
+check("busy light field gets a light plate", busy.needsPlate && (busy.plateSRGB ?? 0) > 0.9)
+check("plate ink still clears",
+      MenuBarContrast.contrastRatio(MenuBarInk.percent(pct: 10, inkLuminance: busy.inkLuminance),
+                                   on: busy.inkLuminance) >= 4.5)
+
+var columnsL = [Double](repeating: 0.02, count: 40)
+var columnsV = [Double](repeating: 0, count: 40)
+for i in 20..<40 { columnsL[i] = gray; columnsV[i] = 0.001 }
+let picked = MenuBarContrast.pickLuminance(columnLuminance: columnsL,
+                                           columnVariance: columnsV,
+                                           preferHighIndex: true)
+check("sample beside the gauges prefers the gray patch",
+      picked != nil && abs((picked?.luminance ?? 0) - gray) < 0.02)
+
 if failed > 0 {
     fputs("\(failed) failed\n", stderr)
     exit(1)

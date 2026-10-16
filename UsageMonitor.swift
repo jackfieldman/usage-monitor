@@ -11,6 +11,7 @@
 //
 // Build:  ./build.sh      Run:  open UsageMonitor.app
 import AppKit
+import ScreenCaptureKit
 import CoreWLAN
 import IOKit.pwr_mgt
 import ServiceManagement
@@ -172,6 +173,11 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.13.2", "Menu bar text follows the background", [
+            "Percent colours and letters stay readable on a light, dark, or tinted menu bar",
+            "A busy wallpaper gets a quiet backing behind the gauges",
+            "A plain black or white menu bar keeps the same colours as before",
+        ]),
         ("2.13.1", "Caffeinate turns on right away", [
             "The On switch updates before a hotspot join starts",
             "Sleep settings stay as they are",
@@ -720,12 +726,10 @@ enum Level {
 }
 
 func levelColor(_ pct: Double) -> NSColor {
-    // Two steps quieter than neon, still clear on a black menu bar.
-    switch Level(pct) {
-    case .high: return NSColor(srgbRed: 0.76, green: 0.46, blue: 0.42, alpha: 1)
-    case .mid:  return NSColor(srgbRed: 0.78, green: 0.60, blue: 0.38, alpha: 1)
-    case .low:  return NSColor(srgbRed: 0.40, green: 0.62, blue: 0.48, alpha: 1)
-    }
+    // Quiet dark-bar palette. Menu rows use this. The menu bar itself
+    // goes through statusInk so a light or tinted bar can deepen the same hues.
+    let rgb = MenuBarInk.quietDark(MenuBarInk.Level(pct))
+    return NSColor(srgbRed: rgb.0, green: rgb.1, blue: rgb.2, alpha: 1)
 }
 
 /// JSONSerialization boxes numbers as NSNumber — plain `as? Int` often fails.
@@ -4935,6 +4939,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.pollCost()
         }
         WhatsNew.recordLaunch()
+        installMenuBarSampling()
         laptopMode.restoreIfNeeded()
         caffeinateNotice.onTurnOff = { [weak self] in self?.deactivateLaptopModeQuiet() }
         render()
@@ -5734,6 +5739,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Pin status-item width to the bitmap so macOS doesn’t pad a “variable” slot
     /// wider than the gauges. Keeps the menu bar lean.
     private func applyMenuBarImage(_ image: NSImage, to item: NSStatusItem, button: NSStatusBarButton) {
+        let image = plateBacked(image)
         image.isTemplate = false
         // Point size must match pixels-at-1x used when drawing (no extra margin).
         let w = max(1, ceil(image.size.width))
@@ -5746,6 +5752,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Explicit length ≈ image width. `variableLength` often leaves dead air
         // on either side of multi-glyph images.
         item.length = w
+    }
+
+    /// A flat chip behind the gauges when the menu bar itself is a photo.
+    /// The ink was chosen for this chip, so the percent colours stay the quiet or deep set.
+    private func plateBacked(_ image: NSImage) -> NSImage {
+        guard drawingOnDarkBar == nil, let plate = inkField().plateSRGB else { return image }
+        let size = image.size
+        let out = NSImage(size: size, flipped: false) { _ in
+            NSColor(srgbRed: plate, green: plate, blue: plate, alpha: 0.94).setFill()
+            let rect = NSRect(x: 0, y: 1, width: size.width, height: max(1, size.height - 2))
+            NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill()
+            image.draw(in: NSRect(origin: .zero, size: size), from: .zero, operation: .sourceOver, fraction: 1)
+            return true
+        }
+        out.isTemplate = false
+        return out
     }
 
     // MARK: Caffeinate glow (menu-bar cup)
@@ -5858,7 +5880,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pad: CGFloat = 0                             // no outer dead air
         let letterGap: CGFloat = comfortable ? 2 : 1.5   // letter → glyph
         let pctGap: CGFloat = comfortable ? 2 : 1.5      // glyph → %
-        let ink = NSColor.labelColor
+        let ink = barNeutral()
 
         // Per-cluster glyph size depends on Icon Shape.
         let glyphW: CGFloat = {
@@ -5925,7 +5947,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let colorPct = usedPercent
         switch shape {
         case .bars:
-            NSColor.labelColor.withAlphaComponent(0.18).setFill()
+            barTrack().setFill()
             NSBezierPath(roundedRect: rect, xRadius: rect.width / 2, yRadius: rect.width / 2).fill()
             if p > 0 {
                 let bh = max(rect.width, rect.height * p)
@@ -5934,7 +5956,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              xRadius: rect.width / 2, yRadius: rect.width / 2).fill()
             }
         case .hbars:
-            NSColor.labelColor.withAlphaComponent(0.18).setFill()
+            barTrack().setFill()
             NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2).fill()
             if p > 0 {
                 let bw = max(rect.height, rect.width * p)
@@ -5948,7 +5970,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let track = NSBezierPath()
             track.appendArc(withCenter: c, radius: r, startAngle: 0, endAngle: 360)
             track.lineWidth = 2.2
-            NSColor.labelColor.withAlphaComponent(0.18).setStroke()
+            barTrack().setStroke()
             track.stroke()
             if p > 0.01 {
                 let arc = NSBezierPath()
@@ -5961,7 +5983,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         case .battery:
             let body = rect.insetBy(dx: 0, dy: 1)
-            let tint = NSColor.labelColor.withAlphaComponent(0.5)
+            let tint = barNeutral().withAlphaComponent(0.5)
             let outline = NSBezierPath(roundedRect: body.insetBy(dx: 0.5, dy: 0.5),
                                        xRadius: 2, yRadius: 2)
             outline.lineWidth = 1
@@ -5985,7 +6007,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let badge = letter.count == 1 ? "\(letter):" : letter
         let font = NSFont.systemFont(ofSize: 11, weight: .semibold)
         let s = NSAttributedString(string: badge,
-            attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+            attributes: [.font: font, .foregroundColor: barNeutral()])
         let gap: CGFloat = 2, pad: CGFloat = 0
         let h = max(18, body.size.height)
         let w = pad + ceil(s.size().width) + gap + body.size.width + pad
@@ -6226,22 +6248,349 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Forced while drawing the Settings preview. Nil follows the live menu bar.
     var drawingOnDarkBar: Bool?
+    /// Last read of the pixels beside the gauges. Nil until the first sample.
+    private var measuredField: MenuBarField?
+    private var barSampleInFlight = false
+    private var barSampleTimer: Timer?
 
     func menuBarIsDark() -> Bool {
         if let forced = drawingOnDarkBar { return forced }
+        return MenuBarContrast.usesQuietDarkPalette(inkLuminance: inkField().inkLuminance)
+    }
+
+    /// Field the gauges are drawn against. Preview strips pass a solid black or white.
+    func inkField() -> MenuBarField {
+        if let forced = drawingOnDarkBar {
+            let L = forced ? 0.0 : 0.96
+            return MenuBarField(luminance: L, variance: 0, inkLuminance: L, needsPlate: false, plateSRGB: nil)
+        }
+        if let measuredField { return measuredField }
+        return appearanceField()
+    }
+
+    /// Letters, tracks, and greyscale bars. Concrete sRGB, not a dynamic label colour,
+    /// so a dark appearance name cannot leave black type on a light bar.
+    func barNeutral() -> NSColor {
+        let rgb = MenuBarContrast.neutralSRGB(on: inkField().inkLuminance)
+        return NSColor(srgbRed: rgb.0, green: rgb.1, blue: rgb.2, alpha: 1)
+    }
+
+    func barTrack() -> NSColor {
+        barNeutral().withAlphaComponent(0.18)
+    }
+
+    /// Percent ink. A black bar keeps the quiet palette. A white bar keeps the deep palette.
+    /// Anything between is pushed toward black or white until the contrast floor clears.
+    func statusInk(_ pct: Double) -> NSColor {
+        let rgb = MenuBarInk.percent(pct: pct, inkLuminance: inkField().inkLuminance)
+        return NSColor(srgbRed: rgb.0, green: rgb.1, blue: rgb.2, alpha: 1)
+    }
+
+    private func appearanceSaysDark() -> Bool {
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
         return appearance.bestMatch(from: [.darkAqua, .aqua]) != .aqua
     }
 
-    /// Percent ink. Dark menu bar keeps the quiet palette. A light menu bar
-    /// uses a deeper ink of the same hue so the number stays readable.
-    func statusInk(_ pct: Double) -> NSColor {
-        guard !menuBarIsDark() else { return levelColor(pct) }
-        switch Level(pct) {
-        case .high: return NSColor(srgbRed: 0.55, green: 0.16, blue: 0.13, alpha: 1)
-        case .mid:  return NSColor(srgbRed: 0.52, green: 0.32, blue: 0.05, alpha: 1)
-        case .low:  return NSColor(srgbRed: 0.10, green: 0.38, blue: 0.22, alpha: 1)
+    /// Used before the first pixel sample, and when screen capture is not allowed.
+    private func appearanceField() -> MenuBarField {
+        if let wall = wallpaperField() { return wall }
+        let L = appearanceSaysDark() ? 0.0 : 0.96
+        return MenuBarField(luminance: L, variance: 0, inkLuminance: L, needsPlate: false, plateSRGB: nil)
+    }
+
+    func installMenuBarSampling() {
+        sampleMenuBarBackdrop()
+        barSampleTimer?.invalidate()
+        barSampleTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
+            self?.sampleMenuBarBackdrop()
         }
+        if let t = barSampleTimer { RunLoop.main.add(t, forMode: .common) }
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification,
+                           object: nil, queue: .main) { [weak self] _ in
+            self?.sampleMenuBarBackdrop()
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in
+            self?.sampleMenuBarBackdrop()
+        }
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil, queue: .main) { [weak self] _ in
+            self?.sampleMenuBarBackdrop()
+        }
+    }
+
+    /// Read the menu bar beside the gauges and redraw when the ink decision changes.
+    func sampleMenuBarBackdrop() {
+        guard !barSampleInFlight else { return }
+        guard let button = statusItem.button, let window = button.window else { return }
+        let item = window.convertToScreen(button.convert(button.bounds, to: nil))
+        guard let rect = menuBarSampleRect() else { return }
+        // The strip sits to the left of the gauges, so the right-hand columns are the nearest.
+        let preferHighIndex = rect.midX < item.midX
+        if !CGPreflightScreenCaptureAccess() {
+            applyMeasuredField(appearanceField())
+            return
+        }
+        guard #available(macOS 15.2, *) else {
+            applyMeasuredField(appearanceField())
+            return
+        }
+        barSampleInFlight = true
+        SCScreenshotManager.captureImage(in: rect) { [weak self] image, _ in
+            let stats = image.flatMap { Self.columnStats($0) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.barSampleInFlight = false
+                let field: MenuBarField
+                if let stats, let picked = MenuBarContrast.pickLuminance(
+                    columnLuminance: stats.luminance,
+                    columnVariance: stats.variance,
+                    preferHighIndex: preferHighIndex) {
+                    field = MenuBarContrast.field(luminance: picked.luminance, variance: picked.variance)
+                } else {
+                    field = self.appearanceField()
+                }
+                self.applyMeasuredField(field)
+            }
+        }
+    }
+
+    private func applyMeasuredField(_ field: MenuBarField) {
+        let previous = measuredField
+        measuredField = field
+        guard let previous else {
+            render()
+            return
+        }
+        let sideChanged = MenuBarContrast.usesQuietDarkPalette(inkLuminance: previous.inkLuminance)
+            != MenuBarContrast.usesQuietDarkPalette(inkLuminance: field.inkLuminance)
+        let plateChanged = previous.needsPlate != field.needsPlate
+        let shifted = abs(previous.inkLuminance - field.inkLuminance) > 0.05
+        if sideChanged || plateChanged || shifted { render() }
+    }
+
+    /// A strip of the menu bar next to the gauges, not the gauges themselves.
+    private func menuBarSampleRect() -> CGRect? {
+        guard let button = statusItem.button, let window = button.window else { return nil }
+        let item = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let screen = window.screen
+            ?? NSScreen.screens.first { $0.frame.intersects(item) }
+            ?? NSScreen.main
+        guard let screen else { return nil }
+        var barH = screen.frame.maxY - screen.visibleFrame.maxY
+        if barH < 8 { barH = 24 }
+        let inset: CGFloat = 3
+        let span: CGFloat = 180
+        let gap: CGFloat = 8
+        var x = item.minX - gap - span
+        var width = span
+        if x < screen.frame.minX {
+            x = min(item.maxX + gap, screen.frame.maxX - 40)
+            width = min(span, screen.frame.maxX - x)
+        }
+        width = min(width, screen.frame.maxX - x)
+        guard width >= 12 else { return nil }
+        let y = screen.frame.maxY - barH + inset
+        let height = max(8, barH - inset * 2)
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    /// Wallpaper behind the menu bar when the pixels cannot be read.
+    /// macOS 26 draws a clear menu bar from this picture.
+    private func wallpaperField() -> MenuBarField? {
+        guard let button = statusItem.button, let window = button.window else { return nil }
+        let item = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let screen = window.screen ?? NSScreen.main
+        guard let screen,
+              let url = NSWorkspace.shared.desktopImageURL(for: screen),
+              let image = NSImage(contentsOf: url),
+              let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let cg = rep.cgImage else { return nil }
+        let options = NSWorkspace.shared.desktopImageOptions(for: screen) ?? [:]
+        let scaling = (options[NSWorkspace.DesktopImageOptionKey.imageScaling] as? NSNumber)?.intValue ?? 3
+        let clips = (options[NSWorkspace.DesktopImageOptionKey.allowClipping] as? NSNumber)?.boolValue ?? false
+        guard let stats = Self.wallpaperColumnStats(
+            image: cg,
+            screen: screen.frame,
+            sample: item,
+            scaling: scaling,
+            clips: clips) else { return nil }
+        guard let picked = MenuBarContrast.pickLuminance(
+            columnLuminance: stats.luminance,
+            columnVariance: stats.variance,
+            preferHighIndex: true) else { return nil }
+        return MenuBarContrast.field(luminance: picked.luminance, variance: picked.variance)
+    }
+
+    /// sRGB 0...1 for one pixel. ScreenCaptureKit SDR frames are BGRA.
+    /// Wallpaper images are often RGBA. Both are handled.
+    private static func srgbPixel(_ image: CGImage, x: Int, y: Int) -> (Double, Double, Double)? {
+        guard x >= 0, y >= 0, x < image.width, y < image.height, image.bitsPerPixel >= 24,
+              let data = image.dataProvider?.data, let ptr = CFDataGetBytePtr(data) else { return nil }
+        let bpp = image.bitsPerPixel / 8
+        let o = y * image.bytesPerRow + x * bpp
+        let alphaFirst = image.alphaInfo == .premultipliedFirst
+            || image.alphaInfo == .first
+            || image.alphaInfo == .noneSkipFirst
+        let little = image.bitmapInfo.contains(.byteOrder32Little)
+        let r: Double
+        let g: Double
+        let b: Double
+        if bpp >= 4 && little && alphaFirst {
+            b = Double(ptr[o]) / 255
+            g = Double(ptr[o + 1]) / 255
+            r = Double(ptr[o + 2]) / 255
+        } else if bpp >= 4 && alphaFirst {
+            r = Double(ptr[o + 1]) / 255
+            g = Double(ptr[o + 2]) / 255
+            b = Double(ptr[o + 3]) / 255
+        } else if bpp >= 3 {
+            r = Double(ptr[o]) / 255
+            g = Double(ptr[o + 1]) / 255
+            b = Double(ptr[o + 2]) / 255
+        } else {
+            return nil
+        }
+        return (r, g, b)
+    }
+
+    /// One relative-luminance mean and variance per column. SDR captures are BGRA.
+    private static func columnStats(_ image: CGImage) -> (luminance: [Double], variance: [Double])? {
+        guard image.width > 0, image.height > 0, image.bitsPerPixel >= 32,
+              let data = image.dataProvider?.data, let ptr = CFDataGetBytePtr(data) else { return nil }
+        let bpp = image.bitsPerPixel / 8
+        let bpr = image.bytesPerRow
+        let alphaFirst = image.alphaInfo == .premultipliedFirst
+            || image.alphaInfo == .first
+            || image.alphaInfo == .noneSkipFirst
+        let bgra = image.bitmapInfo.contains(.byteOrder32Little) && alphaFirst && bpp >= 4
+        let y0 = image.height / 5
+        let y1 = max(y0 + 1, image.height - image.height / 5)
+        var luminance = [Double]()
+        var variance = [Double]()
+        luminance.reserveCapacity(image.width)
+        variance.reserveCapacity(image.width)
+        for x in 0..<image.width {
+            var sum = 0.0
+            var values = [Double]()
+            values.reserveCapacity(y1 - y0)
+            for y in y0..<y1 {
+                let o = y * bpr + x * bpp
+                let r: Double
+                let g: Double
+                let b: Double
+                if bgra {
+                    b = Double(ptr[o]) / 255
+                    g = Double(ptr[o + 1]) / 255
+                    r = Double(ptr[o + 2]) / 255
+                } else if bpp >= 4 && alphaFirst {
+                    r = Double(ptr[o + 1]) / 255
+                    g = Double(ptr[o + 2]) / 255
+                    b = Double(ptr[o + 3]) / 255
+                } else {
+                    r = Double(ptr[o]) / 255
+                    g = Double(ptr[min(o + 1, o + bpp - 1)]) / 255
+                    b = Double(ptr[min(o + 2, o + bpp - 1)]) / 255
+                }
+                let L = MenuBarContrast.relativeLuminance(r: r, g: g, b: b)
+                values.append(L)
+                sum += L
+            }
+            let n = Double(values.count)
+            let mean = n > 0 ? sum / n : 0
+            var spread = 0.0
+            for L in values {
+                let d = L - mean
+                spread += d * d
+            }
+            luminance.append(mean)
+            variance.append(n > 0 ? spread / n : 0)
+        }
+        return (luminance, variance)
+    }
+
+    /// Map a screen rect onto a desktop picture and return column stats.
+    private static func wallpaperColumnStats(image: CGImage,
+                                            screen: CGRect,
+                                            sample: CGRect,
+                                            scaling: Int,
+                                            clips: Bool) -> (luminance: [Double], variance: [Double])? {
+        let imgW = CGFloat(image.width)
+        let imgH = CGFloat(image.height)
+        guard imgW > 1, imgH > 1, screen.width > 1, screen.height > 1 else { return nil }
+        // NSImageScaling: 0 proportional down, 1 stretch, 2 none, 3 proportional up or down.
+        let stretch = scaling == 1
+        let none = scaling == 2
+        let fit = !stretch && !none && !clips
+        var scale = max(screen.width / imgW, screen.height / imgH)
+        var drawnW = imgW * scale
+        var drawnH = imgH * scale
+        if stretch {
+            drawnW = screen.width
+            drawnH = screen.height
+            scale = 1
+        } else if fit {
+            scale = min(screen.width / imgW, screen.height / imgH)
+            drawnW = imgW * scale
+            drawnH = imgH * scale
+        } else if none {
+            drawnW = imgW
+            drawnH = imgH
+            scale = 1
+        }
+        let offsetX = (drawnW - screen.width) / 2
+        let offsetY = (drawnH - screen.height) / 2
+        // Sample the top 24pt of the picture across the gauge's x range.
+        let band = sample.insetBy(dx: 0, dy: 0)
+        let localX = band.minX - screen.minX
+        let localTop = screen.maxY - min(screen.maxY, band.maxY)
+        let localH = min(24, screen.maxY - screen.minY)
+        func imagePoint(_ sx: CGFloat, _ syFromTop: CGFloat) -> (Int, Int)? {
+            let ix: CGFloat
+            let iy: CGFloat
+            if stretch {
+                ix = sx / screen.width * imgW
+                iy = syFromTop / screen.height * imgH
+            } else {
+                ix = (sx + offsetX) / max(scale, 0.001)
+                iy = (syFromTop + offsetY) / max(scale, 0.001)
+            }
+            let px = Int(ix.rounded())
+            let py = Int(iy.rounded())
+            guard px >= 0, py >= 0, px < image.width, py < image.height else { return nil }
+            return (px, py)
+        }
+        let steps = 24
+        var luminance = [Double]()
+        var variance = [Double]()
+        for step in 0..<steps {
+            let sx = localX + (band.width * CGFloat(step) / CGFloat(steps))
+            var sum = 0.0
+            var values = [Double]()
+            for row in 0..<8 {
+                let sy = localTop + localH * CGFloat(row) / 8
+                guard let (px, py) = imagePoint(sx, sy),
+                      let rgb = Self.srgbPixel(image, x: px, y: py) else { continue }
+                let L = MenuBarContrast.relativeLuminance(r: rgb.0, g: rgb.1, b: rgb.2)
+                values.append(L)
+                sum += L
+            }
+            guard !values.isEmpty else { continue }
+            let mean = sum / Double(values.count)
+            var spread = 0.0
+            for L in values {
+                let d = L - mean
+                spread += d * d
+            }
+            luminance.append(mean)
+            variance.append(spread / Double(values.count))
+        }
+        guard !luminance.isEmpty else { return nil }
+        return (luminance, variance)
     }
 
     func menuBarPreview(onDark: Bool) -> NSImage {
@@ -6265,13 +6614,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .colour: return statusInk(pct)
         case .greyscale:
             switch Level(pct) {
-            case .high: return .labelColor
-            case .mid:  return NSColor.labelColor.withAlphaComponent(0.62)
-            case .low:  return NSColor.labelColor.withAlphaComponent(0.38)
+            case .high: return barNeutral()
+            case .mid:  return barNeutral().withAlphaComponent(0.62)
+            case .low:  return barNeutral().withAlphaComponent(0.38)
             }
         case .battery:
             // High stays the quiet red on a dark bar, and the deeper ink on a light bar.
-            return Level(pct) == .high ? statusInk(pct) : .labelColor
+            return Level(pct) == .high ? statusInk(pct) : barNeutral()
         }
     }
 
@@ -7403,7 +7752,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Battery shell like the system battery icon: 1pt hairline outline,
     /// pixel-aligned, with a small cap nub past the right edge.
     private func drawShell(_ body: NSRect) {
-        let tint = NSColor.labelColor.withAlphaComponent(0.5)
+        let tint = barNeutral().withAlphaComponent(0.5)
         let r = body.height * 0.28
         let outline = NSBezierPath(roundedRect: body.insetBy(dx: 0.5, dy: 0.5),
                                    xRadius: r, yRadius: r)
@@ -7435,7 +7784,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let capExt: CGFloat = 2.0   // gap + cap nub beyond the shell
         let gap: CGFloat = 3, gaugeGap: CGFloat = 6, pad: CGFloat = 0
         let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        let numAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
+        let numAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: barNeutral()]
 
         let items: [(g: Gauge, s: NSAttributedString, w: CGFloat)] = gauges.map { g in
             let shown = batteryDisplayPercent(g.percent)
@@ -7466,7 +7815,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let used = displayPercent(gauges)
         let shown = batteryDisplayPercent(used)
         return NSAttributedString(string: "\(Int(shown))%",
-                                  attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+                                  attributes: [.font: font, .foregroundColor: barNeutral()])
     }
 
     /// One rounded column per gauge over a faint full-height track,
@@ -7485,7 +7834,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let baseY = ((h - chartH) / 2).rounded()
             for (i, g) in gauges.enumerated() {
                 let x = pad + CGFloat(i) * (barW + barGap)
-                NSColor.labelColor.withAlphaComponent(0.18).setFill()
+                barTrack().setFill()
                 NSBezierPath(roundedRect: NSRect(x: x, y: baseY, width: barW, height: chartH),
                              xRadius: barW / 2, yRadius: barW / 2).fill()
                 let p = max(0, min(100, g.percent)) / 100
@@ -7519,7 +7868,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let baseY = ((h - chartH) / 2).rounded()
             for (i, g) in gauges.enumerated() {
                 let y = baseY + chartH - rowH - CGFloat(i) * (rowH + rowGap)
-                NSColor.labelColor.withAlphaComponent(0.18).setFill()
+                barTrack().setFill()
                 NSBezierPath(roundedRect: NSRect(x: pad, y: y, width: trackW, height: rowH),
                              xRadius: rowH / 2, yRadius: rowH / 2).fill()
                 let p = max(0, min(100, g.percent)) / 100
@@ -7553,7 +7902,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let track = NSBezierPath()
                 track.appendArc(withCenter: c, radius: r, startAngle: 0, endAngle: 360)
                 track.lineWidth = stroke
-                NSColor.labelColor.withAlphaComponent(0.18).setStroke()
+                barTrack().setStroke()
                 track.stroke()
                 let p = max(0, min(100, g.percent)) / 100
                 guard p > 0.01 else { continue }

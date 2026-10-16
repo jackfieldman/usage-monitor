@@ -15,7 +15,7 @@ RES="$APP/Contents/Resources"
 mkdir -p "$MACOS" "$RES"
 
 swiftc -O UsageCore.swift UsageMonitor.swift main.swift -o "$MACOS/UsageMonitor" \
-    -framework AppKit -framework CoreWLAN -framework IOKit
+    -framework AppKit -framework ScreenCaptureKit -framework CoreWLAN -framework IOKit
 
 # App icon — used by Finder, the Dock, and macOS notifications.
 cp AppIcon.icns "$RES/AppIcon.icns"
@@ -33,8 +33,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>      <string>com.usagemonitor.app</string>
     <key>CFBundleExecutable</key>      <string>UsageMonitor</string>
     <key>CFBundleIconFile</key>        <string>AppIcon</string>
-    <key>CFBundleVersion</key>         <string>2.13.1</string>
-    <key>CFBundleShortVersionString</key> <string>2.13.1</string>
+    <key>CFBundleVersion</key>         <string>2.13.2</string>
+    <key>CFBundleShortVersionString</key> <string>2.13.2</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>NSPrincipalClass</key>        <string>NSApplication</string>
     <key>LSUIElement</key>             <true/>
