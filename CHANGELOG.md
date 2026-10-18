@@ -8,6 +8,12 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.13.3
+
+- **Prompts open in front.** A click that asks a question, such as Caffeinate On with a hotspot set, closes the panel or menu first. The question then opens on top and takes the click.
+- **One prompt per click.** Turning Caffeinate on from the menu or Settings shows the Wi‑Fi question or the “now active” note, not both. A repeated click no longer stacks a second prompt.
+- **Same rule everywhere.** Hotspot, password, status, provider, install, and report prompts follow it too. The More button closes the panel before the full menu opens.
+
 ## 2.13.2
 
 - **Menu bar text follows the background.** Letters and percent colours stay readable when the menu bar is light, dark, or tinted by the wallpaper. A plain black or white bar keeps the same colours as before. A busy wallpaper gets a quiet backing behind the gauges.
