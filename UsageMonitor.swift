@@ -173,6 +173,10 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.13.3", "Prompts open in front", [
+            "A click that asks a question closes the panel or menu first",
+            "One click shows one prompt, on top and ready for the click",
+        ]),
         ("2.13.2", "Menu bar text follows the background", [
             "Percent colours and letters stay readable on a light, dark, or tinted menu bar",
             "A busy wallpaper gets a quiet backing behind the gauges",
@@ -464,7 +468,7 @@ final class WhatsNewController: NSObject, NSWindowDelegate {
     func present() {
         WhatsNew.markSeen()
         if window == nil { build() }
-        NSApp.activate(ignoringOtherApps: true)
+        AppDelegate.bringAppForward()
         window?.center()
         window?.makeKeyAndOrderFront(nil)
     }
@@ -2614,7 +2618,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         choice = StartSystem.suggested { needsReauth($0) }
         if window == nil { makeWindow() }
         show(.pick)
-        NSApp.activate(ignoringOtherApps: true)
+        AppDelegate.bringAppForward()
         window?.center()
         window?.makeKeyAndOrderFront(nil)
     }
@@ -4089,9 +4093,8 @@ final class CaffeinateNoticeController: NSObject, NSWindowDelegate {
         let h = max(320, fitting.height + 60)
         panel.setContentSize(NSSize(width: 420, height: h))
         panel.center()
-        NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
         window = panel
+        AppDelegate.presentFront(panel)
     }
 
     private func noticeRow(symbol: String, title: String, body: String) -> NSView {
@@ -4821,6 +4824,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let laptopMode = LaptopModeController.shared
     let settingsController = SettingsController()
     let usagePanel = UsagePanelController()
+    /// A prompt is on screen. Only one runs at a time.
+    private(set) var promptOpen = false
+    /// A prompt is waiting for the next turn of the main loop.
+    private var promptQueued = false
+    /// A menu popped from the panel or Settings. Closed before any prompt opens.
+    weak var trackingMenu: NSMenu?
+    /// Self-test hook: sees each prompt window once it is on screen.
+    var promptProbe: ((NSWindow) -> Void)?
     /// Catches a real click on the status item. The button action alone does not.
     private var statusClickMonitor: Any?
     private var lastStatusClickStamp: TimeInterval = -1
@@ -4969,9 +4980,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc func openSetup() { onboarding.present(trouble: lastError) }
+    @objc func openSetup() {
+        usagePanel.close()
+        onboarding.present(trouble: lastError)
+    }
 
     @objc func openSettings() {
+        usagePanel.close()
         settingsController.present(app: self)
     }
 
@@ -5008,13 +5023,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             || event?.modifierFlags.contains(.control) == true
         guard let button = statusItem.button else { return }
         if right {
-            usagePanel.close()
-            button.highlight(true)
-            statusMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
-            button.highlight(false)
+            popStatusMenu()
             return
         }
         usagePanel.toggle(app: self, anchor: button)
+    }
+
+    /// The full menu, under the menu-bar icon. The Usage panel closes first,
+    /// so a prompt from the menu never opens under it.
+    func popStatusMenu() {
+        guard let button = statusItem.button else { return }
+        usagePanel.close()
+        button.highlight(true)
+        statusMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
+        button.highlight(false)
     }
 
     func paceForecast(providerId: String, gauge: Gauge) -> PaceForecast {
@@ -5317,12 +5339,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Downloads the latest signed app into `/Applications` and opens it.
     @objc func installOfficialApp() {
         guard !updating else { return }
+        deferPrompt { [weak self] in self?.installOfficialAppNow() }
+    }
+
+    private func installOfficialAppNow() {
+        guard !updating else { return }
         let ask = NSAlert()
         ask.messageText = "Install the official app"
         ask.informativeText = "This downloads the latest signed Usage Monitor into Applications and opens it."
         ask.addButton(withTitle: "Install")
         ask.addButton(withTitle: "Cancel")
-        guard ask.runModal() == .alertFirstButtonReturn else { return }
+        guard runPrompt(ask) == .alertFirstButtonReturn else { return }
         updating = true
         stopUpdateMarquee(restore: false)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -5335,7 +5362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     fail.messageText = "Could not install"
                     fail.informativeText = result.message
                     fail.addButton(withTitle: "OK")
-                    fail.runModal()
+                    self.deferPrompt { self.runPrompt(fail) }
                     return
                 }
                 if result.replacedRunning {
@@ -5354,11 +5381,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func copyOfficialLink() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(OfficialDownload.diskURL.absoluteString, forType: .string)
-        let note = NSAlert()
-        note.messageText = "Download link copied"
-        note.informativeText = OfficialDownload.diskURL.absoluteString
-        note.addButton(withTitle: "OK")
-        note.runModal()
+        deferPrompt { [weak self] in
+            let note = NSAlert()
+            note.messageText = "Download link copied"
+            note.informativeText = OfficialDownload.diskURL.absoluteString
+            note.addButton(withTitle: "OK")
+            self?.runPrompt(note)
+        }
     }
 
     /// Installs in place and relaunches. A manual failure opens the release
@@ -5673,6 +5702,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func showWhatsNew() {
+        usagePanel.close()
         whatsNew.present()
         // Rebuild next open so the chip disappears after “Got it” / open.
     }
@@ -5841,7 +5871,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func caffeinateGlowClicked() {
-        showCaffeinateNotice(kind: .reminder)
+        deferPrompt { [weak self] in self?.showCaffeinateNotice(kind: .reminder) }
     }
 
     func showCaffeinateNotice(kind: CaffeinateNoticeController.Kind) {
@@ -6789,7 +6819,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     alert.messageText = "Session Report failed"
                     alert.informativeText = error.localizedDescription
                     alert.alertStyle = .warning
-                    alert.runModal()
+                    self?.deferPrompt { self?.runPrompt(alert) }
                 }
             }
         }
@@ -6797,11 +6827,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openLastSessionReport() {
         if !SessionRadar.openLastReport() {
-            let alert = NSAlert()
-            alert.messageText = "No report yet"
-            alert.informativeText = "Choose Scan Last 7 Days or Scan Last 35 Days first."
-            alert.alertStyle = .informational
-            alert.runModal()
+            deferPrompt { [weak self] in
+                let alert = NSAlert()
+                alert.messageText = "No report yet"
+                alert.informativeText = "Choose Scan Last 7 Days or Scan Last 35 Days first."
+                alert.alertStyle = .informational
+                self?.runPrompt(alert)
+            }
         }
     }
 
@@ -6927,12 +6959,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return root
     }
 
-    /// The Usage panel sits at status-bar level, above a normal alert.
-    /// Raise the alert or the click looks frozen behind the panel.
+    // MARK: Prompts (one at a time, never under the panel or a menu)
+
+    /// Close the Usage panel and any open menu. A prompt must never open under them:
+    /// the panel sits at status-bar level and its full-screen click catcher would
+    /// swallow every click meant for the prompt.
+    func closeMenusAndPanel() {
+        usagePanel.close()
+        statusMenu.cancelTracking()
+        trackingMenu?.cancelTracking()
+        trackingMenu = nil
+    }
+
+    /// Every click that opens a prompt or window comes through here. The menu or
+    /// panel closes first. The prompt opens on the next turn of the main loop, after
+    /// the click that asked for it has finished. A second request while one is
+    /// queued or open is dropped, so one click shows one prompt.
+    func deferPrompt(_ body: @escaping () -> Void) {
+        guard !promptOpen, !promptQueued else { return }
+        promptQueued = true
+        closeMenusAndPanel()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.promptQueued = false
+            body()
+        }
+    }
+
+    /// Bring this accessory app forward so its window takes the click.
+    static func bringAppForward() {
+        if #available(macOS 14, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    /// Bring a window forward and make it key. Used for every window a menu opens.
+    static func presentFront(_ window: NSWindow?) {
+        guard let window else { return }
+        bringAppForward()
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
+
+    /// Run one alert as the only prompt on screen, in front and key.
+    /// `runModal` resets the window level to modal-panel, so the level is raised
+    /// again once the modal session runs.
     @discardableResult
-    private func runAlertAbovePanel(_ alert: NSAlert) -> NSApplication.ModalResponse {
-        alert.window.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
-        NSApp.activate(ignoringOtherApps: true)
+    func runPrompt(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        guard !promptOpen else { return .abort }
+        promptOpen = true
+        defer { promptOpen = false }
+        closeMenusAndPanel()
+        Self.bringAppForward()
+        let win = alert.window
+        RunLoop.main.perform(inModes: [.modalPanel]) { [weak self] in
+            win.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
+            win.orderFrontRegardless()
+            win.makeKeyAndOrderFront(nil)
+            self?.promptProbe?(win)
+        }
         return alert.runModal()
     }
 
@@ -6942,14 +7029,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.informativeText = text
         alert.alertStyle = .warning
         alert.addButton(withTitle: "OK")
-        _ = runAlertAbovePanel(alert)
+        _ = runPrompt(alert)
+    }
+
+    /// True when turning Caffeinate on asks about Wi-Fi first.
+    var hotspotConfirmNeeded: Bool {
+        laptopMode.joinHotspotOnActivate
+            && !laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// False when the user cancels the hotspot warning. No prompt when join is off.
     private func confirmHotspotJoinIfNeeded() -> Bool {
-        guard laptopMode.joinHotspotOnActivate,
-              !laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return true }
+        guard hotspotConfirmNeeded else { return true }
         let warn = NSAlert()
         warn.messageText = "About to use Wi‑Fi"
         warn.informativeText = """
@@ -6965,7 +7056,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         warn.alertStyle = .informational
         warn.addButton(withTitle: "Continue")
         warn.addButton(withTitle: "Cancel")
-        return runAlertAbovePanel(warn) == .alertFirstButtonReturn
+        return runPrompt(warn) == .alertFirstButtonReturn
     }
 
     /// Keep-awake is already on. The hotspot join must not block this call.
@@ -6978,33 +7069,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self, !cancelled, !ok else { return }
             guard self.laptopMode.hotspotJoinGenerationNow() == generation,
                   self.laptopMode.isActive else { return }
-            self.showCaffeinateProblem(line)
+            self.deferPrompt { self.showCaffeinateProblem(line) }
         }
     }
 
+    /// Menu and Settings “Turn On”. One click shows at most one window: the Wi-Fi
+    /// question when a hotspot join is set, otherwise the “now active” notice.
     @objc func activateLaptopMode() {
+        deferPrompt { [weak self] in self?.activateLaptopModeNow() }
+    }
+
+    private func activateLaptopModeNow() {
+        let asked = hotspotConfirmNeeded
         guard confirmHotspotJoinIfNeeded() else { return }
         let held = laptopMode.engageKeepAwake()
+        updateCaffeinateGlow()
         render()
-        if !held.ok { showCaffeinateProblem(held.line) }
+        settingsController.reloadIfOpen()
+        if !held.ok {
+            showCaffeinateProblem(held.line)
+        } else if laptopMode.isActive && !asked {
+            showCaffeinateNotice(kind: .activated)
+        }
         guard laptopMode.isActive else { return }
-        showCaffeinateNotice(kind: .activated)
         startHotspotJoinIfNeeded()
     }
 
     /// Usage panel switch. The switch shows the new state before any hotspot join.
+    /// With no question to ask, the panel stays open. A question closes it first.
     func setCaffeinateFromPanel(on: Bool) {
         if !on {
             deactivateLaptopModeQuiet()
             usagePanel.reloadIfVisible()
             return
         }
-        guard confirmHotspotJoinIfNeeded() else { return }
+        if hotspotConfirmNeeded {
+            deferPrompt { [weak self] in self?.engageCaffeinateFromPanel(confirm: true) }
+        } else {
+            engageCaffeinateFromPanel(confirm: false)
+        }
+    }
+
+    private func engageCaffeinateFromPanel(confirm: Bool) {
+        if confirm { guard confirmHotspotJoinIfNeeded() else { return } }
         let held = laptopMode.engageKeepAwake()
         updateCaffeinateGlow()
         render()
         usagePanel.reloadIfVisible()
-        if !held.ok { showCaffeinateProblem(held.line) }
+        settingsController.reloadIfOpen()
+        if !held.ok {
+            let line = held.line
+            deferPrompt { [weak self] in self?.showCaffeinateProblem(line) }
+        }
         guard laptopMode.isActive else { return }
         startHotspotJoinIfNeeded()
     }
@@ -7017,14 +7133,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateCaffeinateGlow()
         render()
         usagePanel.reloadIfVisible()
+        settingsController.reloadIfOpen()
         guard result.ok else {
-            showCaffeinateProblem(result.line)
+            let line = result.line
+            deferPrompt { [weak self] in self?.showCaffeinateProblem(line) }
             return
         }
     }
 
     @objc func deactivateLaptopMode() {
+        deferPrompt { [weak self] in self?.deactivateLaptopModeNow() }
+    }
+
+    private func deactivateLaptopModeNow() {
         deactivateLaptopModeQuiet()
+        settingsController.reloadIfOpen()
         let alert = NSAlert()
         alert.messageText = "Caffeinate Mode is off"
         alert.informativeText = """
@@ -7033,8 +7156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         The Mac’s sleep settings were not changed. Other apps can still keep the Mac awake on their own.
         """
         alert.addButton(withTitle: "OK")
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
+        runPrompt(alert)
     }
 
     /// Turn off without an extra alert (used by the modern notice panel).
@@ -7045,22 +7167,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func showCaffeinateReminderFromMenu() {
-        showCaffeinateNotice(kind: .reminder)
+        deferPrompt { [weak self] in self?.showCaffeinateNotice(kind: .reminder) }
     }
 
     @objc func toggleLaptopJoinHotspot() {
         laptopMode.joinHotspotOnActivate.toggle()
     }
 
+    /// Menu and Settings lid switch. Same path as the panel switch: no prompt
+    /// unless the change fails, and that prompt opens with the menu closed.
     @objc func toggleLaptopClamshell() {
         let next = !laptopMode.lidShutOnActivate
-        _ = laptopMode.applyLidShut(next)
+        let result = laptopMode.applyLidShut(next)
+        updateCaffeinateGlow()
         render()
+        usagePanel.reloadIfVisible()
+        settingsController.reloadIfOpen()
+        if !result.ok {
+            let line = result.line
+            deferPrompt { [weak self] in self?.showCaffeinateProblem(line) }
+        }
     }
 
     @objc func setFavoriteHotspot() {
-        NSApp.activate(ignoringOtherApps: true)
+        deferPrompt { [weak self] in self?.chooseFavoriteHotspot() }
+    }
 
+    /// One question at a time. Each answer opens the next only after the last closed.
+    private func chooseFavoriteHotspot() {
         // Prefer known networks (no admin, no Location). Optional scan after consent.
         var names = laptopMode.preferredNetworkNames()
         if let cur = laptopMode.currentSSID(), !names.contains(where: { $0.caseInsensitiveCompare(cur) == .orderedSame }) {
@@ -7079,7 +7213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         askScan.addButton(withTitle: "Scan nearby…")
         askScan.addButton(withTitle: "Type name…")
         askScan.addButton(withTitle: "Cancel")
-        let pick = askScan.runModal()
+        let pick = runPrompt(askScan)
         if pick == .alertThirdButtonReturn {
             // Type name
             let alert = NSAlert()
@@ -7091,7 +7225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.accessoryView = field
             alert.addButton(withTitle: "Save")
             alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            guard runPrompt(alert) == .alertFirstButtonReturn else { return }
             laptopMode.favoriteHotspot = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             return
         }
@@ -7108,7 +7242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             """
             consent.addButton(withTitle: "Scan")
             consent.addButton(withTitle: "Cancel")
-            guard consent.runModal() == .alertFirstButtonReturn else { return }
+            guard runPrompt(consent) == .alertFirstButtonReturn else { return }
             let scanned = laptopMode.scanNearbyNetworkNames()
             for s in scanned where !names.contains(where: { $0.caseInsensitiveCompare(s) == .orderedSame }) {
                 names.append(s)
@@ -7122,7 +7256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             empty.messageText = "No known networks found"
             empty.informativeText = "Join a hotspot once in System Settings, or use “Type name…”."
             empty.addButton(withTitle: "OK")
-            empty.runModal()
+            runPrompt(empty)
             return
         }
 
@@ -7139,14 +7273,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.accessoryView = popup
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard runPrompt(alert) == .alertFirstButtonReturn else { return }
         laptopMode.favoriteHotspot = popup.titleOfSelectedItem ?? ""
+        settingsController.reloadIfOpen()
     }
 
     @objc func setHotspotPassword() {
+        deferPrompt { [weak self] in self?.askHotspotPassword() }
+    }
+
+    private func askHotspotPassword() {
         var ssid = laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
         if ssid.isEmpty {
-            setFavoriteHotspot()
+            chooseFavoriteHotspot()
             ssid = laptopMode.favoriteHotspot.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !ssid.isEmpty else { return }
         }
@@ -7158,20 +7297,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.accessoryView = field
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard runPrompt(alert) == .alertFirstButtonReturn else { return }
         laptopMode.saveHotspotPassword(field.stringValue, for: ssid)
     }
 
     @objc func showLaptopModeProof() {
+        deferPrompt { [weak self] in self?.showLaptopModeProofNow() }
+    }
+
+    private func showLaptopModeProofNow() {
         let proof = laptopMode.refreshProof()
         let alert = NSAlert()
         alert.messageText = "Caffeinate Mode status"
         alert.informativeText = proof
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Copy")
-        NSApp.activate(ignoringOtherApps: true)
-        let resp = alert.runModal()
+        let resp = runPrompt(alert)
         if resp == .alertSecondButtonReturn {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(proof, forType: .string)
@@ -7496,6 +7637,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func renameProvider(_ sender: NSMenuItem) {
+        let item = sender
+        deferPrompt { [weak self] in self?.renameProviderNow(item) }
+    }
+
+    private func renameProviderNow(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String,
               let cfg = providerConfigs.first(where: { $0.id == id }) else { return }
         let alert = NSAlert()
@@ -7506,8 +7652,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.accessoryView = field
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard runPrompt(alert) == .alertFirstButtonReturn else { return }
         let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
         ProviderStore.update(id) { $0.displayName = name }
@@ -7520,6 +7665,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func setProviderLetter(_ sender: NSMenuItem) {
+        let item = sender
+        deferPrompt { [weak self] in self?.setProviderLetterNow(item) }
+    }
+
+    private func setProviderLetterNow(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String,
               let cfg = providerConfigs.first(where: { $0.id == id }) else { return }
         let alert = NSAlert()
@@ -7530,8 +7680,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.accessoryView = field
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard runPrompt(alert) == .alertFirstButtonReturn else { return }
         let letter = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard let ch = letter.first else { return }
         ProviderStore.update(id) { $0.letter = String(ch) }
@@ -7554,6 +7703,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func addProvider() {
+        deferPrompt { [weak self] in self?.addProviderNow() }
+    }
+
+    private func addProviderNow() {
         let present = Set(providerConfigs.map(\.kind))
         // Prefer kinds not yet added; still allow a second slot of an existing kind
         // (e.g. “Claude Work” + “Claude Personal”) with a unique id.
@@ -7585,8 +7738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.accessoryView = popup
         alert.addButton(withTitle: "Add")
         alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn,
+        guard runPrompt(alert) == .alertFirstButtonReturn,
               let raw = popup.selectedItem?.representedObject as? String,
               let kind = ProviderKind(rawValue: raw) else { return }
         var all = providerConfigs
@@ -8022,6 +8174,11 @@ final class UsagePanelController: NSObject {
         anchor?.highlight(false)
         disarm()
     }
+
+    /// True while the card or its click catcher is on screen.
+    var isOpen: Bool { panel.isVisible || catcher.isVisible }
+    /// The card window. The prompt self-test clicks inside it.
+    var cardWindow: NSWindow { panel }
 
     func reloadIfVisible() {
         guard panel.isVisible, app != nil, anchor != nil else { return }
@@ -8721,9 +8878,11 @@ final class UsagePanelController: NSObject {
         NSApp.terminate(nil)
     }
 
+    /// More closes the panel, then opens the full menu under the menu-bar icon.
     @objc private func moreClicked(_ sender: NSButton) {
         guard let app else { return }
-        app.statusMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+        close()
+        DispatchQueue.main.async { app.popStatusMenu() }
     }
 
     @objc private func sessionClicked(_ sender: SessionButton) {
@@ -8873,8 +9032,13 @@ final class SettingsController: NSObject {
         self.app = app
         if window == nil { window = makeWindow() }
         refill()
-        NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
+        AppDelegate.presentFront(window)
+    }
+
+    /// Redraw after a change made elsewhere, without stealing focus.
+    func reloadIfOpen() {
+        guard let win = window, win.isVisible else { return }
+        refill()
     }
 
     private func makeWindow() -> NSWindow {
@@ -9230,6 +9394,8 @@ final class SettingsController: NSObject {
 
     private func pop(_ item: NSMenuItem?, _ sender: NSButton) {
         guard let menu = item?.submenu else { return }
+        app?.trackingMenu = menu
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+        if app?.trackingMenu === menu { app?.trackingMenu = nil }
     }
 }

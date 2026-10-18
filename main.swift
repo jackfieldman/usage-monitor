@@ -141,6 +141,136 @@ if CommandLine.arguments.contains("--laptop-mode-self-test") {
     }
 }
 
+// Prompt self-test: a click that asks a question closes the Usage panel and any
+// menu first, shows exactly one prompt, and that prompt sits above every other
+// window of this app. Every prompt is cancelled, so nothing turns on.
+//   UsageMonitor.app/Contents/MacOS/UsageMonitor --prompt-self-test
+if CommandLine.arguments.contains("--prompt-self-test") {
+    setbuf(stdout, nil)
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    let delegate = AppDelegate()   // not app.delegate: no polling, no update check
+    let lm = delegate.laptopMode
+    let saved = (lm.joinHotspotOnActivate, lm.favoriteHotspot, lm.isActive, lm.lidShutOnActivate)
+    func restore() {
+        lm.joinHotspotOnActivate = saved.0
+        lm.favoriteHotspot = saved.1
+        lm.isActive = saved.2
+        lm.lidShutOnActivate = saved.3
+    }
+    var failures = 0
+    func check(_ ok: Bool, _ label: String) {
+        print(ok ? "PASS: \(label)" : "FAIL: \(label)")
+        if !ok { failures += 1 }
+    }
+    struct Seen { var level: Int; var panelOpen: Bool; var topmost: Bool; var otherPrompts: Int; var key: Bool }
+    var seen: [Seen] = []
+    delegate.promptProbe = { win in
+        let others = NSApp.windows.filter { $0 !== win && $0.isVisible && $0.level.rawValue < NSWindow.Level.statusBar.rawValue + 2 && !($0.className.contains("StatusBar")) }
+        let higher = NSApp.windows.filter { $0 !== win && $0.isVisible && $0.level.rawValue >= win.level.rawValue && !$0.className.contains("StatusBar") }
+        let otherPrompts = NSApp.windows.filter { $0 !== win && $0.isVisible && $0.className.contains("Alert") }.count
+        _ = others
+        seen.append(Seen(level: win.level.rawValue, panelOpen: delegate.usagePanel.isOpen,
+                         topmost: higher.isEmpty, otherPrompts: otherPrompts, key: win.isKeyWindow))
+        // Cancel, so nothing is engaged and no Wi-Fi join starts.
+        let t = Timer(timeInterval: 0.3, repeats: false) { _ in NSApp.abortModal() }
+        RunLoop.main.add(t, forMode: .modalPanel)
+    }
+    func findView(_ v: NSView, label: String) -> NSView? {
+        if v.accessibilityLabel() == label { return v }
+        for sub in v.subviews { if let hit = findView(sub, label: label) { return hit } }
+        return nil
+    }
+    func click(_ view: NSView, in window: NSWindow) {
+        let center = view.convert(NSPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            if let e = NSEvent.mouseEvent(with: type, location: center, modifierFlags: [],
+                                          timestamp: ProcessInfo.processInfo.systemUptime,
+                                          windowNumber: window.windowNumber, context: nil,
+                                          eventNumber: 0, clickCount: 1, pressure: 1) {
+                window.sendEvent(e)
+            }
+        }
+    }
+    func after(_ s: Double, _ body: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + s, execute: body)
+    }
+
+    lm.isActive = false
+    lm.joinHotspotOnActivate = true
+    lm.favoriteHotspot = "UsageMonitor-SelfTest"
+    delegate.statusItem.button?.title = "UM"
+    print("=== Prompt self-test ===")
+    after(0.5) {
+        // 1) Usage panel: Caffeinate On, clicked twice fast.
+        guard let button = delegate.statusItem.button else { check(false, "status button"); restore(); exit(1) }
+        delegate.usagePanel.toggle(app: delegate, anchor: button)
+        check(delegate.usagePanel.isOpen, "Usage panel opens")
+        let card = delegate.usagePanel.cardWindow
+        guard let root = card.contentView, let on = findView(root, label: "Caffeinate on") else {
+            check(false, "Caffeinate On switch found"); restore(); exit(1)
+        }
+        click(on, in: card)
+        click(on, in: card)
+        after(1.2) {
+            check(seen.count == 1, "panel On (double click) shows exactly one prompt (saw \(seen.count))")
+            if let s = seen.first {
+                check(!s.panelOpen, "panel and click catcher closed before the prompt")
+                check(s.level > NSWindow.Level.statusBar.rawValue, "prompt above status-bar level (level \(s.level))")
+                check(s.topmost, "no window of this app above the prompt")
+                check(s.otherPrompts == 0, "no second prompt window")
+                print("INFO: prompt key=\(s.key) (a CLI run cannot activate an app; a real click does)")
+            }
+            check(!lm.isActive, "cancel left Caffeinate off")
+
+            // 2) Menu / Settings Turn On, handler fired twice.
+            seen.removeAll()
+            delegate.usagePanel.toggle(app: delegate, anchor: button)
+            delegate.openSettings()
+            delegate.activateLaptopMode()
+            delegate.activateLaptopMode()
+            after(1.2) {
+                check(seen.count == 1, "menu Turn On fired twice shows exactly one prompt (saw \(seen.count))")
+                if let s = seen.first {
+                    check(!s.panelOpen, "menu path closed the panel first")
+                    check(s.topmost, "prompt above the Settings window")
+                }
+                let notices = NSApp.windows.filter { $0.isVisible && $0 is NSPanel && $0.styleMask.contains(.titled) }
+                check(notices.isEmpty, "cancel shows no second window (no Caffeinate notice)")
+                check(!lm.isActive, "cancel left Caffeinate off")
+
+                // 3) Every other prompt entry point: one prompt each, panel closed.
+                let entries: [(String, () -> Void)] = [
+                    ("Choose Favorite Hotspot", { delegate.setFavoriteHotspot() }),
+                    ("Show Status", { delegate.showLaptopModeProof() }),
+                    ("Add provider", { delegate.addProvider() }),
+                    ("Copy download link", { delegate.copyOfficialLink() }),
+                    ("Install official app", { delegate.installOfficialApp() }),
+                ]
+                func runEntry(_ i: Int) {
+                    guard i < entries.count else {
+                        restore()
+                        print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
+                        exit(failures == 0 ? 0 : 1)
+                    }
+                    seen.removeAll()
+                    delegate.usagePanel.toggle(app: delegate, anchor: button)
+                    if !delegate.usagePanel.isOpen { delegate.usagePanel.toggle(app: delegate, anchor: button) }
+                    entries[i].1()
+                    entries[i].1()
+                    after(1.0) {
+                        let ok = seen.count == 1 && seen.allSatisfy { !$0.panelOpen && $0.topmost }
+                        check(ok, "\(entries[i].0): one prompt, panel closed, in front (saw \(seen.count))")
+                        runEntry(i + 1)
+                    }
+                }
+                runEntry(0)
+            }
+        }
+    }
+    app.run()
+}
+
 // Headless Session Report (smoke / automation):
 //   UsageMonitor.app/Contents/MacOS/UsageMonitor --session-report [--days 7|35] [--titles]
 if CommandLine.arguments.contains("--session-report") {
