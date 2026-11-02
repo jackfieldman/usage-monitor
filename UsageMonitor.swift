@@ -91,16 +91,14 @@ struct IconCluster {
     let letter: String
     let name: String
     let gauges: [Gauge]
+    var providerId: String = ""
 }
 
 /// Timing for the menu-bar pace ticker.
 enum PaceTickerMotion {
-    /// The percent stays still this long between passes.
-    static let restSeconds: TimeInterval = 40
-    /// Slow enough to read in a narrow slot.
-    static let pointsPerSecond: CGFloat = 20
+    /// The percent stays still this long between fades.
+    static let restSeconds: TimeInterval = 20
     static let frame: TimeInterval = 1.0 / 30
-    static let gap: CGFloat = 10
 }
 
 /// How the menu-bar packs multiple providers.
@@ -183,6 +181,11 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.14.1", "Pace fades in each gauge", [
+            "Each gauge's percent fades to its burn per hour, then to the forecast for the next 6 hours, then back",
+            "Nothing scrolls, and the menu bar keeps its width",
+            "A gauge with no pace yet keeps its percent",
+        ]),
         ("2.14.0", "Pace scrolls in the menu bar", [
             "The percent slides away, and the burn per hour and the forecast for the next 6 hours scroll past",
             "If the limit resets sooner, the forecast stops at the reset",
@@ -4881,6 +4884,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var paceAnimTimer: Timer?
     var paceTickerActive = false
     var paceTickerLastEnd = Date()
+    var paceTickerCache: [String: PaceTicker] = [:]
     var monthSpend: Double?
     var costError: String?
     var hasAdminKey = false
@@ -4902,15 +4906,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .highestOnly:
             let flat = shown.flatMap { g in g.gauges.map { (g.config, $0) } }
             guard let best = flat.max(by: { $0.1.percent < $1.1.percent }) else { return [] }
-            return [IconCluster(letter: best.0.letter, name: best.0.displayName, gauges: [best.1])]
+            return [IconCluster(letter: best.0.letter, name: best.0.displayName, gauges: [best.1],
+                                providerId: best.0.id)]
         case .allGauges:
             return shown.map { group in
-                IconCluster(letter: group.config.letter, name: group.config.displayName, gauges: group.gauges)
+                IconCluster(letter: group.config.letter, name: group.config.displayName, gauges: group.gauges,
+                            providerId: group.config.id)
             }
         case .perProvider:
             return shown.compactMap { group in
                 guard let g = Self.primaryGauge(for: group) else { return nil }
-                return IconCluster(letter: group.config.letter, name: group.config.displayName, gauges: [g])
+                return IconCluster(letter: group.config.letter, name: group.config.displayName, gauges: [g],
+                                   providerId: group.config.id)
             }
         }
     }
@@ -5531,78 +5538,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let t = marqueeAnimTimer { RunLoop.main.add(t, forMode: .common) }
     }
 
-    // MARK: Pace ticker (percent → burn per hour and six-hour forecast → percent)
+    // MARK: Pace fade (each gauge's percent → burn per hour → six-hour forecast → percent)
 
     var paceTickerEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "paceTicker.enabled") as? Bool ?? true }
         set {
             UserDefaults.standard.set(newValue, forKey: "paceTicker.enabled")
-            if !newValue { stopPaceTicker(restore: true) }
+            stopPaceTicker(restore: false)
+            render()
         }
     }
 
-    /// The scrolling line: "C: +3.2%/h · 76% in 6h", one slot per shown provider.
-    /// Built once per pass, so the animation never reads stored samples.
-    func paceTickerLine() -> NSAttributedString? {
-        let comfortable = density == .comfortable
-        let letterFont = NSFont.systemFont(ofSize: comfortable ? 11.5 : 11, weight: .semibold)
-        let numFont = NSFont.monospacedDigitSystemFont(ofSize: comfortable ? 11.5 : 11, weight: .medium)
-        let ink = barNeutral()
-        let line = NSMutableAttributedString()
-        let now = Date()
-        for group in providerGauges where group.config.showInMenuBar && group.config.enabled {
-            guard let g = Self.primaryGauge(for: group) else { continue }
-            let pace = paceForecast(providerId: group.config.id, gauge: g)
-            guard let tick = PaceMath.ticker(percent: g.percent, burnPerHour: pace.burnPerHour,
-                                             resetsAt: g.resetsAt, now: now) else { continue }
-            if line.length > 0 {
-                line.append(NSAttributedString(string: "   ", attributes: [.font: numFont]))
+    /// Off when the setting is off or Reduce Motion is on. Then the slots keep their old width.
+    var paceFadeOn: Bool {
+        paceTickerEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    /// Rate and forecast per shown gauge, read once per render so frames never touch stored samples.
+    func refreshPaceTickerCache() {
+        var cache: [String: PaceTicker] = [:]
+        if paceFadeOn {
+            let now = Date()
+            for c in iconClusters {
+                guard let g = c.gauges.max(by: { $0.percent < $1.percent }) else { continue }
+                let pace = paceForecast(providerId: c.providerId, gauge: g)
+                if let tick = PaceMath.ticker(percent: g.percent, burnPerHour: pace.burnPerHour,
+                                              resetsAt: g.resetsAt, now: now) {
+                    cache[c.providerId + "|" + g.label] = tick
+                }
             }
-            let letter = group.config.letter.count == 1 ? "\(group.config.letter): " : "\(group.config.letter) "
-            line.append(NSAttributedString(string: letter, attributes: [.font: letterFont, .foregroundColor: ink]))
-            line.append(NSAttributedString(string: "\(tick.rate) · ",
-                                           attributes: [.font: numFont, .foregroundColor: ink]))
-            line.append(NSAttributedString(string: "\(Int(tick.projected.rounded()))%",
-                                           attributes: [.font: numFont, .foregroundColor: statusInk(tick.projected)]))
-            line.append(NSAttributedString(string: " \(tick.horizon)",
-                                           attributes: [.font: numFont, .foregroundColor: ink]))
         }
-        return line.length > 0 ? line : nil
+        paceTickerCache = cache
     }
 
-    /// One slow pass: the gauges slide out left, the pace line follows, and the
-    /// gauges slide back in. The slot keeps the gauges' width, so nothing beside it moves.
+    func paceTicker(for c: IconCluster) -> PaceTicker? {
+        guard let g = c.gauges.max(by: { $0.percent < $1.percent }) else { return nil }
+        return paceTickerCache[c.providerId + "|" + g.label]
+    }
+
+    /// One pass: in each gauge's own slot the percent fades to the burn per hour,
+    /// then to the forecast, then back. Slots keep their width, so nothing moves.
     func startPaceTicker() {
-        guard paceTickerEnabled, !paceTickerActive, !marqueeActive, !updating else { return }
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        guard paceFadeOn, !paceTickerActive, !marqueeActive, !updating else { return }
         guard let button = statusItem.button else { return }
-        if iconShape == .hbars && iconClusters.count > 1 { return }
         let clusters = iconClusters
-        guard !clusters.isEmpty, let line = paceTickerLine() else { return }
-        let gauges = clusterImage(clusters)
-        let viewport = max(1, ceil(gauges.size.width))
-        let gap = PaceTickerMotion.gap
-        let lineW = ceil(line.size().width)
-        let travel = viewport + gap + lineW + gap
-        let h: CGFloat = 18
-        let lineY = ((h - line.size().height) / 2).rounded()
-        var offset: CGFloat = 0
+        guard !clusters.isEmpty, !(clusters.count == 1 && clusters[0].gauges.count > 1) else { return }
+        if iconShape == .hbars && clusters.count > 1 { return }
+        guard clusters.contains(where: { paceTicker(for: $0) != nil }) else { return }
         paceTickerActive = true
+        let start = Date()
+        var last: (Double, Double, Double)? = nil
 
         paceAnimTimer?.invalidate()
         paceAnimTimer = Timer.scheduledTimer(withTimeInterval: PaceTickerMotion.frame, repeats: true) { [weak self] t in
             guard let self else { t.invalidate(); return }
-            offset = min(travel, offset + PaceTickerMotion.pointsPerSecond * CGFloat(PaceTickerMotion.frame))
-            let x = offset
-            let frame = NSImage(size: NSSize(width: viewport, height: h), flipped: false) { _ in
-                NSRect(x: 0, y: 0, width: viewport, height: h).clip()
-                gauges.draw(at: NSPoint(x: -x, y: 0), from: .zero, operation: .sourceOver, fraction: 1)
-                line.draw(at: NSPoint(x: -x + viewport + gap, y: lineY))
-                gauges.draw(at: NSPoint(x: -x + travel, y: 0), from: .zero, operation: .sourceOver, fraction: 1)
-                return true
+            let elapsed = Date().timeIntervalSince(start)
+            if elapsed >= PaceFade.duration {
+                self.stopPaceTicker(restore: true)
+                return
             }
+            let w = PaceFade.weights(at: elapsed)
+            // Holds need one frame, not thirty a second.
+            if let last, last == (w.percent, w.rate, w.forecast) { return }
+            last = (w.percent, w.rate, w.forecast)
+            let frame = self.clusterImage(self.iconClusters, fade: w)
             self.applyMenuBarImage(frame, to: self.statusItem, button: button)
-            if offset >= travel { self.stopPaceTicker(restore: true) }
         }
         if let t = paceAnimTimer { RunLoop.main.add(t, forMode: .common) }
     }
@@ -5849,7 +5849,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             applyMenuBarImage(warningImage(), to: statusItem, button: button)
             button.toolTip = lastError
         } else {
-            // The pace ticker owns the image while it scrolls. It redraws when it ends.
+            refreshPaceTickerCache()
+            // The pace fade owns the image while it runs. It redraws when it ends.
             if !paceTickerActive {
                 applyMenuBarImage(clusterImage(clusters), to: statusItem, button: button)
             }
@@ -6003,7 +6004,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Draws letter-badged clusters, respecting **Icon Shape** for the glyph
     /// next to each letter (`G:▮ 11%` / battery / rings / horizontal).
     /// Layout is intentionally tight — menu-bar real estate is scarce.
-    func clusterImage(_ clusters: [IconCluster]) -> NSImage {
+    func clusterImage(_ clusters: [IconCluster],
+                      fade: (percent: Double, rate: Double, forecast: Double)? = nil) -> NSImage {
         // Classic multi-gauge shapes when one provider shows all its gauges.
         if clusters.count == 1, clusters[0].gauges.count > 1 {
             let gauges = clusters[0].gauges
@@ -6042,20 +6044,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         struct Laid {
             let letter: NSAttributedString
-            let pct: NSAttributedString
+            /// The percent, then the rate and forecast when pace is known. Each drawn at its fade weight.
+            let texts: [(NSAttributedString, Double)]
+            let slotW: CGFloat
             let percent: Double
             let width: CGFloat
         }
+        let w = fade ?? (1, 0, 0)
         let laid: [Laid] = clusters.map { c in
             let used = c.gauges.map(\.percent).max() ?? 0
             let shown = batteryDisplayPercent(used)
             let badge = c.letter.count == 1 ? "\(c.letter):" : c.letter
             let letter = NSAttributedString(string: badge,
                 attributes: [.font: letterFont, .foregroundColor: ink])
-            let pct = NSAttributedString(string: "\(Int(shown))%",
-                attributes: [.font: numFont, .foregroundColor: statusInk(used)])
-            let w = ceil(letter.size().width) + letterGap + glyphW + pctGap + ceil(pct.size().width)
-            return Laid(letter: letter, pct: pct, percent: used, width: w)
+            func text(_ parts: [(String, NSColor)], _ alpha: Double) -> NSAttributedString {
+                let out = NSMutableAttributedString()
+                for (str, color) in parts {
+                    out.append(NSAttributedString(string: str, attributes: [
+                        .font: numFont, .foregroundColor: color.withAlphaComponent(CGFloat(alpha))]))
+                }
+                return out
+            }
+            // A gauge with no known pace keeps its percent still while the others fade.
+            let tick = paceTicker(for: c)
+            let pctWeight = tick == nil ? 1 : w.percent
+            var texts = [(text([("\(Int(shown))%", statusInk(used))], pctWeight), pctWeight)]
+            if let tick {
+                texts.append((text([(tick.compactRate, ink)], w.rate), w.rate))
+                texts.append((text([(tick.compactHorizon + " ", ink),
+                                    ("\(Int(tick.projected.rounded()))%", statusInk(tick.projected))],
+                                   w.forecast), w.forecast))
+            }
+            let slotW = texts.map { ceil($0.0.size().width) }.max() ?? 0
+            let width = ceil(letter.size().width) + letterGap + glyphW + pctGap + slotW
+            return Laid(letter: letter, texts: texts, slotW: slotW, percent: used, width: width)
         }
         // No trailing gap after the last cluster (only between items).
         let total = pad * 2 + laid.reduce(0) { $0 + $1.width } + gap * CGFloat(max(0, laid.count - 1))
@@ -6074,9 +6096,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.drawShapeGlyph(shape, usedPercent: item.percent, in: gRect)
                 x += glyphW + pctGap
 
-                let py = ((h - item.pct.size().height) / 2).rounded()
-                item.pct.draw(at: NSPoint(x: x, y: py))
-                x += ceil(item.pct.size().width)
+                for (text, weight) in item.texts where weight > 0.01 {
+                    let py = ((h - text.size().height) / 2).rounded()
+                    text.draw(at: NSPoint(x: x, y: py))
+                }
+                x += item.slotW
                 if idx < laid.count - 1 { x += gap }
             }
             return true
@@ -9241,7 +9265,7 @@ final class SettingsController: NSObject {
             stack.addArrangedSubview(check("Consolidated icon", app.consolidated, #selector(consolidatedClicked(_:))))
         }
         stack.addArrangedSubview(button("Which limit the percent follows…", #selector(showBarPercent(_:))))
-        stack.addArrangedSubview(check("Scroll pace and 6-hour forecast", app.paceTickerEnabled, #selector(paceTickerClicked(_:))))
+        stack.addArrangedSubview(check("Fade in pace and 6-hour forecast", app.paceTickerEnabled, #selector(paceTickerClicked(_:))))
         stack.addArrangedSubview(check("Open at Login", app.loginEnabled, #selector(loginClicked(_:))))
         return stack
     }

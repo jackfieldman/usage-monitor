@@ -345,7 +345,34 @@ struct PaceTicker: Equatable {
     var rate: String        // "+3.2%/h"
     var projected: Double   // expected percent used at the horizon, capped at 100
     var horizon: String     // "in 6h" or "by reset"
+    var hoursAhead: Double  // 6, or less when the limit resets first
     var text: String { "\(rate) · \(Int(projected.rounded()))% \(horizon)" }
+    /// Short forms that fit in a gauge's percent slot: "+3.9/h", "6h", "2h", "45m".
+    var compactRate: String { String(rate.dropLast(3)) + "/h" }
+    var compactHorizon: String {
+        hoursAhead >= 1 ? "\(Int(hoursAhead.rounded(.down)))h" : "\(max(1, Int((hoursAhead * 60).rounded())))m"
+    }
+    var compactForecast: String { "\(compactHorizon) \(Int(projected.rounded()))%" }
+}
+
+/// Crossfade timing for one gauge slot: percent → rate → forecast → percent.
+/// Weights are opacities that add to 1 at every moment.
+enum PaceFade {
+    static let fade: Double = 0.7
+    static let hold: Double = 3.2
+    static var duration: Double { 3 * fade + 2 * hold }
+
+    static func weights(at t: Double) -> (percent: Double, rate: Double, forecast: Double) {
+        func ease(_ x: Double) -> Double { let c = min(1, max(0, x)); return c * c * (3 - 2 * c) }
+        let a = fade, b = fade + hold, c = 2 * fade + hold, d = 2 * fade + 2 * hold, e = duration
+        if t <= 0 || t >= e { return (1, 0, 0) }
+        if t < a { let k = ease(t / fade); return (1 - k, k, 0) }
+        if t < b { return (0, 1, 0) }
+        if t < c { let k = ease((t - b) / fade); return (0, 1 - k, k) }
+        if t < d { return (0, 0, 1) }
+        let k = ease((t - d) / fade)
+        return (k, 0, 1 - k)
+    }
 }
 
 enum PaceMath {
@@ -404,7 +431,7 @@ enum PaceMath {
         }
         let projected = min(100, max(percent, percent + burn * hours))
         let rate = burn < 10 ? String(format: "+%.1f%%/h", burn) : String(format: "+%.0f%%/h", burn)
-        return PaceTicker(rate: rate, projected: projected, horizon: horizon)
+        return PaceTicker(rate: rate, projected: projected, horizon: horizon, hoursAhead: hours)
     }
 
     /// Drop samples older than 48 hours, and drop history from before a sharp fall

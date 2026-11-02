@@ -155,6 +155,16 @@ let tickCap = PaceMath.ticker(percent: 90, burnPerHour: 12, resetsAt: nil, now: 
 check("ticker caps at 100", tickCap?.text == "+12%/h · 100% in 6h")
 check("ticker skips flat pace", PaceMath.ticker(percent: 40, burnPerHour: 0.1, resetsAt: nil, now: t1) == nil)
 check("ticker skips collecting", PaceMath.ticker(percent: 40, burnPerHour: nil, resetsAt: nil, now: t1) == nil)
+check("ticker compact rate", tick?.compactRate == "+6.0/h" && tickCap?.compactRate == "+12/h")
+check("ticker compact forecast", tick?.compactForecast == "6h 76%" && tickReset?.compactForecast == "2h 52%")
+let tickSoon = PaceMath.ticker(percent: 40, burnPerHour: 6, resetsAt: t1.addingTimeInterval(45 * 60), now: t1)
+check("ticker minutes before a near reset", tickSoon?.compactHorizon == "45m")
+let w0 = PaceFade.weights(at: 0), wMid = PaceFade.weights(at: PaceFade.fade + 1)
+let wFc = PaceFade.weights(at: 2 * PaceFade.fade + PaceFade.hold + 1), wEnd = PaceFade.weights(at: PaceFade.duration)
+check("fade starts and ends on the percent", w0.percent == 1 && wEnd.percent == 1)
+check("fade holds the rate, then the forecast", wMid.rate == 1 && wFc.forecast == 1)
+let wHalf = PaceFade.weights(at: PaceFade.fade / 2)
+check("fade weights add to one", abs(wHalf.percent + wHalf.rate + wHalf.forecast - 1) < 1e-9)
 
 let suite = UserDefaults(suiteName: "usage-core-tests")!
 suite.removePersistentDomain(forName: "usage-core-tests")

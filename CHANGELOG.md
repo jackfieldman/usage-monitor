@@ -8,6 +8,12 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.14.1
+
+- **Pace fades in each gauge.** The scroll is gone. Every 20 seconds, each gauge's percent fades to its burn per hour (`+4.4/h`), then to its forecast (`6h 99%`), then back to the percent. Each provider changes in its own slot.
+- **Reset-aware forecast.** When a limit resets sooner than 6 hours, the forecast shows the hours to the reset and the expected percent then (`3h 65%`).
+- **Steady width.** Each slot is wide enough for all three values, so the menu bar does not shift. A gauge with no pace yet keeps its percent.
+
 ## 2.14.0
 
 - **Pace scrolls in the menu bar.** About every 40 seconds, the percent slides away. The burn per hour and the expected percent in 6 hours scroll past slowly, then the percent comes back. The forecast colour uses the same green, amber, and red as the gauges.
