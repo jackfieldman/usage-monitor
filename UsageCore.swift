@@ -340,6 +340,14 @@ struct PaceForecast: Equatable {
     var warn: Bool
 }
 
+/// One provider's slot in the menu-bar pace ticker.
+struct PaceTicker: Equatable {
+    var rate: String        // "+3.2%/h"
+    var projected: Double   // expected percent used at the horizon, capped at 100
+    var horizon: String     // "in 6h" or "by reset"
+    var text: String { "\(rate) · \(Int(projected.rounded()))% \(horizon)" }
+}
+
 enum PaceMath {
     static let minSpan: TimeInterval = 8 * 60
 
@@ -377,6 +385,26 @@ enum PaceMath {
         let soon = eta.timeIntervalSince(now) <= 6 * 3600 + 1
         return PaceForecast(line: "Pace · \(rate) · hits 80% at \(clock(eta, from: now))",
                             burnPerHour: burn, eta: eta, warn: soon)
+    }
+
+    /// The menu-bar pace ticker: burn per hour, and the expected percent in six hours.
+    /// When the limit resets inside six hours, the forecast stops at the reset.
+    /// Returns nil while the pace is collecting or flat, so nothing scrolls.
+    static func ticker(percent: Double, burnPerHour: Double?, resetsAt: Date?,
+                       now: Date = Date()) -> PaceTicker? {
+        guard let burn = burnPerHour, burn > 0.2 else { return nil }
+        var hours = 6.0
+        var horizon = "in 6h"
+        if let resetsAt, resetsAt > now {
+            let left = resetsAt.timeIntervalSince(now) / 3600
+            if left < hours {
+                hours = left
+                horizon = "by reset"
+            }
+        }
+        let projected = min(100, max(percent, percent + burn * hours))
+        let rate = burn < 10 ? String(format: "+%.1f%%/h", burn) : String(format: "+%.0f%%/h", burn)
+        return PaceTicker(rate: rate, projected: projected, horizon: horizon)
     }
 
     /// Drop samples older than 48 hours, and drop history from before a sharp fall

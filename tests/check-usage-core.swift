@@ -146,6 +146,16 @@ let dropped = PaceMath.collapsed(
     now: t1)
 check("pace drops pre-reset samples", dropped.count == 2 && dropped[0].percent == 10)
 
+let tick = PaceMath.ticker(percent: 40, burnPerHour: 6, resetsAt: nil, now: t1)
+check("ticker projects six hours", tick?.text == "+6.0%/h · 76% in 6h")
+let tickReset = PaceMath.ticker(percent: 40, burnPerHour: 6,
+                                resetsAt: t1.addingTimeInterval(2 * 3600), now: t1)
+check("ticker stops at a reset inside six hours", tickReset?.text == "+6.0%/h · 52% by reset")
+let tickCap = PaceMath.ticker(percent: 90, burnPerHour: 12, resetsAt: nil, now: t1)
+check("ticker caps at 100", tickCap?.text == "+12%/h · 100% in 6h")
+check("ticker skips flat pace", PaceMath.ticker(percent: 40, burnPerHour: 0.1, resetsAt: nil, now: t1) == nil)
+check("ticker skips collecting", PaceMath.ticker(percent: 40, burnPerHour: nil, resetsAt: nil, now: t1) == nil)
+
 let suite = UserDefaults(suiteName: "usage-core-tests")!
 suite.removePersistentDomain(forName: "usage-core-tests")
 let g = Gauge(label: "Session", percent: 12, sub: "")

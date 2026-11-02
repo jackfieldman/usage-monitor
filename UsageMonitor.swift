@@ -93,6 +93,16 @@ struct IconCluster {
     let gauges: [Gauge]
 }
 
+/// Timing for the menu-bar pace ticker.
+enum PaceTickerMotion {
+    /// The percent stays still this long between passes.
+    static let restSeconds: TimeInterval = 40
+    /// Slow enough to read in a narrow slot.
+    static let pointsPerSecond: CGFloat = 20
+    static let frame: TimeInterval = 1.0 / 30
+    static let gap: CGFloat = 10
+}
+
 /// How the menu-bar packs multiple providers.
 enum MenuBarLayout: String, CaseIterable {
     case perProvider   // letter + highest% per shown provider (default)
@@ -173,6 +183,11 @@ enum WhatsNew {
     /// Newest first. Keep in sync with CHANGELOG.md for the current series.
     /// PUBLIC VOICE: no maintainer names, private machines, or insider jokes.
     static let releases: [(version: String, title: String, bullets: [String])] = [
+        ("2.14.0", "Pace scrolls in the menu bar", [
+            "The percent slides away, and the burn per hour and the forecast for the next 6 hours scroll past",
+            "If the limit resets sooner, the forecast stops at the reset",
+            "Turn it off under Settings, Menu bar",
+        ]),
         ("2.13.3", "Prompts open in front", [
             "A click that asks a question closes the panel or menu first",
             "One click shows one prompt, on top and ready for the click",
@@ -4860,6 +4875,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var marqueeOffset: CGFloat = 0
     var marqueeText = "Update available"
     var marqueeFullWidth: CGFloat = 0
+    /// Pace ticker: the percent slides out, burn per hour and the six-hour forecast
+    /// scroll past, then the percent slides back.
+    var paceCycleTimer: Timer?
+    var paceAnimTimer: Timer?
+    var paceTickerActive = false
+    var paceTickerLastEnd = Date()
     var monthSpend: Double?
     var costError: String?
     var hasAdminKey = false
@@ -4972,6 +4993,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.maybeRunUpdateMarquee()
         }
         if let t = marqueeTickTimer { RunLoop.main.add(t, forMode: .common) }
+        // Check often; start only when the percent has rested a full interval since the last pass.
+        paceCycleTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self,
+                  Date().timeIntervalSince(self.paceTickerLastEnd) >= PaceTickerMotion.restSeconds else { return }
+            self.startPaceTicker()
+        }
+        if let t = paceCycleTimer { RunLoop.main.add(t, forMode: .common) }
         usageSignedIn = usageProviderSignedIn()
         if usageSignedIn {
             OnboardingController.markSeen()
@@ -5464,7 +5492,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// If an update is pending and an hour has passed, scroll “Update available”.
     func maybeRunUpdateMarquee() {
-        guard !marqueeActive, !updating else { return }
+        guard !marqueeActive, !paceTickerActive, !updating else { return }
         guard let up = updateAvailable, UpdatePrefs.shouldSurface(version: up.version) else { return }
         guard UpdatePrefs.shouldMarquee() else { return }
         startUpdateMarquee(version: up.version)
@@ -5472,6 +5500,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func startUpdateMarquee(version: String) {
         guard let button = statusItem.button else { return }
+        stopPaceTicker(restore: false)
         marqueeActive = true
         UpdatePrefs.lastMarqueeAt = Date().timeIntervalSince1970
         marqueeText = "  Update available · \(version)  ·  open Updates menu  ·  "
@@ -5500,6 +5529,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.appearsDisabled = false
         }
         if let t = marqueeAnimTimer { RunLoop.main.add(t, forMode: .common) }
+    }
+
+    // MARK: Pace ticker (percent → burn per hour and six-hour forecast → percent)
+
+    var paceTickerEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "paceTicker.enabled") as? Bool ?? true }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "paceTicker.enabled")
+            if !newValue { stopPaceTicker(restore: true) }
+        }
+    }
+
+    /// The scrolling line: "C: +3.2%/h · 76% in 6h", one slot per shown provider.
+    /// Built once per pass, so the animation never reads stored samples.
+    func paceTickerLine() -> NSAttributedString? {
+        let comfortable = density == .comfortable
+        let letterFont = NSFont.systemFont(ofSize: comfortable ? 11.5 : 11, weight: .semibold)
+        let numFont = NSFont.monospacedDigitSystemFont(ofSize: comfortable ? 11.5 : 11, weight: .medium)
+        let ink = barNeutral()
+        let line = NSMutableAttributedString()
+        let now = Date()
+        for group in providerGauges where group.config.showInMenuBar && group.config.enabled {
+            guard let g = Self.primaryGauge(for: group) else { continue }
+            let pace = paceForecast(providerId: group.config.id, gauge: g)
+            guard let tick = PaceMath.ticker(percent: g.percent, burnPerHour: pace.burnPerHour,
+                                             resetsAt: g.resetsAt, now: now) else { continue }
+            if line.length > 0 {
+                line.append(NSAttributedString(string: "   ", attributes: [.font: numFont]))
+            }
+            let letter = group.config.letter.count == 1 ? "\(group.config.letter): " : "\(group.config.letter) "
+            line.append(NSAttributedString(string: letter, attributes: [.font: letterFont, .foregroundColor: ink]))
+            line.append(NSAttributedString(string: "\(tick.rate) · ",
+                                           attributes: [.font: numFont, .foregroundColor: ink]))
+            line.append(NSAttributedString(string: "\(Int(tick.projected.rounded()))%",
+                                           attributes: [.font: numFont, .foregroundColor: statusInk(tick.projected)]))
+            line.append(NSAttributedString(string: " \(tick.horizon)",
+                                           attributes: [.font: numFont, .foregroundColor: ink]))
+        }
+        return line.length > 0 ? line : nil
+    }
+
+    /// One slow pass: the gauges slide out left, the pace line follows, and the
+    /// gauges slide back in. The slot keeps the gauges' width, so nothing beside it moves.
+    func startPaceTicker() {
+        guard paceTickerEnabled, !paceTickerActive, !marqueeActive, !updating else { return }
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        guard let button = statusItem.button else { return }
+        if iconShape == .hbars && iconClusters.count > 1 { return }
+        let clusters = iconClusters
+        guard !clusters.isEmpty, let line = paceTickerLine() else { return }
+        let gauges = clusterImage(clusters)
+        let viewport = max(1, ceil(gauges.size.width))
+        let gap = PaceTickerMotion.gap
+        let lineW = ceil(line.size().width)
+        let travel = viewport + gap + lineW + gap
+        let h: CGFloat = 18
+        let lineY = ((h - line.size().height) / 2).rounded()
+        var offset: CGFloat = 0
+        paceTickerActive = true
+
+        paceAnimTimer?.invalidate()
+        paceAnimTimer = Timer.scheduledTimer(withTimeInterval: PaceTickerMotion.frame, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            offset = min(travel, offset + PaceTickerMotion.pointsPerSecond * CGFloat(PaceTickerMotion.frame))
+            let x = offset
+            let frame = NSImage(size: NSSize(width: viewport, height: h), flipped: false) { _ in
+                NSRect(x: 0, y: 0, width: viewport, height: h).clip()
+                gauges.draw(at: NSPoint(x: -x, y: 0), from: .zero, operation: .sourceOver, fraction: 1)
+                line.draw(at: NSPoint(x: -x + viewport + gap, y: lineY))
+                gauges.draw(at: NSPoint(x: -x + travel, y: 0), from: .zero, operation: .sourceOver, fraction: 1)
+                return true
+            }
+            self.applyMenuBarImage(frame, to: self.statusItem, button: button)
+            if offset >= travel { self.stopPaceTicker(restore: true) }
+        }
+        if let t = paceAnimTimer { RunLoop.main.add(t, forMode: .common) }
+    }
+
+    func stopPaceTicker(restore: Bool) {
+        guard paceTickerActive || paceAnimTimer != nil else { return }
+        paceAnimTimer?.invalidate()
+        paceAnimTimer = nil
+        paceTickerActive = false
+        paceTickerLastEnd = Date()
+        if restore { render() }
     }
 
     func stopUpdateMarquee(restore: Bool) {
@@ -5731,11 +5845,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let button = statusItem.button else { return }
         let clusters = iconClusters
         if clusters.isEmpty {
+            stopPaceTicker(restore: false)
             applyMenuBarImage(warningImage(), to: statusItem, button: button)
             button.toolTip = lastError
         } else {
-            let img = clusterImage(clusters)
-            applyMenuBarImage(img, to: statusItem, button: button)
+            // The pace ticker owns the image while it scrolls. It redraws when it ends.
+            if !paceTickerActive {
+                applyMenuBarImage(clusterImage(clusters), to: statusItem, button: button)
+            }
             var tip: [String] = []
             for group in providerGauges {
                 tip.append("— \(group.config.displayName) —")
@@ -9124,6 +9241,7 @@ final class SettingsController: NSObject {
             stack.addArrangedSubview(check("Consolidated icon", app.consolidated, #selector(consolidatedClicked(_:))))
         }
         stack.addArrangedSubview(button("Which limit the percent follows…", #selector(showBarPercent(_:))))
+        stack.addArrangedSubview(check("Scroll pace and 6-hour forecast", app.paceTickerEnabled, #selector(paceTickerClicked(_:))))
         stack.addArrangedSubview(check("Open at Login", app.loginEnabled, #selector(loginClicked(_:))))
         return stack
     }
@@ -9347,6 +9465,9 @@ final class SettingsController: NSObject {
         NSWorkspace.shared.open(tipURL)
     }
 
+    @objc private func paceTickerClicked(_ sender: NSButton) {
+        app?.paceTickerEnabled = sender.state == .on
+    }
     @objc private func consolidatedClicked(_ sender: NSButton) {
         guard let app else { return }
         if (sender.state == .on) != app.consolidated { app.toggleConsolidated() }

@@ -8,6 +8,12 @@ All notable changes to Usage Monitor are recorded here. Versions follow the
 > nicknames, or “for me vs everyone else” language. Release notes, in-app What’s
 > New, and UI copy must read as professional product text for any user.
 
+## 2.14.0
+
+- **Pace scrolls in the menu bar.** About every 40 seconds, the percent slides away. The burn per hour and the expected percent in 6 hours scroll past slowly, then the percent comes back. The forecast colour uses the same green, amber, and red as the gauges.
+- **Reset-aware forecast.** When a limit resets inside 6 hours, the forecast shows the expected percent at the reset.
+- **Your choice.** Turn it off under Settings, Menu bar. It also stays still when Reduce Motion is on, or while the pace is still collecting or flat.
+
 ## 2.13.3
 
 - **Prompts open in front.** A click that asks a question, such as Caffeinate On with a hotspot set, closes the panel or menu first. The question then opens on top and takes the click.
